@@ -38,6 +38,7 @@ docs/rfcs/      RFCs (required for constitution-level changes)
 ## Documentation
 
 - **Specs (SDD)** — [`specs/`](specs/) (project MVP, GGUF loader; see [Spec-Driven Development](docs/sdd/README.md))
+- **Feature list** — [`docs/design/feature-list.md`](docs/design/feature-list.md) (implementation roadmap with traceability)
 - **Project constitution** — [`CONSTITUTION.md`](CONSTITUTION.md) (read before contributing)
 - **Agent rules** — [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md)
 - **Contributing** — [`CONTRIBUTING.md`](CONTRIBUTING.md)

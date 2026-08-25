@@ -38,6 +38,7 @@ docs/rfcs/      RFC（变更宪法级规则所需）
 ## 文档
 
 - **Specs（SDD）** —— [`specs/`](specs/)（项目 MVP、GGUF 加载器；流程见 [Spec-Driven Development](docs/sdd/README.md)）
+- **功能清单** —— [`docs/design/feature-list.md`](docs/design/feature-list.md)（带追踪关系的实施路线）
 - **项目宪法** —— [`CONSTITUTION.md`](CONSTITUTION.md)（贡献前必读）
 - **AI 代理规则** —— [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md)
 - **贡献指南** —— [`CONTRIBUTING.md`](CONTRIBUTING.md)

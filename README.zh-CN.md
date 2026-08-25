@@ -21,7 +21,7 @@
 
 ```bash
 rustup toolchain install   # stable（见 rust-toolchain.toml）
-cargo build --release --features cpu   # 或：--features cuda / --features can
+cargo build --release --features cpu   # 或：--features cuda / --features ascend
 cargo run                 # 输出 "reinfer 0.1.0"（骨架阶段）
 ```
 

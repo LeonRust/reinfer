@@ -21,7 +21,7 @@
 
 ```bash
 rustup toolchain install   # stable (see rust-toolchain.toml)
-cargo build --release --features cpu   # or: --features cuda / --features can
+cargo build --release --features cpu   # or: --features cuda / --features ascend
 cargo run                 # prints "reinfer 0.1.0" (scaffold)
 ```
 

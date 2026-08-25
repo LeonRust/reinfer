@@ -36,7 +36,9 @@ Consistent with cann-rs constitution §1 (`cann → cann-sys`, no reverse/cross-
 | ACL error codes & `is_oom/is_recoverable` | cann-rs (SDK semantics) | reinfer maps to engine `LaunchError` (table in 002/plan.md) |
 | Device properties (SoC, memory, L2…) | cann-rs (`DeviceProps`) | reinfer: capability gating + TuneDb keys |
 | aclnn operator wrappers (Matmul/Softmax/RMSNorm/TopK…) | cann-rs (`cann-ops`-style crate) | reinfer: KernelProvider Vendor-tier selection + autotune |
-| Graph capture (`aclrtGraph*`) | cann-rs (bindings) | reinfer: what goes into the graph, bucket pooling, memory reuse |
+| Graph capture (GE graph engine `aclgrph*`: aclgrphParseONNX/BuildModel/SaveModel + Session) | cann-rs (bindings) | reinfer: what goes into the graph, bucket pooling, memory reuse |
+
+> Note (2026-08-25): CANN 8.5.0 has no `aclrtGraph*` symbols; graph APIs are GE graph engine (`aclcppdevg`/`API/ascendgraphapi`: aclgrph* + Session). Earlier `aclrtGraph*` naming referred to legacy dynamic-graph APIs.
 | HCCL primitives (comm init, collective, send/recv) | cann-rs (`cann-sys` + `cann`) | reinfer: algorithms, topology, fallback (shared with CUDA `crates/comm`) |
 | AscendC kernel **compile pipeline** (bisheng/AOC, cache, locks) | **reinfer `crates/jit`** | mirrors FlashInfer JitSpec; kernel source assets are engine-owned |
 | AscendC custom-op **load/execute API** (aclnnCustomOp…) | cann-rs (bindings) | reinfer drives compile → load → launch |

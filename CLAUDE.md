@@ -22,3 +22,5 @@ feat(radix): page split on mixed prefix match
 ```
 Co-Authored-By: Claude <noreply@anthropic.com>
 ```
+
+7. **跨仓库协作（cann-rs）**：cann-rs 位于 `/home/dora/Dev/ai-tokens/cann-rs`。契约锚点与一致性规则见 `specs/002-ascend-backend/plan.md`（L0 契约表）与同目录 `boundary.md`；cann-rs 侧镜像为 `cann-rs/docs/boundary-with-reinfer.md`、事实底稿为 `cann-rs/docs/cann-850-catalog.md`（CANN 8.5 官方符号/签名核定表）。Ascend 相关开发可直接读写对方仓库：cann-rs 变更由对方仓库会话负责，本仓库只消费契约；符号核实一律以官方 8.5 文档为准。开发期依赖用 `[patch]` 指向 `../cann-rs/{cann,cann-sys}`（宪法 §? 已配置于 Cargo.toml）。

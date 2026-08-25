@@ -17,7 +17,7 @@
 
 ## Interface Contracts — L0 (proposal for `cann` crate)
 
-> Symbol names follow CANN SDK 8.x/9.x headers. Anything marked `TODO(verify-symbol)` must be confirmed against the installed headers before finalizing.
+> Symbol names follow CANN SDK 8.x/9.x headers. All L0 symbols were verified against official CANN 8.5.0 docs on 2026-08-25 (see cann-rs `docs/cann-850-catalog.md` §2).
 
 ```rust
 // ---- lifecycle ----
@@ -25,7 +25,7 @@ pub struct Context;                                 // RAII: aclInit / aclFinali
 impl Context {
     pub fn init() -> Result<Self, Error>;
 }
-pub fn device_count() -> Result<u32, Error>;       // TODO(verify-symbol): aclrtGetDeviceNum
+pub fn device_count() -> Result<u32, Error>;       // aclrtGetDeviceCount(uint32_t*) — verified vs CANN 8.5 (aclcppdevg_03_0045)
 pub fn set_device(dev: u32) -> Result<(), Error>;  // aclrtSetDevice
 
 // ---- streams & events ----
@@ -58,8 +58,8 @@ impl Error {
 
 ### Pure FFI list for `cann-sys` (L0)
 
-`aclInit` · `aclFinalize` · `aclrtGetDeviceNum` * · `aclrtSetDevice` · `aclrtCreateStream` · `aclrtDestroyStream` · `aclrtCreateEvent` · `aclrtRecordEvent` · `aclrtSynchronizeEvent` · `aclrtDestroyEvent` · `aclrtMalloc` · `aclrtFree` · `aclrtMallocHost` · `aclrtFreeHost` · `aclrtMemcpy` · `ACL_ERROR_RT_*` consts
-*(verify exact name per SDK 9.x)
+`aclInit` · `aclFinalize` · `aclrtGetDeviceCount` · `aclrtSetDevice` · `aclrtCreateStream` · `aclrtDestroyStream` · `aclrtCreateEvent` · `aclrtRecordEvent` · `aclrtSynchronizeEvent` · `aclrtDestroyEvent` · `aclrtMalloc` · `aclrtFree` · `aclrtMallocHost` · `aclrtFreeHost` · `aclrtMemcpy` · `ACL_ERROR_RT_*` consts
+(note: `aclrtMalloc` third arg is enum `aclrtMemMallocPolicy`; `aclrtGetSocName` is `const char *aclrtGetSocName(void)` — not in L0 surface, but for DeviceProps later)
 
 ## Risk Assessment
 

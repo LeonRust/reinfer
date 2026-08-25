@@ -72,7 +72,7 @@
 
 **2.5 结构化生成（本方案最强的差异化点）**：SGLang/vLLM 都要 FFI 包装 C++ 的 xgrammar；而 **llguidance 本身就是 Rust 库**（Guidance.ai 出品，regex FSM + JSON schema + CFG），全程零 FFI，语法约束直接挂在调度器 grammar 状态上、逐 token 填 vocab mask + jump-forward——这正好落在 Rust 生态的甜点区。
 
-**2.6 图执行**：per-(batch_shape, seqlen) 桶 → CUDA Graph 捕获池（vLLM `cuda_graph_buffer_registry` 思路）；CANN 侧对应 `aclrtGraph`；小 batch 场景维护"graph + eager 双路"，按桶命中率切换。
+**2.6 图执行**：per-(batch_shape, seqlen) 桶 → CUDA Graph 捕获池（vLLM `cuda_graph_buffer_registry` 思路）；CANN 侧对应 GE 图引擎 `aclgrph*`（8.5 已无 `aclrtGraph` 符号）；小 batch 场景维护"graph + eager 双路"，按桶命中率切换。
 
 ---
 

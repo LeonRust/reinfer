@@ -61,6 +61,33 @@ impl Error {
 `aclInit` · `aclFinalize` · `aclrtGetDeviceCount` · `aclrtSetDevice` · `aclrtCreateStream` · `aclrtDestroyStream` · `aclrtCreateEvent` · `aclrtRecordEvent` · `aclrtSynchronizeEvent` · `aclrtDestroyEvent` · `aclrtMalloc` · `aclrtFree` · `aclrtMallocHost` · `aclrtFreeHost` · `aclrtMemcpy` · `ACL_ERROR_RT_*` consts
 (note: `aclrtMalloc` third arg is enum `aclrtMemMallocPolicy`; `aclrtGetSocName` is `const char *aclrtGetSocName(void)` — not in L0 surface, but for DeviceProps later)
 
+## Interface Contracts — L1 (proposal for `cann` crate; source: cann-rs `docs/specs/0002-l1-aclnn/plan.md`)
+
+> L1 = aclTensor base types + first aclnn ops (Matmul/Softmax/RMSNorm) + GE graph engine (`aclgrph*`).
+> Marked ⚠️: verify against headers before finalizing (cann-rs 0002 verify-list).
+
+```rust
+// ---- tensor base types (cann-sys: acl_meta.h) ----
+pub type aclnnStatus = c_int;
+pub type aclTensor = c_void;  // opaque; aclTensorList / aclScalar likewise
+// lifecycle: aclCreateTensor(viewDims, num, dataType, stride, offset, format, ...) -> *mut aclTensor  ⚠️
+// destroy + getters: aclDestroyTensor / aclGetViewShape / aclGetViewStrides / aclGetViewOffset /
+//                    aclGetFormat / aclGetDataType -> aclnnStatus
+// ---- ops (cann-sys: aclnnop/aclnn_*.h) ----
+aclnnMatmulGetWorkspaceSize(self, mat2: *const aclTensor, out: *mut aclTensor, cubeMathType: i8,
+                            workspaceSize: *mut u64, executor: *mut *mut c_void) -> aclnnStatus;
+aclnnMatmul(workspace: *mut c_void, workspaceSize: u64, executor: *mut c_void, stream: *mut c_void) -> aclnnStatus;
+// Softmax / RmsNorm: same two-phase shape; exact params ⚠️ verify
+// ---- GE graph engine (cann-sys: parser/onnx_parser.h) ----
+aclgrphParseONNX(modelFile, graph) / ParseONNXFromMem(buffer, size, graph) -> graphStatus;   // ⚠️
+aclgrphBuildModel(...) / aclgrphSaveModel(...) -> graphStatus;                                // ⚠️
+```
+
+cann safe surface: `Tensor` (RAII) · `DataType`/`Format` enums · `Operator` trait + `OpExecutor`
+(two-phase: GetWorkspaceSize -> launch(&Stream)) · `Matmul`/`Softmax`/`RmsNorm` · `Graph` (from_onnx)
++ `Session` (build/save .om). Error family mapping: `aclnnStatus`/`graphStatus` non-success -> `Fatal`
+(fail-closed) mapped into engine `LaunchError` like L0.
+
 ## Risk Assessment
 
 | Risk | Impact | Mitigation |

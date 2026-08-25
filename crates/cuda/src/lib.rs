@@ -6,3 +6,6 @@
 /// 接线探针：feature `cuda` 开启时依赖链路必须可编译（003 T1）。
 #[cfg(feature = "cuda")]
 pub use cudarc as _cudarc;
+
+/// `cudaError → LaunchError` 白名单映射（003 T3；纯 CPU 可测）。
+pub mod error;

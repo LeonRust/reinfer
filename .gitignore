@@ -1,6 +1,6 @@
 /target
 **/target/
-kernels/
+# (注：kernels/ 作为任意目录模式会误伤 crates/kernels——已移除；JitCache 产物在 ~/.cache/reinfer/jit)
 **/*.tune.json
 .env
 .env.*

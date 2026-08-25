@@ -60,6 +60,7 @@ name = "reinfer-cuda"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "reinfer-kernels",
 ]
 
 [[package]]

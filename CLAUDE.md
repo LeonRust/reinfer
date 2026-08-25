@@ -6,7 +6,7 @@
 
 2. **工作流程**：读宪法 → 读 `docs/` 三份设计文档（分析报告 / 设计报告 / 深入补充）→ 任务分块（小提交）→ 验证（fmt/clippy/test）→ 提交 PR。
 
-3. **语言**：与用户交流用中文；commit message 与代码注释用英文（Conventional Commits，见宪法 §3.1）。
+3. **语言**：与用户交流用中文；commit message 与代码注释一律英文（Conventional Commits，见宪法 §3.1）；仓库文档默认英文，中文版以 `-zh-CN` 后缀文件并存。
 
 4. **环境约定**：昇腾变量 `CANN_HOME`、`DEVICE_ID`；NVIDIA `CUDA_VISIBLE_DEVICES`；禁止在未询问的情况下安装全局依赖或改变目标机配置。
 

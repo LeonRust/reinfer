@@ -28,8 +28,10 @@ cargo build --release --features cpu    # 无 GPU 也能跑参考实现
 ❌ fix bug with changes and formatting together
 ```
 
+- **commit message 一律英文**（summary 与 body，宪法 §3.1）；中文沟通请放在 issue / PR 描述中。
 - **禁止任何 AI `Co-Authored-By:` Trailer**（宪法 §3.2）。AI 参与情况写在 PR 描述里。
 - 本地钩子（可选但推荐）：`git config core.hooksPath .githooks`。
+- 文档默认英文；中文版本以 `-zh-CN` 后缀文件并存（宪法 §4.4）。
 
 ## 3. PR 自检清单（合入前逐项打勾）
 

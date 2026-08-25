@@ -38,7 +38,7 @@
 
 3.1 **Conventional Commits 1.0**：`type(scope): summary`
    - type ∈ `feat | fix | perf | refactor | docs | test | chore | ci | build`；
-   - summary ≤ 70 字符、祈使句、句末无标点；scope 为 crate 或子系统名（`kernel` / `scheduler` / `radix` / `can` / `cuda` / `ipc` / `server` / `ci` …）；
+   - summary ≤ 70 字符、祈使句、句末无标点；**summary 与 body 一律使用英文**；scope 为 crate 或子系统名（`kernel` / `scheduler` / `radix` / `can` / `cuda` / `ipc` / `server` / `ci` …）；
    - body 与 summary 之间空行；一条提交只做一件事。
 
 3.2 **AI 署名禁令**：任何提交（人工或 AI 代理）**不得包含** `Co-Authored-By: Claude <noreply@anthropic.com>`，也不得包含任何形式的 AI `Co-Authored-By:` Trailer。AI 参与情况写在 **PR 描述**中，不进入 commit message。启动钩子强制校验：`git config core.hooksPath .githooks`。
@@ -57,7 +57,7 @@
 
 4.3 **模块上限**：单文件 > 500 行应拆分（SGLang 5291 行调度器即反面教材）；数据流用显式类型（`OpConfig` / `ReqId`），禁止字符串散传。
 
-4.4 公开 API 必须文档化；设计决策写入 `docs/`（借鉴 vLLM `docs/design/` 文化），一次改动只改变一个决策点。
+4.4 公开 API 必须文档化；设计决策写入 `docs/`（借鉴 vLLM `docs/design/` 文化），一次改动只改变一个决策点；**仓库内文档默认英文，中文版本以 `-zh-CN` 后缀文件并存（如 `README.zh-CN.md`），并在主文档顶部提供双语切换链接**。
 
 ## 第 5 章 AI 代理条款
 

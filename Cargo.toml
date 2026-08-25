@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["bin/reinfer", "crates/*"]
+default-members = ["bin/reinfer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+reinfer-core      = { path = "crates/core" }
+reinfer-gguf      = { path = "crates/gguf" }
+reinfer-arch      = { path = "crates/arch" }
+reinfer-memory    = { path = "crates/memory" }
+reinfer-cache     = { path = "crates/cache" }
+reinfer-scheduler = { path = "crates/scheduler" }
+reinfer-kernels   = { path = "crates/kernels" }
+reinfer-samplers  = { path = "crates/samplers" }
+reinfer-grammar   = { path = "crates/grammar" }
+reinfer-ipc       = { path = "crates/ipc" }
+reinfer-cpu       = { path = "crates/cpu" }
+reinfer-jit       = { path = "crates/jit" }
+reinfer-cuda      = { path = "crates/cuda" }
+reinfer-can       = { path = "crates/can" }
+reinfer-server    = { path = "crates/server" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+unwrap_used = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+
+# 注：panic="abort" 不允许在 package 级 profile 覆盖（Cargo 限制）。
+# 如确需最终二进制 abort：可将 [profile.release] 下加 panic="abort"，
+# 代价是库侧 catch_unwind 失效（宪法 §2.1 的 FFI 捕获即不可用），
+# 故默认保持 unwind，逐调用处用 Result / catch_unwind 消化错误。

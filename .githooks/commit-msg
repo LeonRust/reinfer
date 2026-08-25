@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# 宪法 §3.2 强制钩子：禁止任何 AI Co-Authored-By Trailer
+# 安装：git config core.hooksPath .githooks
+set -euo pipefail
+
+msg_file="$1"
+
+if grep -qiE '^Co-Authored-By:[[:space:]]*[^<]*<[^>]*@anthropic\.com>' "$msg_file" \
+   || grep -qsiP 'Co-Authored-By:\s*Claude\s*<[^>]*>' "$msg_file"; then
+  echo "⛔ 宪法 §3.2 违反：禁止 'Co-Authored-By: Claude <noreply@anthropic.com>'（或任何 AI 署名 Trailer）" >&2
+  echo "   AI 参与情况请写在 PR 描述中，不要写入 commit message。" >&2
+  exit 1
+fi
+
+# Conventional Commits 基本校验（宪法 §3.1）：type(scope): summary
+head_line="$(awk 'NR==1' "$msg_file")"
+if ! grep -qE '^(feat|fix|perf|refactor|docs|test|chore|ci|build)(\([a-z0-9_-]+\))?: .+' <<<"$head_line"; then
+  echo "⛔ 宪法 §3.1 违反：首行须为 Conventional Commits（feat/fix/perf/refactor/docs/test/chore/ci/build(scope): summary）" >&2
+  exit 1
+fi
+
+exit 0

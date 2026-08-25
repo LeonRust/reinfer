@@ -1,0 +1,7 @@
+# 标准 rustfmt 配置（放入仓库根目录）
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+imports_granularity = "Item"
+group_imports = "StdExternalCrate"
+use_small_heuristics = "Max"

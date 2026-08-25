@@ -1,0 +1,15 @@
+[package]
+name = "reinfer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reinfer-core = { workspace = true }
+
+[features]
+default = []
+cuda = []
+can = []
+
+[lints]
+workspace = true

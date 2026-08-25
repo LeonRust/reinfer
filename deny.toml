@@ -1,0 +1,11 @@
+# cargo-deny 配置（放入仓库根目录）
+# 宪法附：仅允许与 Apache-2.0/MIT 兼容的许可
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC"]
+unlicensed = "deny"
+
+[bans]
+multiple-versions = "allow"   # 构建期可临时放宽；依赖树里风险由 CI 告警

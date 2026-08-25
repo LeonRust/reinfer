@@ -30,11 +30,11 @@
 
 | ID | Feature | Notes |
 |---|---|---|
-| P1-01 | CUDA backend (cudarc + VendorCubinProvider + JitCache nvcc) | 🔒 spec 005-cuda-backend; vendor = FlashInfer cubin protocol |
-| P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | policy-side is ours (boundary §4) |
-| P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | port mini-sglang model |
-| P1-04 | CUDA graph bucket capture + stream overlap | |
-| P1-05 | OpenAI-compatible HTTP server (axum) + sampler chain (greedy/top-p/top-k) | |
+| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop) — spec ready |
+| P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | included in 003 T9; policy-side is ours (boundary §4) |
+| P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | 🔒 spec 004-scheduler-serving |
+| P1-04 | CUDA graph bucket capture + stream overlap | 🔒 spec 005 (with FA3 vendor cubin) |
+| P1-05 | OpenAI-compatible HTTP server (axum) + sampler chain (greedy/top-p/top-k) | 🔒 spec 004 |
 | P2-01 | Ascend full: Vendor-tier aclnn ops (L1, via cann safe wrappers), GE graph (aclgrph*) session pattern, AscendC pipeline (`crates/jit`), HCCL | depends cann-rs 0002 code; graph note: 8.5 = GE engine `aclgrph*`, not legacy `aclrtGraph*` |
 | P3-01 | RadixCache · speculative decode · llguidance grammar · TP/PP/CP | semantics from design report §2 |
 | P4-01 | MoE/MLA/FP8 · autotune TuneDb · KV offload · PD separation (lightllm protocol) · plugins | |

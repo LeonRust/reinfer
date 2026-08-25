@@ -27,6 +27,10 @@ CONSTITUTION.md   immutable project principles (Spec Kit's constitution.md slot)
 4. **Validate is never skipped** — a spec replaces the requirements document, never Code Review or CI.
 5. **RFC vs Spec** — RFC decides *whether/why*; Spec decides *to what extent*; on conflict, RFC wins.
 
+## Cross-repo agreements
+
+- [`specs/002-ascend-backend/boundary.md`](../specs/002-ascend-backend/boundary.md) — Ascend ownership boundary between reinfer and [cann-rs](https://github.com/cann-rs/cann-rs) (mirror: cann-rs/docs/boundary-with-reinfer.md)
+
 ## Current specs
 
 - `specs/000-project-mvp/` — P0 CPU feasibility loop

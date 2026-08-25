@@ -43,5 +43,5 @@ Single source of discipline = CONSTITUTION.md §6.4 (not duplicated here). Revie
 - `specs/005-scheduler-serving/` — continuous batching + OpenAI-compatible HTTP serving
 - `specs/006-cuda-perf/` — FA3/CUTLASS vendor tier + CUDA graph (arch-tiered llama.cpp-CUDA gate)
 - `specs/007-core-inference/` — 🔒 to write (CPU full-path loop; carrier for 005 `--backend cpu` and GPU-less CI)
-- `specs/008-ci-infra/` — 🔒 to write (CI artifacts: jobs / runners / `#[ignore]` matrix / bench gates)
+- `specs/008-ci-infra/` — CI artifacts contract (jobs / runners / `#[ignore]` matrix / bench gates) — spec ready
 - Parity matrix — [`specs/000-project-mvp/parity.md`](../specs/000-project-mvp/parity.md)

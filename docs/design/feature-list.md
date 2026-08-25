@@ -12,7 +12,7 @@
 | ASC-02 | `error.rs`: `cann::Error → LaunchError` (whitelist mapping: OOM/Driver/Fatal) | `crates/ascend` | 002/plan §Error mapping | cann::Error (is_oom/is_recoverable) ✅ | unit tests | ✅ ready |
 | ASC-03 | `diag()` + `reinfer diag` subcommand (CANN version str/num, device count, readable errors) | `crates/ascend`, `bin/reinfer` | 002/spec §AC | cann::Version/Context ✅ | NPU-runner smoke | ✅ ready |
 | ASC-04 | Contract conformance tests (signatures vs `cann` HEAD) | `crates/ascend` | 002/tasks T4 | — | CI | ↔ later (needs SDK) |
-| ASC-05 | CI three-tier: lint (no SDK) / build (`--features ascend`, SDK) / NPU smoke | infra | 002/tasks T5 + 008-ci-infra | — | CI | 🔒 待 008-ci-infra |
+| ASC-05 | CI three-tier: lint (no SDK) / build (`--features ascend`, SDK) / NPU smoke | infra | specs/008 (can-gpu runner 预留) | — | CI | ✅ specs/008 定义 |
 
 ## Track 2 — CPU / P0 (specs 000 + 001) — **unblocked**
 

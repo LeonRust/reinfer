@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 reinfer-core = { workspace = true }
+reinfer-cuda = { workspace = true }
 
 [features]
 default = []
-cuda = []
+cuda = ["reinfer-cuda/cuda"]
 ascend = []
 
 [lints]

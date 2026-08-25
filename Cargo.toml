@@ -25,6 +25,7 @@ reinfer-jit       = { path = "crates/jit" }
 reinfer-cuda      = { path = "crates/cuda" }
 reinfer-ascend       = { path = "crates/ascend" }
 reinfer-server    = { path = "crates/server" }
+cudarc            = "0.19"   # 仅 crates/cuda 经 feature `cuda` 可选启用
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -4,69 +4,68 @@
 
 ## Architecture Decisions
 
-- **D1 Libs**: `cudarc` for driver/runtime/cublas — the only GPU dependency (feature `cuda`); FFI surface stays inside `crates/cuda` (narrow, one crate).
-- **D2 Kernel ownership**: all hand-written kernel sources live in `crates/cuda/kernels/*.cu` as crate assets, compiled at runtime by `crates/jit` (nvcc, source-hash keyed, FileLock, on-disk cache `~/.cache/reinfer/jit`) — mirrors FlashInfer `JitSpecNvcc` protocol (tri_phase try_load/build/load) but with our own hash/locking. No bindgen, no build-time CUDA for non-GPU CI.
-- **D3 GEMM**: cuBLAS via `cudarc::cublas` (fp16/bf16/f32). Prefill attention = two GEMMs + split-k epilogue (non-flash acceptable for this slice; FA3 upgrade in 005).
-- **D4 Paged KV**: policy lives in `crates/memory` (block allocator, refcount, free list — backend-agnostic) with `MemOps` trait; `crates/cuda` implements `MemOps` (VMM not required yet; `cudaMalloc`-sized slabs, block size 16/32).
-- **D5 Error mapping**: `cudaError_t → LaunchError` by whitelist: `cudaErrorMemoryAllocation` → `Oom`; context-lost class (`cudaErrorDeviceUnavailable`, `cudaErrorNoDevice`, `cudaErrorIllegalAddress` bounded set) → `Driver`; everything unknown → `Fatal` (fail-closed, same rule as Ascend contract).
-- **D6 Determinism**: every kernel independently numerical — host CPU reference counterpart per kernel; parity test at text level vs llama.cpp.
+- **D1 依赖**：仅 `cudarc`（driver/runtime/cublas，feature `cuda`）；FFI 面收敛于 `crates/cuda`（unsafe 宿主）。
+- **D2 Tier 语义（与深入设计补充 §1 对齐并补谱系）**：`Vendor`（预编译 cubin/vendor 库）> `Jit`（引擎自有 CUDA C++ 经 JitCache nvcc 编译——含本切片全部 kernel）> `Native`（直写 Rust/CubeCL 内核——CUDA 侧暂缺，保留档位）> CPU 参考。本切片选择链实为 `Jit(dense)` 单档；006 升级为 `Vendor > Jit(fmha) > Jit(dense)`。`select()` 与 TuneDb 位于 `crates/kernels`（safe 层），Provider 实现（触 FFI）位于 `crates/cuda`。
+- **D3 GEMM**：cuBLAS。F16 路径用 fp16 累积（与 llama.cpp `CUBLAS_COMPUTE_16F` 一致），比对时双侧强制同 compute type；Q8_0 为"dequant→fp16→GEMM"（与 referee mmq 不同的算法，作为记录差异，见 spec 三层门禁）。
+- **D4 JitCache**（按评审加固）：键 = sha256(源码 + 头传递闭包(nvcc -M depfile) + gencode/flags + nvcc --version + capability)；写入 temp+rename；`cuModuleLoad` 失败→删除重建一次；prewarm = 启动**阻塞**前滚完成（不在后台与首请求并发）；按 key 粒度文件锁（双检）；锁文件放 /tmp；无 GPU CI 用 `REINFER_CUDA_ARCH` + 预烘焙 cubin 缓存。
+- **D5 错误映射**：`cudaError→LaunchError` 白名单 fail-closed（表锚定 002/plan）。
+- **D6 确定性**：采样 RNG 为纯函数（契约见 005：`rng(seed_i,pos,v)`）；本切片先实现 greedy + gumbel-max，种子沿用 005 定义。
+- **D7 数值容差表**（唯一判据来源）：
+
+| 输出 dtype | 判据 |
+|---|---|
+| fp16/bf16 | 参考先舍入到同 dtype，再比较：≤1 ulp 视为相等 |
+| fp32 | rtol=1e-5, atol=1e-7（numpy allclose 语义，pr 取 max） |
+| GEMM（按输入累积） | f16-accurate：rel 1e-4；bf16：rel 1e-2 或舍入后精确；f32：rel 1e-5 |
 
 ## Module Breakdown
 
-| Module | Content |
+| 模块 | 内容 |
 |---|---|
-| `crates/cuda/src/ctx.rs / device.rs / stream.rs / event.rs / buffer.rs` | safe wrappers (mirror of cann L0 shapes; `DeviceBuffer: Send`) |
-| `crates/cuda/src/error.rs` | cudaError→LaunchError whitelist + tests |
-| `crates/jit/src/nvcc.rs` | find nvcc, build cmd, `#gencode` per arch (sm80/90/100 family), hash-key, lock, cubin cache load/store |
-| `crates/cuda/src/kernels/mod.rs` | kernel registry (`KernelHandle` → cubin symbol) |
-| `crates/cuda/src/kernels/{norm,rope,softmax,quant,attn}.cu` | RMSNorm, RoPE, masked softmax, Q8_0/F16 decode, GQA paged decode kernel |
-| `crates/cuda/src/gemm.rs` | cuBLAS wrapper (`f16/f32` matmul, no-op guard when cuda absent) |
-| `crates/cuda/src/pool.rs` | `MemOps` impl: slab alloc + block table + page ops (leak counters) |
-| `crates/memory/src/block.rs` | backend-agnostic block allocator policy (refcount + free list + epochs) |
-| `crates/cpu/src/kernels/*.rs` | CPU reference counterparts for every GPU kernel |
-| `bin/reinfer/src/cli.rs` | `--backend {cpu,cuda}` routing; `cli` subcommand streams |
+| `crates/cuda/src/{ctx,device,stream,event,buffer,error}.rs` | 安全包装（DeviceBuffer: Send） |
+| `crates/cuda/src/gemm.rs` | cuBLAS 包装（f16/f32，compute type 可选） |
+| `crates/cuda/src/kernels/{norm,rope,softmax,quant,attn,sampler}.cu` | 引擎自有内核（Jit 档） |
+| `crates/cuda/src/pool.rs` | `MemOps` CUDA 实现（slab+页表+泄漏计数） |
+| `crates/kernels/src/tunedb.rs` | tune.json 读写 + `select_*`（safe，供全后端复用） |
+| `crates/memory/src/block.rs` | 后端无关块分配器策略 |
+| `crates/cpu/src/kernels/*.rs` | 每 kernel 的 CPU 参考 |
+| `crates/engine`（本切片末建，005 建） | ModelRunner/Engine 宿主（forbid unsafe） |
+| `bin/reinfer/src/cli.rs` | `--backend {cpu,cuda}` 路由 |
 
-## Interface Contracts (slice-local)
+## Interface Contracts（标注 crates/cuda，非 kernels）
 
 ```rust
-// crates/cuda
-pub struct CudaContext;                      // cudarc CUDA init + device set per-thread
-impl CudaContext { pub fn init() -> Result<Self, LaunchError>; }
-pub struct CudaStream; pub struct CudaEvent;
-pub struct CudaBuffer { /* Send */ }         // cudaMalloc slab / pinned host
-pub fn map_error(e: cudaError_t) -> LaunchError;   // whitelist, fail-closed
-
-// crates/kernels
-pub fn launch_norm(...) -> Result<(), LaunchError>;   // RMSNorm epilogue fused
+// crates/cuda（unsafe 宿主）
+pub fn map_error(e: cudaError_t) -> LaunchError;      // 白名单 fail-closed
+pub fn launch_norm(...) -> Result<(), LaunchError>;
 pub fn launch_rope(...) -> Result<(), LaunchError>;
 pub fn launch_masked_softmax(...) -> Result<(), LaunchError>;
-pub fn launch_dequant(...) -> Result<(), LaunchError>;         // Q8_0 / F16 → f16 fp32acc
-pub fn launch_paged_attn_decode(...) -> Result<(), LaunchError>; // GQA, block 16/32, smem staging
+pub fn launch_dequant(...) -> Result<(), LaunchError>;
+pub fn launch_paged_attn_decode(...) -> Result<(), LaunchError>;   // GQA block16/32
+pub fn launch_sampler(...) -> Result<(), LaunchError>;             // masked softmax + gumbel + argmax
 
-// crates/memory (backend-agnostic policy)
-pub trait MemOps { fn alloc(&mut self, pages: usize) -> Result<PageSpan, ...>; ... }
-pub struct BlockPool;                        // refcount, free list, epoch pairs
+// crates/kernels（safe：trait/注册/选择/调优）
+pub trait KernelProvider { fn tier(&self) -> ProviderTier; fn launch(...); }
+pub struct TuneDb; pub fn select(...);
 
-// crates/jit
-pub struct JitCache;                         // nvcc + hash + lock + ~/.cache/reinfer/jit + prewarm
-impl JitCache { pub fn get_or_build(&self, key: &JitKey, src: &str) -> Result<JLib, LaunchError>; }
+// crates/memory（后端无关策略）
+pub trait MemOps { fn alloc(&mut self, pages: usize) -> Result<PageSpan, ...>; }
 ```
 
-## Reference assets (资产清单 → 依据 docs/深入设计补充 §3)
+## Reference assets（只列增量，全量见 docs/深入设计补充 §3）
 
-- llama.cpp `ggml-quants.c` — Q8_0 dequant math → port to CUDA kernel + CPU reference
-- FlashInfer `jit/core.py` — three-phase try_load/build/load + FileLock protocol → JitCache design
-- vLLM block pool (`kv_cache_manager.py`, `block_pool.py`) — refcount/free-list semantics → `crates/memory::BlockPool`
-- mistral.rs / ferrum-runtime — cudarc integration patterns (contexts per thread, cublas usage)
-- mini-sglang `kernel/index.cu`, `store.cu` — PDL launch hints & warp-copy idioms for decode kernels
+- llama.cpp `ggml-quants.c` — Q8_0 数学（仅算法）；`mmq.cuh` 结构仅作 RFC 参考，本切片不复刻
+- FlashInfer `jit/core.py` — 三段式 + FileLock + 双检范式
+- vLLM `kv_cache_manager/block_pool` — refcount/free-list 语义
+- mini-sglang `index.cu`/`store.cu` — warp-copy/PDL 惯用法
+- ferrum-runtime — cudarc 多上下文每线程用法
 
 ## Risk Assessment
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| nvcc JIT first-call latency (seconds) | Medium | prewarm at startup (background thread); hash-cached cubin makes it one-time |
-| No GPU in dev environment | Medium | CPU differential is the primary CI gate; GPU parity only on runner |
-| Naive paged decode < 3× CPU gate | High | gate set relative to llama.cpp CPU initially; block-16 + smem staging first; FA3 upgrade path (005) is the committed fallback |
-| cudaError class drift | Low | fail-closed whitelist + test for `unknown → Fatal` |
-| Non-CUDA CI accidentally compiling CUDA path | High | `#[cfg(feature="cuda")]` on every module; no-GPU CI also runs `cargo check -p reinfer-cuda --no-default-features` |
-| Device determinism vs llama.cpp (ulps → token flips) | Low | greedy + same seed; parity gate = 100% tokens for Llama family with 1e-5 kernel tolerance |
+| Risk | Mitigation |
+|---|---|
+| 与 llama.cpp 算法差异导致 token 差（High，评审定级） | 三层门禁（spec）；差异声明 notes；mmq 复刻为 RFC |
+| JitCache 缓存失效（head 变更/nvcc 升级） | D4 键含头闭包与 nvcc 版本；原子写 |
+| prewarm 与首请求竞争 | D4 阻塞式预热 + 锁内双检 |
+| nvcc 缺失/toolkit 不足 | 专用错误；按 arch 检查最低版本（sm90a≥12.3/sm100a≥12.8） |
+| 无 GPU CI 空转 | `#[ignore]` 矩阵 + JitCache/TuneDb/选择器单测跑无 GPU 档；008-ci-infra |

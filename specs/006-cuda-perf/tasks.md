@@ -1,37 +1,42 @@
 # Tasks: CUDA performance upgrade
 
-> Derived from specs/006-cuda-perf/plan.md
+> Derived from specs/006-cuda-perf/plan.md · 容差用 003 D7 表
 
-## Task 1: FMHA prefill kernel (Vendor-CUTLASS 档)
+## T1: FMHA prefill (Jit 档)
 
-- `fmha/` kernel（sm90a warpspec + simple 模板）经 JitCache 编译；`prefill_attn_quad()` 替换 003 两段 GEMM
-- Verification: kernel 差分 ≤1e-5（CPU 参考）+ 4K seq 对 003 输出文本一致（≥99.9%）；无 sm90 设备 skip
+- 摘录头 version.json + `.cu` 编译（sm90a/100a gencode 梯度 + CUTE flag 注入）；heuristics（head_dim/warp/分块，按 flashinfer `fmha_v2` 启发式样例）
+- Verification: 差分 ≤D7（fp16 出），4K seq vs 003 dense 文本 100%；无 sm90a 设备 skip；源码含 wgmma 时编译失败→回退 dense（不假装降级）
 
-## Task 2: TuneDb v1
+## T2: TuneDb + select (crates/kernels)
 
-- `tune.json`（device/op/cfg → 时间测量）+ `select_fmha` 选择器；自动 `bench_and_record`
-- Verification: 首测（慢）+ 二次（快速读到）+ 设备过滤
+- tune.json（原子写+写锁+损坏容错=重 bench）；`select_fmha` 回退链单测（无 GPU → 恒 dense）
+- Verification: 首测慢/二次快；损坏 JSON 可恢复；无 GPU CI 绿
 
-## Task 3: FA3 cubin 装载（可选项）
+## T3: Vendor cubin（manifest 供应链）
 
-- `fa3/`: 下载 → sha256 校验 → `cuLibraryLoad` → `cudaLaunchKernelEx`（在 sm100a/sm120a 设备）
-- Verification: 无 cubin 时 `select() → D2`；有 cubin 时 D3 优先 & 正确性 diff
+- `cubins/manifest.json`（sha256/arch/来源）入库；加载+校验；离线→硬失败（无静默下载）；失败→回退 Jit(fmha)+warn；vendored release 分发路径
+- Verification: 篡改 manifest → load 拒绝并回退；离线行为断言；checksum 来源=仓库内（非下载侧）
 
-## Task 4: CUDA Graph pool
+## T4: Graph pool（decode-only）
 
-- `GraphPool` 捕获（bs 桶 8/16/32/64 × seq 桶 512/1024/2048/4096）；重放/eager 回退；`cudaGraphExecUpdate` 快速断言
-- Verification: 各桶捕获/重放与 eager diff ≤1e-5；桶外走 eager 日志可见；内存增量 ≤ 8%
+- 桶 8..128/8、128..256/16；单池；profile 记账；捕获全局锁；捕获期 `--no-overlap`；ExecUpdate 限 ptr 刷新（失败 re-instantiate）；运行期计数（replay/eager/padding per bucket）
+- Verification: 各桶回放==eager 100% token + ≤1 ulp；execupdate 失败路径重实例化；内存增量实测记录
 
-## Task 5: 双流重叠
+## T5: 双流重叠
 
-- attn / ffn 事件对（`compute/comm` reserve）；`overlap::{wrap, sync}`
-- Verification: 基准记录（decode/prefill 各自 ratios）; 不稳定时允许 `--no-overlap` 降级开关
+- 模式①（事件入图）与 ②（--no-overlap）；捕获窗口外部多流允许
+- Verification: 两模式结果一致；捕获期串行断言（无并发发射）；`--no-overlap` 开关生效
 
-## Task 6: 基准与门禁收尾
+## T6: decode fused Q8_0 dequant-dot 核（sm90 门禁前提）
 
-- `bench/notes.md`：record decode/prefill × llama.cpp-CUDA; `ck --perf` 回归（>10% 掉速阻断）
-- CI: GPU job 增加 `perf` 任务（nightly 或 label 触发）；`--features cuda` 无 GPU 时仍全绿
+- 寄存器内解量化+dot（mmvq 级结构，算法不抄代码）；替代"dequant→GEMM"路径（dense fallback 保留）
+- Verification: 差分 ≤D7；decode 相对 003 提升记录；**sm90 门禁在 T6 落地后才按 0.85× 判决**
+
+## T7: 基准协议 + 回归门禁
+
+- `bench/` 协议脚本（llama-bench 参数/commit/构建 flags/UUID 记录）；`baseline.json`（5 次中位数）；`--perf` 对比输出；CI：中位数 ≤0.9× 基线 → 红（10% 阈值，与 000 的 5% CPU 档并存注明）
+- Verification: 重放基准两遍一致；CI 模拟阈值判定（fixture）通过
 
 ---
 
-Completion gate：Tasks 1–6 完成；decode ≥85% llama.cpp-CUDA、prefill ≥70%；bench 数据 + 回退链文档入库；评审通过。至此 P1/P1.5 结束，下一步 P2（Ascend 完整，依托 cann-rs L1/L2 进度）与 P3 规格。
+Completion gate：T1–T7 accepted；sm100 decode ≥0.85× / sm90（T6 后）≥0.85×，未达 T6 前回退档（≥max(0.7× CUDA, 6× CPU)）记录；prefill ≥0.7×；notes+baseline 入库。下一步：007-core-inference（CPU 全链路，为 005 `--backend cpu` 与无 GPU CI 提供载体）与 008-ci-infra。

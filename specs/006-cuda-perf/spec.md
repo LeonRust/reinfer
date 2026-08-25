@@ -1,37 +1,44 @@
-# Spec: CUDA performance upgrade — FA3/CUTLASS vendor tier + CUDA graphs
+# Spec: CUDA performance upgrade — vendor tier + CUDA graphs
 
-> Status: proposal · Owner: maintainers · Created: 2026-08-25 · Parent: specs/003 (correctness base)
+> Status: approved (review 2026-08-25) · Parent: specs/003 · 修订记录：门禁 arch 分档；仅 decode 捕获；单池实测记账；供应链 manifest；spec 层去厂商化；'007 RFC' 改为"后续增量 spec"。
 
 ## Problem Statement
 
-003 交付了正确性（功能关然）——但 GPU 性能未达标：prefill 是两段 GEMM（内存峰值、带宽低效），decode 是手写 naive，缺少 graph 捕获。006 的目标是**基于 vendor 档的两种关键能力**把吞吐对齐到 85% llama.cpp-CUDA：① FMHA prefill（CUTLASS/FA3 cubin 装载）② CUDA Graph 桶化捕获与重放。
+003 提供了正确性路径（Jit 档 dense kernel）；本切片把性能拉到对标杆：① prefill 用 vendor/Jit FMHA 替换两段 GEMM；② decode 高频路径引入 fused 量化核（sm90 门禁前提）；③ CUDA Graph 桶化（decode-only）。回退链始终保留：性能提升不得以失去 003 正确性路径为代价。
 
 ## Success Metrics
 
-- **性能**: decode ≥ **85% llama.cpp CUDA**（同 GPU 同模型同 batch）；prefill（4K seq, fp16）≥ 70% llama.cpp CUDA
-- **正确性**: 与 003 差分一致（文本 100% 对齐；kernel level ≤1e-5）；图形捕获后单请求/多请求结果与 eager 相同（≥99.9% 灰度——bucket miss 时自动回退 eager）
-- **内存**: 复用 003 页池；graph buffer 池化固定（捕获 batch 桶 16/32/64 时峰值 ≤ 基线 + 8%）
-- **工程**: 无 GPU CI 不变；加 `--perf` 回归基准记录（`bench/notes.md`）与回归门禁（1 个 decile 掉速即阻）。
+- **正确性（硬门）**：同形状图重放与 eager **100% 逐 token 一致 + kernel 差分 ≤1 ulp**；回退率另记（回退不等于错误）；实现与 eager 不合时强制回退（D4/D6）。
+- **性能门禁（arch 分档，协议锁定见基准协议文档）**：
+  - sm100：decode ≥ **0.85×** llama.cpp CUDA（cuBLAS tcgen05 路径先验）；
+  - sm90：decode ≥ 0.85× 当且仅当 **decode fused Q8_0 dequant-dot 核（T6）** 落地；未落地前回退档 = `max(0.7× llama.cpp CUDA, 6× llama.cpp CPU)`；
+  - prefill ≥ **0.7×** llama.cpp CUDA（CUTLASS FMHA 路径）；
+  - 对比条件固定：KV dtype=f16、graph on（双侧）、同模型 sha、同 batch、预热≥3 取中位数、commit f280b2698 + 构建标志锁定（基准协议）。
+- **内存**：graph 捕获内存**实测记账**（profile 法）并计入预算公式；桶池化缓冲增幅记录（预期 ≤8%，以实测为准）。
+- **运行期信号**：graph_replay / eager_fallback / padding_ratio 计数器；5 分钟内 eager 比例 >20% → 告警指标（不作为硬门禁，记录于监控）。
+- **工程**：无 GPU CI 仍绿；006 门禁仅 gpu-runner 判定；无 GPU 档仅测 JitCache 键/锁、TuneDb 读写、选择器回退链（恒定回退 003）。
 
 ## User Stories
 
-1. 作为引擎作者：`KernelProvider` 档1(Vendor cubin) 支持 sm90+ 的 FMHA（CUTLASS gen + FA3 via flashinfer-cubin 下载协议）；装载走 `crates/jit`（同一 JitCache，键=sha256+device）。
-2. 作为服务者：`--features cuda` 单卡吞吐对齐 llama.cpp-CUDA 见 `bench/notes.md`。
+1. 作为引擎作者：`select()` 对同一 OpConfig 自动选 Vendor(cubin) > Jit(fmha) > Jit(dense)，并可从 `TuneDb` 读取实测量；回退传递对引擎透明。
+2. 作为服务者：`--perf` 输出与 llama.cpp 同协议的对比；`bench/notes.md` + `bench/baseline.json` 机器可读。
+3. 作为维护者：离线（无 GPU/无网）构建与单元测试不受影响；供应商资产经 manifest 变更受审。
 
 ## Acceptance Criteria
 
-- [ ] FMHA prefill kernel 替换两段 GEMM（`kernels/fmha/*.cu` 经 JitCache nvcc 编译；sm90 warp-mem layout，sm80 fallback 保留 003 路径）
-- [ ] 可选档1：FA3 cubin 装载器（cudarc + cubin sha256 + version-check 脚本挂 CI；下载失败自动回退 CUTLASS）
-- [ ] CUDA Graph：`capture(bucket)` 池（bs×seq 桶 8/16/32/64；内存复用 `cudaGraph` 管理）；`replay` + event 同步；桶 miss → eager 回退
-- [ ] 双流重叠：`attn` 与 `FFN` 流分离（`cudaStream` 双流 + 无界队）
-- [ ] `bench/notes.md` 记录：decode/prefill 相对 llama.cpp-CUDA 的比值、图捕获收益（~18+%，对 ferrum 基线）、`--perf` 回归列盘
+- [ ] FMHA prefill 落地（引擎自有源码 + 运行时编译；sm90a gencode；heuristics 按实测），与 003 dense 路径差分 ≤ 容差表；无相应 arch 时回退 003
+- [ ] decode fused Q8_0 dequant-dot 核（T6）独立交付并过差分；sm90 门禁在此核存在后才生效
+- [ ] vendor cubin 档：期望 sha256 从**入库 manifest**校验；离线 → 硬失败（不静默下载）；优先随 release vendored 分发；校验失败回退 Jit(fmha) 并 warn
+- [ ] Graph：decode-only 桶（8..128 步进 8、128..256 步进 16）；单一共享内存池；捕获全局串行化；捕获期强制 `--no-overlap`；ExecUpdate 仅限同形状指针刷新（失败 re-instantiate）；prefill 不捕获（实验性小桶须显式开关）
+- [ ] 双流重叠两模式：图内事件节点（llama.cpp 式）或 `--no-overlap`（vLLM 式）；捕获期唯一
+- [ ] 基准协议 + `baseline.json`（5 次中位数）+ 回归门禁（CI 红 = 中位数 ≤ 0.9× 基线）；10% 为 GPU 档阈值（000 的 5% 为 CPU 档，两档并存）
 
 ## Non-Goals
 
-- Flash MoE/MLA（P4）；warp specialization 级优化手工调（留 007 RFC）；torch.compile/IR 编译；多卡 CC 调度
+- Flash MoE/MLA（P4）；warp specialization 手工调（后续增量 spec 006-2）；IR 编译/跨卡调度；非 decode 的图捕获（除实验性开关外）
 
 ## Constraints
 
-- llama.cpp-CUDA 作为 referee（同 003）；vendor cubin 下载协议复用 flashinfer-cubin 思想（但不做 Python 依赖；脚本式即可）
-- 所有 vendor 挂载失败必须有明确 fallback 链（Vendor→CUTLASS→003 code）
-- 与原 KernelProvider 三档选择逻辑一致：同一 `OpConfig` 决策
+- 引擎自有源码 + 供应商预编译资产两条线并存；**任何 vendor 覆盖必须有显式回退链**（Vendor → Jit(fmha) → Jit(dense)/003）
+- 裁判 = llama.cpp CUDA（commit/参数锁定）；所有比值固定 KV dtype=f16、graph on
+- 供应链：manifest 提交入库、变更走 PR 审查；禁止"脚本下载+同源自校验"

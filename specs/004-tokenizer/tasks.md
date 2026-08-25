@@ -10,7 +10,7 @@
 ## Task 2: SPM encode
 
 - byte-level unicode 映射 + llama 风格最贪心匹配（unk fallback；`add_bos` 规则）
-- Verification: `tests/golden/` 中 Llama 提示词集 encode == golden ids（100%）
+- Verification: `tests/golden/` 中 Llama（SPM）提示词集 encode == golden ids（100%）；golden 以 `llama-tokenize --ids` 生成并锚定 commit/GGUF sha/convert 版本（parity.md）
 
 ## Task 3: BPE encode
 
@@ -20,7 +20,7 @@
 ## Task 4: IncrementalDecoder
 
 - read/surr 状态机：任意 `[0..k]` 切分下 `decode_chunk` 串接 == `decode_all`；坏 id → `[UNK]`（对齐 llama.cpp）
-- Verification: 单测（ASCII/CJK/emoji/多字节触发边界）+ proptest（随机 unicode 字符串，两路等价性）
+- Verification: 单测（ASCII/CJK/emoji/多字节触发边界）+ **三层 fuzz**（边界语料 ~50 条 / 随机 unicode / 随机 token-id 含越界，见 spec AC）；任意切分等价性为恒等断言
 
 ## Task 5: 集成与 fuzz
 

@@ -19,13 +19,15 @@ specs/<NNN>-<slug>/
 CONSTITUTION.md   immutable project principles (Spec Kit's constitution.md slot)
 ```
 
-## Discipline (all specs obey)
+## Discipline
 
-1. **Granularity check** — re-implement the spec with a different tech stack; if it breaks, you smuggled HOW into WHAT.
-2. **Incremental specs** — new requirements or bug fixes immediately get an incremental spec; never let spec rot.
-3. **Micro-change exemption** — purely local tweaks (copy, style, local variables) skip the full cycle.
-4. **Validate is never skipped** — a spec replaces the requirements document, never Code Review or CI.
-5. **RFC vs Spec** — RFC decides *whether/why*; Spec decides *to what extent*; on conflict, RFC wins.
+Single source of discipline = CONSTITUTION.md §6.4 (not duplicated here). Review verdicts: `docs/design/review-2026-08-25.md`.
+
+### Exemption lane (micro-change channel, §6.4c)
+
+- **Eligibility**: does NOT change AC / metrics / contract signatures / feature-list status, and validates unchanged (fmt/clippy/test green).
+- **Record**: reviewer notes "exempt (conditions met)" in the PR description to merge.
+- **Boundary**: any change touching AC / metrics / contracts always goes through an incremental spec (non-exemptible); when in doubt, treat as non-exempt.
 
 ## Cross-repo agreements
 
@@ -39,4 +41,7 @@ CONSTITUTION.md   immutable project principles (Spec Kit's constitution.md slot)
 - `specs/003-cuda-l0/` — NVIDIA GPU base + single-request inference loop (first P1 slice)
 - `specs/004-tokenizer/` — GGUF SPM/BPE tokenizer + incremental UTF-8 decode (feeds 003/005)
 - `specs/005-scheduler-serving/` — continuous batching + OpenAI-compatible HTTP serving
-- `specs/006-cuda-perf/` — FA3/CUTLASS vendor tier + CUDA graph (85% llama.cpp-CUDA gate)
+- `specs/006-cuda-perf/` — FA3/CUTLASS vendor tier + CUDA graph (arch-tiered llama.cpp-CUDA gate)
+- `specs/007-core-inference/` — 🔒 to write (CPU full-path loop; carrier for 005 `--backend cpu` and GPU-less CI)
+- `specs/008-ci-infra/` — 🔒 to write (CI artifacts: jobs / runners / `#[ignore]` matrix / bench gates)
+- Parity matrix — [`specs/000-project-mvp/parity.md`](../specs/000-project-mvp/parity.md)

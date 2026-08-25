@@ -4,50 +4,51 @@
 
 ## Architecture Decisions
 
-- **D1 三档落地顺序**：002 定的 Vendor > Native > Jit 在此落地为：`Native(003 code)` → `Vendor-CUTLASS(FMHA)` → `Vendor-cubin(FA3, optional)`。每一档都是 `KernelProvider` 的一个实现，`select()` 按 `OpConfig`（sm 型号 + 桶形状 + 裁剪标志）选择，调优 score 入 `TuneDb`（`kernels/{device}/{op}/{cfg}/tune.json`）。
-- **D2 FMHA 装载**: FMHA 以源码形式随 crate（`crates/cuda/kernels/fmha/*.cu` + `include/flashinfer` 风格的 cutlass 头），经 JitCache nvcc 编译（gcode sm90a/sm100a）；初版用 flashinfer FMHA2 风格（100 行 kernel cuda，sm90 warpspec 懒做——007），存 heuristics：`head_dim 128 → warp 64`、`seq > 512 → 分块 128`。
-- **D3 cubin 装载**: `cubins/{device}-{arch}/fa3-{sha256}.cubin` 与 `cudaLaunchKernelEx`；下载脚本（curl % 源 + js 小工具 sha256 校验），手动/CI 交付，失败回退 D2。
-- **D4 CUDA Graph**: `GraphPool`（bucket 键 = (bs 桶, seq 桶, dtype)）；捕获模板驱动 `capture()`，复用内存（工作区地址重分配适配）；重放走原 batch 内地址族（`cudaGraphExecUpdate` 静态刷新 8/16/32/64）；miss → eager。
-- **D5 双流重叠**: `compute_stream` + `comm_stream`(预留) — attn/FFN 跨流事件对（`cudaEventRecord/StreamWaitEvent`）。
-- **D6 失败链**: 每个 Provider `launch()` 返回 `Fallback`（回退 003 code）而非 panic。
+- **D1 选择链与归属（评审 A-H1/M1）**：链 = `Vendor(cubin/dylib, curated)` > `Jit(fmha)` > `Jit(dense/003)`。**TuneDb、`select()`、`ProviderChoice` 位于 `crates/kernels`**（safe 层；trait+注册+tune.json 读写）；Provider 实现（触 FFI/cub 加载）位于 `crates/cuda`。tier 定义：Vendor=预编译二进制；Jit=引擎自有 CUDA C++ 经 JitCache 编译（003 全核 + 006 FMHA/decode核）；Native(Rust 直写)=CUDA 侧暂缺保留；CPU 参考在下游。
+- **D2 FMHA 源码**：FMHA 采用**摘录式** vendored 头 + 自有 `.cu`（`.cu` 经 JitCache nvcc，gencode 按 capability：sm90a/100a；最低 CUDA：sm90a≥12.3、sm100a≥12.8、sm120a≥13.0）；cutlass/warp 相关宏（`CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED` 等）由 build 模板注入；"sm90a 失败退 sm90"**仅对 FA2 级源码成立**——含 wgmma/TMA 的源码不降级，直接回退 Jit(dense)；vendored 头目录带 `version.json`（版本 bump 即 JitCache 键失效——对源头文件 hash 之外的头闭包法补充）。
+- **D3 cubin 供应链**：期望 sha256 表以 **`cubins/manifest.json` 入库**（含 arch/来源/版本）；下载仅 HTTPS 固定源；离线或校验失败 → **硬失败回退**（不产静默下载）；优先方案 = vendor cubin 随 release 产物分发（同 flashinfer 包内 cubins 思路）；校验失败 warning 入 tracing。
+- **D4 Graph 池（decode-only）**：
+  - 桶：bs 8..128 步 8、128..256 步 16（vLLM 实测曲线；禁幂次桶）；**prefill 不捕获**（实验性小桶需 `--cuda-graph-prefill=experimental` 显式开启）；
+  - 单一共享 pool（所有桶复用），捕获内存实测记账（profile：首捕获后按图增量累计，计入预算公式）——参考 vLLM `get_global_graph_pool`/`profile_cudagraph_memory` 语义；
+  - 捕获串行化：全局锁（llama.cpp 模式）；**捕获期 `--no-overlap`**；
+  - ExecUpdate：仅"同形状指针刷新"；失败 → destroy + re-instantiate（cudaErrorGraphExecUpdateFailure 路径）；含事件节点或 cuBLASLt handle 的图禁用 ExecUpdate（直接重捕获）；
+  - 运行期计数：graph_replay / eager_fallback / padding_ratio（每桶），告警阈值 5min eager>20%。
+- **D5 双流重叠**：两模式——① 事件节点入图（llama.cpp：graph 内 record/wait）；② 非捕获期 `--no-overlap` 降级（vLLM 模式）；捕获窗口内禁止并发发射（T9 decode 主循环与捕获不得共流并发）。
+- **D6 失败链**：每个 Provider `launch()` 返回 `Fallback`（选择器层概念：回退下一档，不进 LaunchError 枚举）；nvcc 缺失/toolkit 不足 → `LaunchError::Fatal` 专用消息（不静默）；`REINFER_CUDA_ARCH` 唯一影响选择（离线预烘焙）。
+- **D7 门禁与基准**：基准协议 = llama-bench 参数表（decode：`-b 1 -n 512 -fa 1 -ngl 99`；prefill：`-b 2048 -ub 512`），commit f280b2698、构建 flags、GPU UUID/driver/cuBLAS 版本记录；`bench/baseline.json`（5 次中位数，`--perf` 覆写保留历史）；CI 红 = 中位数 ≤0.9× 基线。
 
 ## Module Breakdown
 
 | 模块 | 内容 |
 |---|---|
-| `crates/cuda/src/fmha/` | kernel 源码 + `select_heuristics` + Provider (Vendor-CUTLASS) |
-| `crates/cuda/src/fa3/` | cubin loader（下载/校验/回退链） |
-| `crates/cuda/src/graph.rs` | `GraphPool`/`GraphBucket`, 捕获/重放模板 |
-| `crates/cuda/src/overlap.rs` | 双流 wrap（事件对 API） |
-| `crates/cuda/src/tunedb.rs` | bench 自动调优 + `tune.json` 读写 + 调度键 |
+| `crates/cuda/src/fmha/` | FMHA 源码（engines-owned）+ heuristics |
+| `crates/cuda/src/decode/` | fused Q8_0 dequant-dot decode 核 |
+| `crates/cuda/src/fa3/` | cubin 加载 + manifest 校验（D3） |
+| `crates/cuda/src/graph.rs` | GraphPool（D4） |
+| `crates/cuda/src/overlap.rs` | 双流双模式（D5） |
+| `crates/kernels/src/tunedb.rs` | TuneDb/select/ProviderChoice（safe） |
+| `bench/` | 协议脚本、baseline.json、notes |
 
-## Interface Contracts (slice-local)
+## Interface Contracts（选择器在 kernels；loader 在 cuda）
 
 ```rust
-pub struct FmhaProvider;                 // KernelProvider impl（Vendor-CUTLASS）
-impl FmhaProvider { pub fn launch_attn_prefill(...); }      // sm90+；否则 None
-pub struct Fa3CubinProvider;             // 可选：需设备上存在 cubin；否则 None → 自动回退
-pub struct GraphPool;                    // get_or_capture(bucket) / replay(bucket, batch) / release(bucket)
-impl GraphPool {
-  pub fn get_or_capture(&mut self, key: BucketKey, tpl: &GraphTemplate) -> Result<usize, LaunchError>;
-  pub fn replay(&self, idx: usize) -> Result<(), LaunchError>;
-}
-pub struct TuneDb;                       // load/save tune.json；select() 读
-pub fn select_fmha(cfg: &OpConfig, db: &TuneDb) -> enum ProviderChoice; // Vendor>CUTLASS>native>eager
+// crates/kernels (safe)
+pub enum ProviderChoice { Vendor(JitKey), JitFmha(JitKey), JitDense(JitKey) }
+pub fn select_fmha(cfg: &OpConfig, db: &TuneDb) -> ProviderChoice;   // fallback 链决定
+pub struct TuneDb { /* load/save tune.json, atomic write */ }
+
+// crates/cuda
+pub struct Fa3Provider;   // manifest 校验 + 回退链
+pub struct GraphPool;     // get_or_capture(bucket, tpl) / replay / release + counters
+pub fn sample_decode_quant_dot(...) -> Result<(), LaunchError>;   // T6 核心
 ```
-
-## Reference assets
-
-- 本地仓库 `flashinfer/`: `fmha_v2/`（heuristics、warp config、TMA/warpspec 配置样例）与 `flashinfer-cubin`（下载 URL/校验语义）——仅借鉴模式，不引入其 Python 生态
-- vLLM `cuda_graph` 桶化 + `registry`（buffer 生命周期）→ `GraphPool`
-- ferrum-runtime: CUDA Graph +18% 参考数据（notes 中对标基准）
-- llama.cpp 后端 2026 年对 sm90/100 的 tiling 调整（参考 `ggml-cuda/fmha-tiled`）
 
 ## Risk Assessment
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| cubin/源码与 sm90a/100a 差异导致编译失败 | High | gcode 分级（sm90a 若失败退 sm90）；`select_heuristics` 仅按实测列 |
-| graph 捕获下 batch 逃出桶（miss 增长） | Medium | 桶宽设计（8/16/32/64）+ 重放 fallback eage no-graph；桶 miss 余量监控 |
-| vendor 回退链风险（静默降级） | Medium | 每条路径打 `tracing::warn`；notes.md 记录当日档位 |
-| 源码内嵌 cutlass 头多（体积+SDK 镜像） | Low | fmha 仅用 flashinfer 少量头（`fmha_kernel_head.cuh` 摘录）；依赖仓库体积控制在 +5MB |
+| Risk | Mitigation |
+|---|---|
+| 摘录头版本漂移 → 静默旧语义 | version.json bump + JitCache 头闭包 hash（D2/D4 键） |
+| ExecUpdate 命中性静默错 | 仅 ptr 刷新 + re-instantiate 回退 + 计数 |
+| 捕获内存爆预算 | decode-only + 单池 + profile 记账入预算 |
+| run 期桶 miss 飚高静默 | 计数器 + 5min eager>20% 告警（notes/监控） |
+| CUTLASS 头体积 | 摘录 FMHA 必需头（不 vendored 全量），+体积实测记录 |

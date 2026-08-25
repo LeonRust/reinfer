@@ -8,7 +8,7 @@
 
 3. **语言**：与用户交流用中文；commit message 与代码注释一律英文（Conventional Commits，见宪法 §3.1）；仓库文档默认英文，中文版以 `-zh-CN` 后缀文件并存。
 
-4. **环境约定**：昇腾变量 `CANN_HOME`、`DEVICE_ID`；NVIDIA `CUDA_VISIBLE_DEVICES`；禁止在未询问的情况下安装全局依赖或改变目标机配置。
+4. **环境约定**：昇腾变量 `ASCEND_TOOLKIT_HOME`（cann-rs 路径探测顺序：ASCEND_TOOLKIT_HOME → ASCEND_HOME_PATH → ASCEND_HOME → ~/Ascend/cann → /usr/local/Ascend）、`DEVICE_ID`；NVIDIA `CUDA_VISIBLE_DEVICES`；禁止在未询问的情况下安装全局依赖或改变目标机配置。
 
 5. 以对话形式给出的修改建议**不算**执行；任何实质改动必须等用户确认。
 

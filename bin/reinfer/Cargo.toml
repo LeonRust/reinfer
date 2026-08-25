@@ -9,7 +9,7 @@ reinfer-core = { workspace = true }
 [features]
 default = []
 cuda = []
-can = []
+ascend = []
 
 [lints]
 workspace = true

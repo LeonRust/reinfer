@@ -16,11 +16,11 @@
 
 1.3 **禁止 `torch` 依赖**——模型权重从 GGUF / safetensors 直读（见设计报告 §3.5）。
 
-1.4 后端按 Cargo feature 编译（`cuda` / `can` / `cpu`），任何后端不得引入强制依赖；无 GPU 环境必须能编译出 CPU 参考实现。
+1.4 后端按 Cargo feature 编译（`cuda` / `ascend` / `cpu`），任何后端不得引入强制依赖；无 GPU 环境必须能编译出 CPU 参考实现。
 
 ## 第 2 章 架构不变量（不可违反）
 
-2.1 **窄 FFI**：`engine/`、`scheduler/`、`radix_cache/` 等核心 crate 禁止 unsafe（`#![forbid(unsafe_code)]`）；所有 unsafe 收敛于 kernel FFI crate（`cuda-bindings`、`can-bindings`、`jit-cache`）。
+2.1 **窄 FFI**：`engine/`、`scheduler/`、`radix_cache/` 等核心 crate 禁止 unsafe（`#![forbid(unsafe_code)]`）；所有 unsafe 收敛于 kernel FFI crate（`crates/cuda`、`crates/ascend`、`crates/jit`；昇腾侧 unsafe 宿主为外部 `cann` crate，经窄接口消费）。
 
 2.2 **三档 KernelProvider**（Vendor > Native > Jit）：每个 OpKind 至少一个纯 CPU 参考实现；任何档的 kernel 必须通过与 naive 参考的数值差分测试（FLA 文化）。
 

@@ -11,7 +11,7 @@ cargo install cargo-deny
 
 # GPU 依赖（按 feature 选择）
 cargo build --release --features cuda   # 需 CUDA + NCCL
-cargo build --release --features can    # 需 CANN >= 7.x，导出 CANN_HOME
+cargo build --release --features ascend # 需 CANN SDK 8.x/9.x，导出 ASCEND_TOOLKIT_HOME（cann-rs 依赖）
 cargo build --release --features cpu    # 无 GPU 也能跑参考实现
 ```
 
@@ -39,7 +39,7 @@ cargo build --release --features cpu    # 无 GPU 也能跑参考实现
 - [ ] `cargo clippy -D warnings` 通过
 - [ ] `cargo test` 全绿
 - [ ] 新 kernel 有 NaN 毒化 / 差分对照测试
-- [ ] 所有 unsafe 已收窄至 `crates/cuda-bindings` / `crates/can-bindings` / `crates/jit-cache`
+- [ ] 所有 unsafe 已收窄至 `crates/cuda` / `crates/ascend` / `crates/jit`（昇腾侧经外部 `cann` crate 窄接口）
 - [ ] 性能变化附 benchmark 对比（回归 > 5% 阻断）
 - [ ] 依赖变更通过 `cargo deny`（仅 MIT / Apache-2.0 / BSD-3 / ISC / BSD-2）
 - [ ] PR 描述含 改动 / 原因 / 验证 三段

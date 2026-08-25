@@ -14,11 +14,11 @@ name = "reinfer-arch"
 version = "0.1.0"
 
 [[package]]
-name = "reinfer-cache"
+name = "reinfer-ascend"
 version = "0.1.0"
 
 [[package]]
-name = "reinfer-can"
+name = "reinfer-cache"
 version = "0.1.0"
 
 [[package]]
@@ -68,3 +68,11 @@ version = "0.1.0"
 [[package]]
 name = "reinfer-server"
 version = "0.1.0"
+
+[[patch.unused]]
+name = "cann"
+version = "0.1.1"
+
+[[patch.unused]]
+name = "cann-sys"
+version = "0.1.1"

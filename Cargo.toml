@@ -23,7 +23,7 @@ reinfer-ipc       = { path = "crates/ipc" }
 reinfer-cpu       = { path = "crates/cpu" }
 reinfer-jit       = { path = "crates/jit" }
 reinfer-cuda      = { path = "crates/cuda" }
-reinfer-can       = { path = "crates/can" }
+reinfer-ascend       = { path = "crates/ascend" }
 reinfer-server    = { path = "crates/server" }
 
 [workspace.lints.rust]
@@ -46,3 +46,4 @@ strip = "symbols"
 # 如确需最终二进制 abort：可将 [profile.release] 下加 panic="abort"，
 # 代价是库侧 catch_unwind 失效（宪法 §2.1 的 FFI 捕获即不可用），
 # 故默认保持 unwind，逐调用处用 Result / catch_unwind 消化错误。
+

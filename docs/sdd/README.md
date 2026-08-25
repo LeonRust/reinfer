@@ -31,3 +31,4 @@ CONSTITUTION.md   immutable project principles (Spec Kit's constitution.md slot)
 
 - `specs/000-project-mvp/` — P0 CPU feasibility loop
 - `specs/001-gguf-loader/` — GGUF loader + typed core layer
+- `specs/002-ascend-backend/` — L0 integration contract with cann/cann-sys (partner repo: cann-rs)

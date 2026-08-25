@@ -1,7 +1,5 @@
-# 标准 rustfmt 配置（放入仓库根目录）
+# 标准 rustfmt 配置（stable 兼容；imports_granularity/group_imports 为 nightly-only，不在此列）
 edition = "2024"
 max_width = 100
 newline_style = "Unix"
-imports_granularity = "Item"
-group_imports = "StdExternalCrate"
 use_small_heuristics = "Max"

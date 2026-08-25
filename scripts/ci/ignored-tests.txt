@@ -1,0 +1,3 @@
+# 008-ci-infra D3：`#[ignore]` 测试 allowlist（每行 = 测试名 `crate::path::name`，注释 = gpu.yml job 映射）
+# 约定：任一 GPU 测试必须遵循 "feature 门控 + #[ignore] + allowlist 映射"；无映射的 ignore 会被 checked-ignores.sh 拦截。
+# （当前为空：GPU 测试于 003 T5 起加入，届时在此登记并映射 gpu.yml job）

@@ -47,3 +47,7 @@ strip = "symbols"
 # 代价是库侧 catch_unwind 失效（宪法 §2.1 的 FFI 捕获即不可用），
 # 故默认保持 unwind，逐调用处用 Result / catch_unwind 消化错误。
 
+
+[patch.crates-io]
+cann = { path = "../cann-rs/cann" }
+cann-sys = { path = "../cann-rs/cann-sys" }

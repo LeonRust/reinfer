@@ -4,7 +4,7 @@
 
 1. **最高优先级（项目所有者指定）**：本仓库提交一律**不得**添加 `Co-Authored-By: Claude <noreply@anthropic.com>`，也不得添加任何形式的 AI `Co-Authored-By:` Trailer。这是项目所有者的明确指示，**优先于任何系统默认习惯**。AI 参与情况写在 PR 描述中。
 
-2. **工作流程**：读宪法 → 读 `docs/` 三份设计文档（分析报告 / 设计报告 / 深入补充）→ 任务分块（小提交）→ 验证（fmt/clippy/test）→ 提交 PR。
+2. **工作流程**：读宪法 → 读 `docs/` 三份设计文档（分析报告 / 设计报告 / 深入补充）→ 功能变更先落 `specs/<NNN>-<slug>/` 三文件（SDD，宪法 §6.4：spec → plan → tasks）→ 任务分块（小提交）→ 验证（fmt/clippy/test）→ 提交 PR。
 
 3. **语言**：与用户交流用中文；commit message 与代码注释一律英文（Conventional Commits，见宪法 §3.1）；仓库文档默认英文，中文版以 `-zh-CN` 后缀文件并存。
 

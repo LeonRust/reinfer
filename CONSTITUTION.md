@@ -75,6 +75,17 @@
 
 6.3 里程碑门禁：P0–P4 验收标准见 `Rust推理引擎设计报告.md` §7；每阶段验收通过后方可宣告进入下一阶段。
 
+6.4 **SDD 工作流（Spec-Driven Development，所有功能变更必走）**：按 `Specify → Plan → Implement → Validate` 四阶段执行，产物为 `specs/<NNN>-<slug>/` 三文件体系：
+   - `spec.md`（需求规格 = 唯一真实来源）：Problem Statement / Success Metrics（**必须可测试**）/ User Stories / Acceptance Criteria / Non-Goals / Constraints；
+   - `plan.md`（架构方案）：Architecture Decision / Module Breakdown / Interface Contracts / Risk Assessment；
+   - `tasks.md`（任务清单）：原子任务 + 每条可独立验证（验证=验收标准）。
+   规则：
+   a. **粒度检验**：换一种技术栈实现该 Spec 仍须成立——Spec 只写 WHAT，Constraints 只允许"外部限制"；
+   b. **增量 Spec**：发现新需求或 BUG 立即写/更新增量 Spec，禁止 Spec 腐烂（spec rot）；Spec 与代码变更同步提交；
+   c. **微变更豁免**：纯局部改动（文案/样式/局部变量）免走全流程；
+   d. **Validate 不可豁免**：Spec 替代需求文档，不替代 Code Review 与 CI 门禁（§3.4）；
+   e. 与 RFC 的关系：RFC 决定"做不做/为什么做"，Spec 决定"做到什么程度"；冲突时以 RFC 为准。
+
 ## 附：许可证与合规
 
 - 本项目采用 **Apache-2.0**（与 MIT / Apache 依赖兼容、含专利授权；与被借鉴的 vLLM / SGLang / FlashInfer 同许可）。

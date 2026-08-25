@@ -37,3 +37,6 @@ CONSTITUTION.md   immutable project principles (Spec Kit's constitution.md slot)
 - `specs/001-gguf-loader/` — GGUF loader + typed core layer
 - `specs/002-ascend-backend/` — L0 integration contract with cann/cann-sys (partner repo: cann-rs)
 - `specs/003-cuda-l0/` — NVIDIA GPU base + single-request inference loop (first P1 slice)
+- `specs/004-tokenizer/` — GGUF SPM/BPE tokenizer + incremental UTF-8 decode (feeds 003/005)
+- `specs/005-scheduler-serving/` — continuous batching + OpenAI-compatible HTTP serving
+- `specs/006-cuda-perf/` — FA3/CUTLASS vendor tier + CUDA graph (85% llama.cpp-CUDA gate)

@@ -22,7 +22,7 @@
 | P0-02 | GGUF reader (header/meta/tensor table + mmap views) | `crates/gguf` | 001/tasks T2–T3 | golden-file + proptest | ✅ ready |
 | P0-03 | Quant codecs naive (Q8_0 / Q4_0 / F16 / FP32) + proptest | `crates/gguf` | 001/tasks T4 | ≤1 ULP golden blocks | ✅ ready |
 | P0-04 | Arch config loader (Llama metadata → typed config; Qwen2 parse) | `crates/arch` | 001/plan §Modules | parse tests | ✅ ready |
-| P0-05 | GGUF tokenizer (SPM/BPE encode + increment-decode from GGUF tokenizer models) | `crates/gguf`(+) | **🔒 needs new spec 003-tokenizer** | golden vs llama.cpp tokens | 🔒 spec first |
+| P0-05 | GGUF tokenizer (SPM/BPE encode + increment-decode from GGUF tokenizer models) | `crates/tokenizer` | ✅ `specs/004-tokenizer` | golden vs llama.cpp tokens | ✅ spec ready |
 | P0-06 | CPU inference loop: RMSNorm/RoPE/softmax/MHA naive + contiguous KV (GQA), streamed decode | `crates/cpu`, `crates/arch` | **🔒 needs new spec 004-core-inference** | 000/spec parity criteria | 🔒 spec first |
 | P0-07 | `info` + `cli` subcommands + differential harness vs llama.cpp | `bin/reinfer`, `bench/` | 001/tasks T5–T6; 000 | PNG: token 100% on 20 prompts; ≥60% llama.cpp decode | ↔ after P0-05/06 |
 
@@ -32,9 +32,9 @@
 |---|---|---|
 | P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop) — spec ready |
 | P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | included in 003 T9; policy-side is ours (boundary §4) |
-| P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | 🔒 spec 004-scheduler-serving |
-| P1-04 | CUDA graph bucket capture + stream overlap | 🔒 spec 005 (with FA3 vendor cubin) |
-| P1-05 | OpenAI-compatible HTTP server (axum) + sampler chain (greedy/top-p/top-k) | 🔒 spec 004 |
+| P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | ✅ `specs/005-scheduler-serving` |
+| P1-04 | CUDA graph bucket capture + stream overlap | ✅ `specs/006-cuda-perf` (FA3 vendor cubin optional) |
+| P1-05 | OpenAI-compatible HTTP server (axum) + sampler chain (greedy/top-p/top-k) | ✅ specs/005 (P1-03 same spec) |
 | P2-01 | Ascend full: Vendor-tier aclnn ops (L1, via cann safe wrappers), GE graph (aclgrph*) session pattern, AscendC pipeline (`crates/jit`), HCCL | depends cann-rs 0002 code; graph note: 8.5 = GE engine `aclgrph*`, not legacy `aclrtGraph*` |
 | P3-01 | RadixCache · speculative decode · llguidance grammar · TP/PP/CP | semantics from design report §2 |
 | P4-01 | MoE/MLA/FP8 · autotune TuneDb · KV offload · PD separation (lightllm protocol) · plugins | |

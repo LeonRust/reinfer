@@ -15,5 +15,9 @@ default = []
 # from-build-system：按本机 CUDA toolkit 探测版本；未装 toolkit → 明确编译错误（不静默）
 cuda = ["dep:cudarc", "cudarc/cuda-version-from-build-system"]
 
+[[example]]
+name = "device_info"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

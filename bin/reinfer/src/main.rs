@@ -1720,8 +1720,17 @@ fn print_proxy_hint() {
 /// 处理函数只做异步信号安全调用（write + _exit）。
 #[cfg(unix)]
 mod sigint {
+    use std::io::Write as _; // on_sigint 内的 flush（trait 方法）
     unsafe extern "C" fn on_sigint(_: libc::c_int) {
         unsafe {
+            // _exit 会绕过 stdio 缓冲：先落盘进度/日志（用户中断时
+            // "resuming/进度帧"必须可见——2026-08-27 真机实测吞输出修复）
+            let stdout = std::io::stdout();
+            let mut so = stdout.lock();
+            let _ = so.flush();
+            let stderr = std::io::stderr();
+            let mut se = stderr.lock();
+            let _ = se.flush();
             libc::write(1, b"\n".as_ptr().cast(), 1);
             libc::_exit(130);
         }

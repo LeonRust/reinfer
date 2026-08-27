@@ -1203,8 +1203,11 @@ fn global_line(g: &Global, speed: f64) -> String {
 }
 
 /// 20 格进度条（█ 填充 / ░ 空）。
+/// **向上取整**：>0% 至少 1 格、100% 满格——避免"4% 显示空条"与百分比不符
+/// （用户反馈：起始位置不一致——bar 与 pct 未对齐；2026-08-27 修正）。
 fn bar(pct: u64) -> String {
-    let filled = (pct.min(100) as usize * 20) / 100;
+    let pct = pct.min(100);
+    let filled = (pct as usize * 20 + 99) / 100; // ceil(pct% × 20 格)
     let mut out = String::with_capacity(20);
     for i in 0..20 {
         out.push(if i < filled { '█' } else { '░' });
@@ -2005,7 +2008,7 @@ mod tests {
         assert_eq!(format_eta(120.0), "2m00s");
         let b = bar(62);
         assert_eq!(b.chars().count(), 20); // █ 是 3 字节——按字符计数
-        assert_eq!(b.chars().filter(|&c| c == '█').count(), 12);
+        assert_eq!(b.chars().filter(|&c| c == '█').count(), 13); // ceil(62%×20=12.4)→13（>0% 至少 1 格）
         assert_eq!(bar(100), "████████████████████");
         assert_eq!(bar(0), "░░░░░░░░░░░░░░░░░░░░");
     }

@@ -6,9 +6,15 @@ edition = "2024"
 [dependencies]
 reinfer-core = { workspace = true }
 reinfer-cuda = { workspace = true }
+reinfer-jit = { workspace = true }        # doctor：nvcc 工具链探测（toolchain.rs 复用）
 reinfer-models = { workspace = true }
 reinfer-ascend = { workspace = true, optional = true }
 dotenvy = { workspace = true }   # 启动读取 .env（开发测试环境；无文件静默跳过）
+clap = { version = "4", features = ["derive"] }   # CLI 解析（契约 v2.5 定稿：clap derive）
+clap_complete = "4"                               # completions 生成（契约 v2.4：clap_complete，不再手写模板）
+serde_json = { workspace = true }                 # --format json 输出（契约 §3）
+fs2 = { workspace = true }                        # doctor 磁盘余量（statvfs 语义；无新系统依赖）
+libc = "0.2"                                      # TTY 进度模式 Ctrl-C：补 \n 后退出（契约 §4）
 
 [features]
 default = []

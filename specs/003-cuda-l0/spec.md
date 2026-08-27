@@ -2,6 +2,7 @@
 
 > Status: approved (review 2026-08-25, see docs/design/review-2026-08-25.md) · Parent: specs/000-project-mvp (P1 first slice)
 > 修订记录：spec 层去厂商化；数值门禁三层化；容差体系统一；GPU sampler 核纳入范围；引用修正（006 为 perf、005 为 serving、004 为 tokenizer）。
+> 环境基线（2026-08-27 对齐，见 docs/design/cuda-phase-plan.md）：判定机 = 本机 RTX 5090 Laptop 24GB sm_120（driver 595.84/CUDA 13.2）；llama.cpp 参考本地构建。
 
 ## Problem Statement
 

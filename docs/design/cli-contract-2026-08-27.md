@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap）；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显））；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -92,6 +92,22 @@ GLOBAL ████████████░░░░░░░░░░░░�
 | 执行失败 | exit 1 + stderr 详情（缺代理打 hint） |
 | 子命令 help | `reinfer <cmd> help|-h|--help` |
 | env 规则 | **默认值不写进 env 模板**；env 显式设置即生效（通用软件惯例——见"附. 待办"） |
+
+### env 体系（v2.6 定稿——现状家族 + 三项）
+
+**现状（自主面 `REINFER_` 前缀）**：MODEL_（SOURCE/DIR/VERIFY/AUTODOWNLOAD/REPO/QUANT/FILE）·
+JIT_（CACHE/LOCK_DIR/LOCK_TIMEOUT）· CUDA_（ARCH/NVCC）——命名空间三节，布尔统一 on/off；
+显式 CLI > 便捷注入；默认值不入 env 模板。**生态面**（只消费）：HTTPS_PROXY/HTTP_PROXY/NO_PROXY ·
+CUDA_VISIBLE_DEVICES · DEVICE_ID/ASCEND_* · CUDA_HOME/CUDA_PATH/PATH · XDG_CACHE_HOME/HOME · NO_COLOR。
+
+**三项定稿（用户 2026-08-27）**：
+
+1. **日志面兼容 `RUST_LOG`**：日志分级 = CLI `-v/-vv/--debug` 优先，否则读 `RUST_LOG`
+   （Rust 生态标准；示例 `RUST_LOG=debug`）；将来 tracing 接入时保持同一入口。
+2. **服务面 env **：`REINFER_SERVE_HOST`/`REINFER_SERVE_PORT`/`REINFER_SERVE_DEVICE`
+   = serve/run/bench 上述参数的缺省来源（CLI 旗覆盖 env；ollama `OLLAMA_HOST` 先例）；
+   env 缺省値不写模板（v2 规则）。
+3. **doctor 回显**：检查块含完整 env 表回显（自主面 + RV 现状值＋来源标注：.env/环境）。
 
 ### 解析实现（v2.5 定稿：clap，用户 2026-08-27 拍板）
 

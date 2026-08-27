@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径）；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿）；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -170,9 +170,8 @@ CUDA_VISIBLE_DEVICES · DEVICE_ID/ASCEND_* · CUDA_HOME/CUDA_PATH/PATH · XDG_CA
 ④ 进度条 TTY 色彩接 --no-color/NO_COLOR。
 ```
 
-**预留注记（各 spec 立项时细化，不入本契约）**：bench 指标定义（warmup/计时口径、-r/-l 缺省）·
-chat REPL 交互细节（历史/编辑、Ctrl-C 语义）· serve 日志风格（结构化 vs 人类双式、访问日志面）
-——届时以对应 spec 修约本契约。
+**预留注记（各 spec 立项时细化，不入本契约）**：chat REPL 交互细节（历史/编辑、Ctrl-C 语义）·
+serve 日志风格（结构化 vs 人类双式、访问日志面）——届时以对应 spec 修约本契约。
 
 ## 6. 未来命令契约（未立项）
 
@@ -198,7 +197,7 @@ run   <model> [-q|-f] [--device] [-n <max-tokens>] [-t <temp>] [--top-p <p>] [--
              [--seed <s>] [--max-model-len <n>] [prompt...]
 chat  <model> [-q|-f] [--device] [-n] [-t] [--top-p] [--top-k] [--seed] [--max-model-len]
 bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len <n>]
-             [--format table|json]
+             [--prompt-file <path>] [--format table|json]
 ```
 
 - **工程缺省表（用户 2026-08-27 定：OpenAI API 缺省）**：`-t/--temperature=1.0` · `--top-p=1.0` ·
@@ -210,8 +209,17 @@ bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len
   属语义直达；结构化消费属 API/streaming；stat 经 stderr 可取）。
 - **chat**：同 run 参数子集（多轮保持 KV）；REPL 内 `/` 命令核心组（决策③现定）：`/help` · `/system <text>` ·
   `/clear` · `/temp <t>` · `/top-p <p>` · `/top-k <k>` · `/seed <n>` · `/quit`；退出 /quit 或 Ctrl-D/Ctrl-C。
-- **bench**：`-r/--reps`、`-l/--seq-len`；指标=prefill tps·decode tps·首 token 延迟·峰值显存；
-  `--format table|json`（数字面机读；008 gate_throughput.sh 消费 json）；gate 阈值逻辑在脚本层（008），不进 CLI。
+- **bench**（v2.8 细节定稿——指标口径/流程/缺省）：
+  - 指标：`load_ms`（加载+kv 分配）· `pp_tps`（prefill=tokens/s）· `tg_tps`（decode=tokens/s）·
+    `TTFT_ms`（首 token 延迟）· `peak_mem`（cuMemGetInfo/dev query 前后差）。
+  - 流程：内部确定性输入（`-l L` 序列；`--prompt-file <path>` 则用真实文本 prefill——与 -l 互斥，
+    llama-bench -p 先例）→ greedy 解码（temp=0 强制；与 golden/对拍口径一致）→ **warmup 恒 1 个
+    rep（不计数值**：JIT/加载抖动排除）→ N 有效 rep → **中位数**（抖振鲁棒；llama-bench 同款）。
+  - 缺省：`-r/--reps=3`（中位数需奇数）· `-l/--seq-len=512`；seed 固定（全链确定性）。
+  - json schema：`{"model","load_ms","prefill_tps","decode_tps","ttft_ms","peak_mem_mb","reps","seq_len"}`——
+    008 gate_throughput.sh 消费判阈值（gate 逻辑在脚本层不进 CLI）。
+  - 范围（不做）：HTTP 压测/延迟分布（serve loadgen 面，P1-05 后另工具）· 多模型矩阵
+    （llama-bench 对照功能）· 显存/带宽约束标志（P3）。
 
 ### doctor（v2.3 定稿——原预置名 diag，用户 2026-08-27 定版改名）
 

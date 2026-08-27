@@ -25,7 +25,8 @@ reinfer-jit       = { path = "crates/jit" }
 reinfer-cuda      = { path = "crates/cuda" }
 reinfer-ascend       = { path = "crates/ascend" }
 reinfer-server    = { path = "crates/server" }
-cudarc            = "0.19"   # 仅 crates/cuda 经 feature `cuda` 可选启用
+cudarc            = { version = "0.19", default-features = false, features = ["driver", "runtime", "dynamic-linking"] }  # 收窄（评审 F10）：L1 仅需 runtime/driver + 动态链接模式；cublas 等增至 L2/L3 再开
+
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

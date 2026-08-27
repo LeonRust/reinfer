@@ -19,5 +19,9 @@ cuda = ["dep:cudarc", "cudarc/cuda-version-from-build-system"]
 name = "device_info"
 required-features = ["cuda"]
 
+[[example]]
+name = "basic_ops"
+required-features = ["cuda"]
+
 [lints]
 workspace = true

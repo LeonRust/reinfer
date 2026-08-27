@@ -37,7 +37,7 @@
 |---|---|
 | `.github/workflows/{ci,gpu,bench}.yml` | D1 三工作流 |
 | `scripts/ci/checked-ignores.sh` | D3 校验 |
-| `scripts/ci/gate_throughput.sh` | D5 CPU 档门禁断言（llama-bench 协议参数） |
+| `scripts/ci/gate_throughput.sh` | D5 CPU 档门禁断言（llama-bench 协议参数）；**尚未落地——由 specs/014 T10 首建（r1 确认；无 011 前实施方一栏则本行挂起）** |
 | `scripts/ci/gen_goldens.sh` | 004 golden 重建（锚定 commit/flag） |
 | `bench/{runner-info.json,baseline.json,summary.json}` | 材料/D2/D5 |
 

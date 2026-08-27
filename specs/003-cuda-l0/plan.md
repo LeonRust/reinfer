@@ -16,7 +16,7 @@
 |---|---|
 | fp16/bf16 | 参考先舍入到同 dtype，再比较：≤1 ulp 视为相等 |
 | fp32 | rtol=1e-5, atol=1e-7（numpy allclose 语义，pr 取 max） |
-| GEMM（按输入累积） | f16-accurate：rel 1e-4；bf16：rel 1e-2 或舍入后精确；f32：rel 1e-5 |
+| GEMM（按输入累积） | **r1 修正（2026-08-27，锚 014 数值评审）**：diff 门禁=compute **32F-acc**（f16-in/f32-out rel 1e-4 + atol 1e-6；f32-on-f32 rel 1e-5；f16-out 档双侧 fp16 舍入 ≤1 ulp）；**16F-acc 档降为记录项**（rel ≤1e-1，parity 兜底——实测 fp16 累积 vs fp32 参考在真实 K（64-1536）92-98% 超 1e-4，原"f16-accurate rel 1e-4"不可执行）；形状含模型真实 K（896/1536）与 K∈1..4096 |
 
 ## Module Breakdown
 

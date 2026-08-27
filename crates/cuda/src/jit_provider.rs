@@ -82,6 +82,12 @@ impl VecAddProvider {
         self.lib.raw()
     }
 
+    /// 阻塞等待 launch 流排空（异步 launch 后的同步凭证——调用方纪律：
+    /// 同一流上的后续依赖/回拷必须显式同步，provider 不隐式同步）。
+    pub fn sync_stream(&self) -> Result<(), LaunchError> {
+        self.stream.synchronize()
+    }
+
     /// 校验 size 供应的匹配（buffer 分配与 args 一致性）。
     pub fn size_check(n: u32, bufs: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer)) -> bool {
         let want = n as usize * std::mem::size_of::<f32>();
@@ -113,9 +119,11 @@ impl KernelProvider for VecAddProvider {
             return Ok(());
         }
         // SAFETY: 指针由调用方保证为对应 DeviceBuffer 的有效设备指针
-        //（provider 不接管所有权）；context current 纪律由调用方保证——
-        // provider 不新建 context（012 plan r1 禁令）。
-        unsafe { launch_vec_add(self.kernel, &self.stream, a.a, a.b, a.out, a.n) }
+        //（provider 不接管所有权）；driver current context 由 launch 内部
+        // primary-context guard 保证（012 plan r1 C3 实测修正）。
+        unsafe {
+            launch_vec_add(self.kernel, &self.stream, _cfg.device.index(), a.a, a.b, a.out, a.n)
+        }
     }
 }
 

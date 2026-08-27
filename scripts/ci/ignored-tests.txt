@@ -6,5 +6,7 @@ smoke::memcpy_roundtrip                             # gpu.yml: smoke / npu.yml: 
 smoke::event_query_states                           # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
 smoke::alloc_free_1000_no_leak                      # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
 smoke::error_injection                              # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
+jit_smoke::vec_add_diff_and_determinism             # gpu.yml: l2-jit
+jit_smoke::jit_cache_reload_budget                  # gpu.yml: l2-jit
 
 

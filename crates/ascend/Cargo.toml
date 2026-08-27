@@ -11,8 +11,11 @@ reinfer-kernels = { workspace = true }
 cann = { workspace = true }   # 经 [patch.crates-io] 本地桥接；无 ffi 默认桩可编译
 
 [features]
-# 目标机（NPU + CANN SDK）构建开关：本地开发机无 CANN，禁止开启。
-ascend = ["cann/ffi"]   # 对外唯一开关（=cann/ffi 真绑定）；ffi 名退役（2026-08-27 用户定）
+# default = 昇腾能力开：跑 reinfer-ascend 即默认昇腾（用户 2026-08-27 定）。
+# 本地/无 SDK 机编译本 crate 须显式 --no-default-features（桩模式；消除误用）；
+# 真绑定开关 ascend = cann/ffi（对外唯一名；ffi 名退役）。
+default = ["ascend"]
+ascend = ["cann/ffi"]
 
 [[example]]
 name = "device_info"

@@ -45,3 +45,4 @@ Single source of discipline = CONSTITUTION.md §6.4 (not duplicated here). Revie
 - `specs/007-core-inference/` — 🔒 to write (CPU full-path loop; carrier for 005 `--backend cpu` and GPU-less CI)
 - `specs/008-ci-infra/` — CI artifacts contract (jobs / runners / `#[ignore]` matrix / bench gates) — spec ready
 - Parity matrix — [`specs/000-project-mvp/parity.md`](../specs/000-project-mvp/parity.md)
+- `specs/009-cuda-runtime-base/` — L1: device/stream/event/buffer wrappers (003 T2 展开, per docs/design/cuda-phase-plan.md)

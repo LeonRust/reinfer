@@ -728,7 +728,7 @@ fn run_downloads(
     };
     let (next, results, prog, targets, vlog, ctx) = (&next, &results, &prog, targets, vlog, &ctx);
     std::thread::scope(|s| {
-        for w in 0..workers {
+        for _w in 0..workers {
             s.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
@@ -738,17 +738,17 @@ fn run_downloads(
                     let entry = &targets[i];
                     vlog.log(2, format!("-> {}", entry.name));
                     if let Some(p) = prog {
-                        p.begin_file(w, entry, i + 1, n);
+                        p.begin_file(i);
                     }
                     let res = if let Some(p) = prog {
                         let p = Arc::clone(p);
-                        let cb = move |bytes: u64, total: u64| p.update(w, bytes, total);
+                        let cb = move |bytes: u64, total: u64| p.update(i, bytes, total);
                         download_one(ctx, entry, Some(&cb))
                     } else {
                         download_one(ctx, entry, None)
                     };
                     if let Some(p) = prog {
-                        p.end_file(w, res.is_ok());
+                        p.end_file(i, res.is_ok());
                     }
                     vlog.log(
                         2,
@@ -962,21 +962,20 @@ fn cmd_download_offline(a: &DownloadArgs, fmt: Format, dir: &Path) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SlotStatus {
-    /// 槽已建但还未取到文件（防首帧空名）。
+enum FileStatus {
+    /// 未开始（行显示 waiting…）。
     Waiting,
     Active,
     Done,
     Failed,
 }
 
-struct Slot {
-    name: String,
-    idx: usize,
+/// 每个文件一行（index = targets 序；渲染按状态分组排序）。
+struct FileState {
     bytes: u64,
     total: u64,
     last: u64,
-    status: SlotStatus,
+    status: FileStatus,
     wb: u64,
     wt: Instant,
 }
@@ -987,8 +986,8 @@ struct Global {
 }
 
 struct ProgressInner {
-    slots: Vec<Slot>,
-    files_total: usize,
+    files: Vec<FileEntry>,
+    states: Vec<FileState>,
     global: Global,
     last_draw: Instant,
     last_draw_done: u64,
@@ -997,7 +996,9 @@ struct ProgressInner {
     drawn_rows: usize,
 }
 
-/// 两层进度：文件条（每 worker 一行）+ GLOBAL 条（底行固定）。
+/// 进度视图（契约 §4 v2.11 修订——全文件清单视图，非"活跃 worker 槽"）：
+/// **每个目标文件一行**（未开始的也可见），渲染顺序 = 已完成(Done/Failed) →
+/// 进行中(Active) → 未开始(Waiting)，组内按文件序；GLOBAL 恒底行。
 /// 刷新节流：每 256KB 或 200ms（契约 §4）；校验重试时该文件进度从 0 重计
 /// （回调值为本次 download_file 累计——delta 可为负，GLOBAL 相应回退）。
 struct Progress {
@@ -1006,23 +1007,21 @@ struct Progress {
 
 impl Progress {
     fn new(targets: &[FileEntry]) -> Self {
-        let workers = targets.len().min(MAX_WORKERS);
         let total: u64 = targets.iter().map(|e| e.size).sum();
         Self {
             inner: Mutex::new(ProgressInner {
-                slots: (0..workers)
-                    .map(|_| Slot {
-                        name: String::new(),
-                        idx: 0,
+                files: targets.to_vec(),
+                states: targets
+                    .iter()
+                    .map(|_| FileState {
                         bytes: 0,
                         total: 0,
                         last: 0,
-                        status: SlotStatus::Waiting,
+                        status: FileStatus::Waiting,
                         wb: 0,
                         wt: Instant::now(),
                     })
                     .collect(),
-                files_total: targets.len(),
                 global: Global { done: 0, total },
                 last_draw: Instant::now(),
                 last_draw_done: 0,
@@ -1032,25 +1031,24 @@ impl Progress {
         }
     }
 
-    /// worker 开始下载一个文件（重置该槽进度）。
-    fn begin_file(&self, worker: usize, entry: &FileEntry, idx: usize, _m: usize) {
+    /// worker 取到文件 idx 后开始（行=该文件）。
+    fn begin_file(&self, idx: usize) {
         let Ok(mut g) = self.inner.lock() else { return };
-        let s = &mut g.slots[worker];
-        s.name = entry.name.clone();
-        s.idx = idx;
+        let size = g.files[idx].size;
+        let s = &mut g.states[idx];
         s.bytes = 0;
         s.last = 0;
-        s.total = entry.size;
-        s.status = SlotStatus::Active;
+        s.total = size;
+        s.status = FileStatus::Active;
         s.wb = 0;
         s.wt = Instant::now();
         self.draw(&mut g);
     }
 
     /// 进度回调（models download_file 的 progress 参数进入点）。
-    fn update(&self, worker: usize, bytes: u64, total: u64) {
+    fn update(&self, idx: usize, bytes: u64, total: u64) {
         let Ok(mut g) = self.inner.lock() else { return };
-        let s = &mut g.slots[worker];
+        let s = &mut g.states[idx];
         let delta = bytes as i64 - s.last as i64;
         s.last = bytes;
         s.bytes = bytes;
@@ -1069,11 +1067,11 @@ impl Progress {
         }
     }
 
-    /// worker 结束一个文件（done/failed 标记）。
-    fn end_file(&self, worker: usize, ok: bool) {
+    /// 结束一个文件（done/failed 标记）。
+    fn end_file(&self, idx: usize, ok: bool) {
         let Ok(mut g) = self.inner.lock() else { return };
-        let s = &mut g.slots[worker];
-        s.status = if ok { SlotStatus::Done } else { SlotStatus::Failed };
+        let s = &mut g.states[idx];
+        s.status = if ok { FileStatus::Done } else { FileStatus::Failed };
         if ok {
             s.bytes = s.total;
         }
@@ -1116,10 +1114,20 @@ impl Progress {
         } else {
             0.0
         };
-        let mut lines: Vec<String> =
-            g.slots.iter().map(|s| slot_line(s, g.files_total, now)).collect();
+        // 排序视图：Done/Failed → Active → Waiting（组内按文件序）
+        let mut order: Vec<usize> = (0..g.states.len()).collect();
+        let rank = |st: FileStatus| match st {
+            FileStatus::Done | FileStatus::Failed => 0,
+            FileStatus::Active => 1,
+            FileStatus::Waiting => 2,
+        };
+        order.sort_by_key(|&i| (rank(g.states[i].status), i));
+        let mut lines: Vec<String> = order
+            .iter()
+            .map(|&i| file_line(&g.files[i], &g.states[i], i, g.states.len(), now))
+            .collect();
         lines.push(global_line(&g.global, gspeed));
-        for s in &mut g.slots {
+        for s in &mut g.states {
             s.wb = s.bytes;
             s.wt = now;
         }
@@ -1142,13 +1150,13 @@ impl Progress {
     }
 }
 
-fn slot_line(s: &Slot, files_total: usize, now: Instant) -> String {
-    let name = truncate(&s.name, 44);
+fn file_line(e: &FileEntry, s: &FileState, idx: usize, files_total: usize, now: Instant) -> String {
+    let name = truncate(&e.name, 44);
     let pct = pct_of(s.bytes, s.total);
     let total_s = if s.total > 0 { human_dec(s.total) } else { "?".to_string() };
     let mut line = format!(
         "[{}/{}] {:<44} {} {:>3}%  {}/{}",
-        s.idx,
+        idx + 1,
         files_total,
         name,
         bar(pct),
@@ -1157,10 +1165,10 @@ fn slot_line(s: &Slot, files_total: usize, now: Instant) -> String {
         total_s
     );
     match s.status {
-        SlotStatus::Done => line.push_str("  (done)"),
-        SlotStatus::Failed => line.push_str("  (failed)"),
-        SlotStatus::Waiting => line.push_str("  waiting…"),
-        SlotStatus::Active => {
+        FileStatus::Done => line.push_str("  (done)"),
+        FileStatus::Failed => line.push_str("  (failed)"),
+        FileStatus::Waiting => line.push_str("  waiting…"),
+        FileStatus::Active => {
             if s.total > 0 {
                 let dt = now.duration_since(s.wt).as_secs_f64();
                 let speed =

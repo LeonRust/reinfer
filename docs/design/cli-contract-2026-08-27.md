@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest））；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting））；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -74,11 +74,11 @@ GLOBAL ████████████░░░░░░░░░░░░�
 
 | 规则 | 值 |
 |---|---|
-| 文件条（活跃 worker 各一行） | 文件名截断 44 列 + 条 + % + 已/总 + 速度 + ETA；`(done)` 保留 ~1s 回收 |
+| 文件条（**每目标文件一行**——v2.11 修订，非活跃 worker 槽） | 文件名截断 44 列 + 条 + % + 已/总 + 速度 + ETA；`(done)` 行保留；未开始行显示 `waiting…` |
 | GLOBAL 条（底行固定） | 条 + % + 落盘字节/总字节（目标合计 size；命中即落盘计入）+ 2s 滑窗速度 + ETA |
 | 刷新 | 每 256KB 或 200ms tick；校验重试时该文件进度从 0 重计 |
 | 降级矩阵 | `table+TTY`=动态条 · `table+非TTY`=摘要行 · `quiet/json/dry-run`=无条 |
-| 单文件 | 文件条=全局，GLOBAL 行仍显示 |
+| **排序（v2.11）** | 渲染顺序：已完成(Done/Failed) → 进行中(Active) → 未开始(Waiting)，组内按文件序；GLOBAL 恒底行——用户可看到**全部**目标文件（含未开始），完成文件置顶不再乱跳 |
 | Ctrl-C | 保留 temp（与重试纪律一致）；结束打印 `\n` 留最后一帧 |
 
 实现落点：`crates/models` 下载层 `fetch_to_temp` 增可选进度回调（`bytes_done,total`）；CLI 聚合 4 worker。

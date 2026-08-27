@@ -333,6 +333,16 @@ mod ffi_tests {
         }
     }
 
+    /// 注入 (a)：`alloc(total_mem + 1)` → 精确 `Err(Oom)`（内存白名单 2）。
+    #[test]
+    fn alloc_overflow_is_oom() {
+        let ctx = CudaContext::init(DeviceId::new(0)).expect("init");
+        let dev = ctx.device_id();
+        let total = CudaContext::device_info(0).expect("info").total_mem;
+        let err = DeviceBuffer::alloc(dev, total as usize + 1).expect_err("must fail");
+        assert_eq!(err, LaunchError::Oom, "expected Oom for over-size alloc");
+    }
+
     /// 独占设备 + 单线程前提下的小块泄漏检测（009 F7 公式）：
     /// 快照 `(free, total)` → 1000 × alloc(1 MiB)+memset 写回 + free →
     /// `free_after >= free_before - (1 MiB*1000*1%) - 8 MiB(slack)` 且 `total` 不变。

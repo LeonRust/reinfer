@@ -91,4 +91,14 @@ mod ffi_tests {
             assert_eq!(err, LaunchError::Fatal);
         }
     }
+
+    /// 注入 (b)：`init(device_count())` → 精确 `Err(Fatal)`（101 fail-closed）。
+    #[test]
+    fn init_out_of_range_is_fatal() {
+        let count = CudaContext::device_count().expect("device_count");
+        if count > 0 {
+            let err = CudaContext::init(DeviceId::new(count)).expect_err("must fail");
+            assert_eq!(err, LaunchError::Fatal);
+        }
+    }
 }

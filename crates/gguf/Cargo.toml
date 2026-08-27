@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 publish = false
+
 [dependencies]
+reinfer-kernels = { workspace = true }   # 错误面统一：GgufError 可转换为 LaunchError（调用层消费）
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

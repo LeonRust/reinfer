@@ -31,6 +31,7 @@ serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 sha2              = "0.10"
 fs2               = "0.4"   # 跨进程文件锁 safe wrapper（crates/jit 零 unsafe 依据）
+proptest          = "1"     # 数据管道 golden/proptest 测试（gguf/codes/arch 等 dev-deps）
 
 
 [workspace.lints.rust]

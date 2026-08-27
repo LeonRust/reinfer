@@ -12,10 +12,14 @@
 
 5. 以对话形式给出的修改建议**不算**执行；任何实质改动必须等用户确认。
 
-6. **模板 commit message**（注意：无 Trailer）：
+6. **模板 commit message**（注意：无 Trailer、**必须有正文 body——改了什么/为什么/验证要点**，宪法 §3.1）：
 
 ```
 feat(radix): page split on mixed prefix match
+
+Split a page when a prefix match stops mid-page; the old page keeps the
+prefix block and a new page owns the suffix. Verified by split/merge
+tests and a 64-request determinism run.
 ```
 
 不包含：

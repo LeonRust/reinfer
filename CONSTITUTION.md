@@ -38,8 +38,8 @@
 
 3.1 **Conventional Commits 1.0**：`type(scope): summary`
    - type ∈ `feat | fix | perf | refactor | docs | test | chore | ci | build`；
-   - summary ≤ 70 字符、祈使句、句末无标点；**summary 与 body 一律使用英文**；scope 为 crate 或子系统名（`kernel` / `scheduler` / `radix` / `can` / `cuda` / `ipc` / `server` / `ci` …）；
-   - body 与 summary 之间空行；一条提交只做一件事。
+   - summary ≤ 70 字符、祈使句、句末无标点；**summary 与 body 一律使用英文**；scope 为 crate 或子系统名（`kernel` / `scheduler` / `radix` / `ascend` / `cuda` / `ipc` / `server` / `ci` …）；
+   - body 与 summary 之间空行；**正文（body）必需**：写明改动内容与动机——改了什么、为什么、验证要点；非空、不复述标题（hook 强制：无正文=拒绝）；一条提交只做一件事。
 
 3.2 **AI 署名禁令**：任何提交（人工或 AI 代理）**不得包含** `Co-Authored-By: Claude <noreply@anthropic.com>`，也不得包含任何形式的 AI `Co-Authored-By:` Trailer。AI 参与情况写在 **PR 描述**中，不进入 commit message。启动钩子强制校验：`git config core.hooksPath .githooks`。
 

@@ -19,4 +19,16 @@ if ! grep -qE '^(feat|fix|perf|refactor|docs|test|chore|ci|build)(\([a-z0-9_-]+\
   exit 1
 fi
 
+# 正文（body）必需（宪法 §3.1）：summary 后空一行 + 至少 10 个非空字符
+if [ -n "$(sed -n '2p' "$msg_file")" ]; then
+  echo "⛔ 宪法 §3.1 违反：summary 之后需空一行再写正文（body）" >&2
+  exit 1
+fi
+BODY_CHARS="$(awk 'NR>2 { gsub(/[[:space:]]/, "", $0); n += length($0) } END { print n + 0 }' "$msg_file")"
+if [ "$BODY_CHARS" -lt 10 ]; then
+  echo "⛔ 宪法 §3.1 违反：正文（body）为空或过短（$BODY_CHARS < 10 字符）" >&2
+  echo "   请写明：改了什么、为什么、验证要点（示例见 CONTRIBUTING.md §2）。" >&2
+  exit 1
+fi
+
 exit 0

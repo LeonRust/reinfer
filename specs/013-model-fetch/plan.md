@@ -30,6 +30,8 @@ pub struct FileEntry { pub name: String, pub size: u64, pub sha256: String, pub 
 pub fn list_files(owner_model: &str) -> Result<Vec<FileEntry>, LaunchError>;
 pub fn download_file(owner_model: &str, entry: &FileEntry, to_dir: &Path) -> Result<PathBuf, LaunchError>;
 // ---- r2：运行时 resolver ----
+// 模型标识零硬编码：repo/quant/file 全部由调用方显式提供（无默认模型常量/便捷函数——
+// ModelSpec::new(repo) 必填；stub 测试用虚构名，真机命令名仅存在于文档示例）
 pub struct ModelSpec { repo: String, quant: Option<String>, file: Option<String>, branch: String }  // with_quant/with_file/with_branch
 pub enum ModelSource { Modelscope, Huggingface, Auto(fallback) }
 pub enum Verify { Sha256, Size, None }

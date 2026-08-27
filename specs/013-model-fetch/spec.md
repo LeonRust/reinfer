@@ -60,6 +60,7 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 
 ## Constraints
 
+- **模型标识零硬编码（用户 2026-08-27 铁律）**：仓库名/文件名/量化段一律由调用方或 CLI 参数提供——`ModelSpec::new(repo)` 必填参数、CLI 必填 repo；库代码**不含任何默认模型常量/便捷函数**（如 `ModelSpec::qwen_05b()` 禁止）；单元/stub 测试一律用虚构 repo（如 `stub/models`）与本地 stub 服务；真实仓库名只出现在文档示例与 T4 真机命令（README/notes 属文档、可含示例，不入代码路径）。
 - 纯 Rust：HTTP 客户端选轻量同步 `ureq`（默认 rustls，无 OpenSSL 系统依赖、无 tokio）；`sha2`/`serde_json` workspace 已有
 - 原子落盘纪律沿用 jit：同目录 temp + rename；manifest 与 jit meta 一样"提交点"式
 - 单二进制：解析仍用 std（不引入 clap 等新命令依赖；参数形态见 plan）

@@ -28,16 +28,14 @@
 # list locally downloaded GGUF files (name / size / sha256 / source
 reinfer model list
 
-# list GGUF files in a remote repo (name / size / sha256)
-reinfer model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF
-
 # download a quantized GGUF (-q: resolves quant tag → file name, verifies size + sha256)
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
 
-# exact file / every GGUF / custom dir
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q8_0.gguf
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models/reinfer
+# exact files / pattern subset / whole repo (hf default) / custom dir·revision
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF --include '*.gguf' --exclude '*fp16*'
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models --revision master
 ```
 
 Source priority and download policy come from env (CLI args win):

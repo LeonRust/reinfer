@@ -114,19 +114,22 @@ fn append_manifest(dir: &Path, entry: ManifestEntry) {
 /// 下载一个文件（302 跟随、流式写 temp、sha/len 校验、失败重试一次、rename+manifest）。
 ///
 /// 幂等：已完成且校验通过 → 返回路径（hit）；`verify` 深度见 [`Verify`]。
+/// `revision`：None → master（`--revision` 同语义，manifest branch 记录实际值）。
 pub fn download_file(
     repo: &str,
     entry: &FileEntry,
     to_dir: &Path,
     verify: Verify,
+    revision: Option<&str>,
 ) -> Result<PathBuf, LaunchError> {
     std::fs::create_dir_all(to_dir).map_err(io_err)?;
     let path = target_path(to_dir, &entry.name);
     if local_hit(&path, entry, verify) {
         return Ok(path);
     }
-    let url = api::ms_download_url(repo, &entry.name);
-    download_with_url(&url, entry, to_dir, verify, repo, "master", None)
+    let branch = revision.unwrap_or("master");
+    let url = api::ms_download_url_rev(repo, &entry.name, revision);
+    download_with_url(&url, entry, to_dir, verify, repo, branch, None)
 }
 
 /// GET 响应头（最终跳转后）ETag 规范化（strip 引号/W- 前缀不剥——W 前缀是强弱标记，需要恒等比较两端）。

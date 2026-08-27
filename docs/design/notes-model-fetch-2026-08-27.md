@@ -59,7 +59,8 @@ manifest: repo=Qwen/Qwen2.5-0.5B-Instruct-GGUF branch=master size=675710816 sha2
 ## 验证 3 — 幂等与 off（本机）
 
 - 二次 `model get` 同参数：立即返回路径，无网络动作（日志无 GET）。
-- r3 定版后命令面：`model list`（本地）/`model ls-remote`（远端）/`model get -q|-f|--all [--local-dir]`（2026-08-27）。
+- r3 定版后命令面：`model list`（本地）/`model ls-remote`（远端）/`model get -q|-f|--all [--local-dir]`（2026-08-27，已被 r5 取代）。
+- r5（用户确认定版）：`reinfer download <repo> [-q|--include|file...|全量] [--revision] [--local-dir]`；`model` 组仅 `list`；`ls-remote`/`model get` 移除（2026-08-27）。
 - `REINFER_MODEL_AUTODOWNLOAD=off` 且目录空：报 "not found locally … refusing to dial out"，exit 1。
 
 ## 已知偏差 / 备注

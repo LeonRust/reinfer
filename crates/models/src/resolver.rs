@@ -258,7 +258,7 @@ fn offline_err(what: &str) -> LaunchError {
 }
 
 fn ms_list(spec: &ModelSpec) -> Result<Vec<FileEntry>, LaunchError> {
-    let url = api::ms_list_url(&spec.repo);
+    let url = api::ms_list_url_rev(&spec.repo, spec.branch.as_deref());
     let body = api::http_get(&url)?;
     api::parse_ms_files(&body, &url)
 }
@@ -316,7 +316,7 @@ fn ms_fetch(
         eprintln!("reinfer-models: {name} not in {} files", spec.repo);
         LaunchError::Fatal
     })?;
-    download_file(&spec.repo, &entry, dir, verify)
+    download_file(&spec.repo, &entry, dir, verify, spec.branch.as_deref())
 }
 
 fn hf_fetch(

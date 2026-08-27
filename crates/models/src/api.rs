@@ -42,22 +42,34 @@ pub fn split_repo(id: &str) -> Result<(&str, &str), LaunchError> {
     }
 }
 
-/// ModelScope 列文件 URL。
+/// ModelScope 列文件 URL（缺省 Revision=master）。
 pub fn ms_list_url(repo: &str) -> String {
-    #[cfg(test)]
-    if let Some(base) = test_override::ms() {
-        return format!("{base}/{repo}/repo/files?Revision=master");
-    }
-    format!("{MS_API_BASE}/{repo}/repo/files?Revision=master")
+    ms_list_url_rev(repo, None)
 }
 
-/// ModelScope 下载入口 URL（302 → CDN）。
-pub fn ms_download_url(repo: &str, path: &str) -> String {
+/// 列文件 URL（显式 revision——`--revision`；None → master）。
+pub fn ms_list_url_rev(repo: &str, revision: Option<&str>) -> String {
+    let rev = revision.unwrap_or("master");
     #[cfg(test)]
     if let Some(base) = test_override::ms() {
-        return format!("{base}/{repo}/repo?Revision=master&FilePath={path}");
+        return format!("{base}/{repo}/repo/files?Revision={rev}");
     }
-    format!("{MS_API_BASE}/{repo}/repo?Revision=master&FilePath={path}")
+    format!("{MS_API_BASE}/{repo}/repo/files?Revision={rev}")
+}
+
+/// ModelScope 下载入口 URL（302 → CDN；缺省 Revision=master）。
+pub fn ms_download_url(repo: &str, path: &str) -> String {
+    ms_download_url_rev(repo, path, None)
+}
+
+/// 下载入口 URL（显式 revision）。
+pub fn ms_download_url_rev(repo: &str, path: &str, revision: Option<&str>) -> String {
+    let rev = revision.unwrap_or("master");
+    #[cfg(test)]
+    if let Some(base) = test_override::ms() {
+        return format!("{base}/{repo}/repo?Revision={rev}&FilePath={path}");
+    }
+    format!("{MS_API_BASE}/{repo}/repo?Revision={rev}&FilePath={path}")
 }
 
 /// HuggingFace 仓库文件列表 URL（siblings）。

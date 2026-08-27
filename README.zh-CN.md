@@ -27,16 +27,14 @@
 # 列出本地已下载 GGUF（名/大小/sha256/来源；关联 manifest）
 reinfer model list
 
-# 列出远端仓库 GGUF 文件（名 / 大小 / sha256）
-reinfer model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF
-
 # 下载量化 GGUF（-q：量化段 → 文件名解析，校验大小 + sha256）
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
 
-# 精确文件 / 全部 GGUF / 自定义目录
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q8_0.gguf
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models/reinfer
+# 精确文件 / 模式子集 / 整个仓库（hf 默认语义）/ 自定义目录·revision
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF --include '*.gguf' --exclude '*fp16*'
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF
+reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models --revision master
 ```
 
 源优先级与下载策略由 env 控制（CLI 参数优先）：

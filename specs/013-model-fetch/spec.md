@@ -57,6 +57,18 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 - `reinfer model get <repo>` —— `hf download` 语义：repo 位置参数；`-q/--quant`、`-f/--file`、`--all` 互斥选其一（无任何缺省行为——无默认模型）；目录参数 `--local-dir <dir>`（hf 命名；缺省 `REINFER_MODEL_DIR`）；支持 `--flag=value`（git/gh 风格）；
 - 参数错误 → exit 2 + 用法提示。**不沿用**旧雏形 `list <repo>`（远端）/`--to` 语义——r1 文档里的 bin 契约块整体由此段替代。
 
+## r5（2026-08-27 CLI 最终定版——经用户确认；替代 r3 的 bin 契约块）
+
+- **`download` 顶层化**（两家先例：`hf download` / `modelscope download`）：
+  `reinfer download <repo> [file...] [-q <qtag> | --include <glob> --exclude <glob>] [--revision <ref>] [--local-dir <dir>]`
+- 语义（与 r1 D6 的差异点，以 r5 为准）：**无显式文件选择 = 整个仓库**（hf 默认快照语义——013 铁律
+  "无默认模型"指模型标识不硬编码，与用户显式 repo 后的全量下载不冲突）；`-q` 与 file.../--include 互斥；
+  `--exclude` 需配 `--include`；`--revision` 映射 ModelScope `Revision=` 与 HF `resolve/{ref}`；
+  `--local-dir` 命名取 hf（kebab）；modelscope 的 `--local_dir`（snake）不兼容吸收。
+- **`model` 组最小集**（r5 最终）：仅 `list`（本地；modelscope-ng `list` 先例）。`ls-remote` 移除——
+  两家官方 CLI 均无"列仓库文件"命令；需要时网页查看。`model get` 废弃（旧 r3 形态）。
+- 通用旗子规则与先例对照表：docs/design/cli-contract-2026-08-27.md。
+
 ## Non-Goals
 
 - 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）

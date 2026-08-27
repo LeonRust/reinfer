@@ -20,3 +20,11 @@ pub mod context;
 #[cfg(feature = "cuda")]
 pub use context::CudaContext;
 pub use device_info::DeviceInfo;
+
+/// CUDA 流（feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod stream;
+
+/// CUDA 事件（feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod event;

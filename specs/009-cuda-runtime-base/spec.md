@@ -13,7 +13,7 @@ L1 提供**可安全消费**的 CUDA 运行时基座：五个类型 + 拷贝族�
 - **真机 smoke（判定机 RTX 5090 sm_120）**：
   - 设备列表：`device_count() >= 1`；`device_info(0)` 断言 name 非空、major.minor 与判定机算力一致、total_mem > 0、uuid 可解析为 8-4-4-4-12 十六进制；
   - **三链往返 H2D → D2D → D2H**（两个不重叠 `DeviceBuffer` 参与 D2D 段），同步版与异步版（`CudaStream::synchronize()` 后）最终 dst 与 1 MiB 确定性填充源**逐字节相等**；
-  - 事件 record → synchronize 成功；`query()`（未 record 事件）== `Ok(false)`；
+  - 事件 record → synchronize 成功；`query()`（未 record 事件）== `Ok(true)`——**完成态**（2026-08-27 真机实测回填：从未 record 的事件即完成态，评审 C-F3"未 record→false"预设作废；`NotReady(600)→false` 分支由 error.rs 纯函数单测覆盖）；
   - 泄漏：循环前快照 `(free_before, total)`，循环 1000 次 `alloc(1 MiB)→写读回验→free`，结束后 `free_after >= free_before - (1 MiB×1000×1%) - 8 MiB(slack)` 且 `total` 不变；**独占设备 + 单线程**前提（`CUDA_VISIBLE_DEVICES` 固定、`--test-threads=1`）。
 - **无 GPU 单测（具名清单，防空转）**：error 5 例（已有）+ `DeviceInfo` Debug/Clone/parse + `DeviceId` 伪造的归属校验纯函数 + `MemRef` 方向/边界校验；以 `cargo test -p reinfer-cuda -- --list | grep -c ': test$' >= 7` 为闸，禁止"空跑绿"措辞。
 - **工程**：默认 feature 零 CUDA 依赖；`--features cuda` 编译 + smoke 在（gpu.yml `smoke` job 或本地真机命令，见 008 接线表）通过。

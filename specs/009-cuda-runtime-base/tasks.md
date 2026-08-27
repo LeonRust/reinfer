@@ -15,7 +15,7 @@
 ## T2: CudaStream / CudaEvent
 
 - RAII + handle(pub(crate))；事件 `BlockingSync` + record/synchronize/query（**600 → Ok(false) 特判**，`cudaEventQuery` 自包）
-- Verification: 无 GPU 单测（Event 语义的纯函数：`query` 的 NotReady 特判分支用注入码值测试）；真机：未 record 事件 `query()==Ok(false)`；record→synchronize→`query()==Ok(true)`；**禁止**在存在未完成异步工作的 stream 上断言 `==false`（flaky）；Drop 兜底后再 query 仍 ==true
+- Verification: 无 GPU 单测（Event 语义的纯函数：`event_query_status` 注入码值——SUCCESS→true / 600→false / 其他→白名单分类）；真机：未 record 事件 `query()==Ok(true)`（**实测回填**，2026-08-27）；record→synchronize→`query()==true`；**禁止**在存在未完成异步工作的 stream 上断言 `==false`（flaky）；已同步事件的 Drop 兜底不挂起
 
 ## T3: DeviceBuffer / HostBuffer + 归属校验
 

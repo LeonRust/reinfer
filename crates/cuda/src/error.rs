@@ -23,6 +23,25 @@ pub const CUDA_ERROR_NO_DEVICE: CudaErrorCode = 100;
 pub const CUDA_ERROR_DEVICES_UNAVAILABLE: CudaErrorCode = 46;
 /// 白名单：非法地址（上下文类，重建后可重试）。
 pub const CUDA_ERROR_ILLEGAL_ADDRESS: CudaErrorCode = 700;
+/// 事件查询专用：本事件未完成（`cudaErrorNotReady`，CUDA 12 新值 600）。
+///
+/// **不在** `Oom/Driver` 白名单内——仅用于 [`event_query_status`] 特判（009 评审 A-M1/C-F3），
+/// fail-closed 语义下绝不允许它被分类为 `Fatal`。
+pub const CUDA_ERROR_NOT_READY: CudaErrorCode = 600;
+
+/// 事件查询纯逻辑：`cudaEventQuery` 返回码 → 完成态。
+///
+/// - `SUCCESS(0)` → `Ok(true)`（已完成）；
+/// - `NOT_READY(600)` → `Ok(false)`（未完成，非错误）；
+/// - 其余 → 白名单分类 fail-closed。
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))] // 无 feature 下由单测覆盖，真机路径 feature 下引用
+pub(crate) fn event_query_status(rc: CudaErrorCode) -> Result<bool, LaunchError> {
+    match rc {
+        CUDA_SUCCESS => Ok(true),
+        CUDA_ERROR_NOT_READY => Ok(false),
+        other => Err(classify(other).unwrap_or(LaunchError::Fatal)),
+    }
+}
 
 /// 对错误码做白名单分类；成功码返回 `None`（调用方契约：只对失败码调用）。
 #[inline]
@@ -117,5 +136,24 @@ mod tests {
     fn map_err_roundtrip() {
         assert_eq!(map_err(CUDA_ERROR_MEMORY_ALLOCATION), Err(LaunchError::Oom));
         assert_eq!(map_err(99), Err(LaunchError::Fatal));
+    }
+
+    #[test]
+    fn event_query_status_completed_is_true() {
+        assert_eq!(event_query_status(CUDA_SUCCESS), Ok(true));
+    }
+
+    #[test]
+    fn event_query_status_not_ready_is_false() {
+        // 未完成（600）绝不落入分类器（否则变 Fatal）——T2 关键守卫
+        assert_eq!(event_query_status(CUDA_ERROR_NOT_READY), Ok(false));
+    }
+
+    #[test]
+    fn event_query_status_other_hits_whitelist() {
+        // 真实错误（如 InvalidValue=1）→ 非白名单 → Fatal
+        assert_eq!(event_query_status(1), Err(LaunchError::Fatal));
+        // 白名单错误（如 2）也会命中分类
+        assert_eq!(event_query_status(CUDA_ERROR_MEMORY_ALLOCATION), Err(LaunchError::Oom));
     }
 }

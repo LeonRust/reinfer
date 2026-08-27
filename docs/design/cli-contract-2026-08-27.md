@@ -5,7 +5,8 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`））；
+> CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
 ## 1. 命令面
@@ -24,6 +25,7 @@ run     <model> [prompt...]       单次生成（prompt 剩余位置拼接）—
 bench   <model>                   性能基准（003 / specs/008）——契约预置
 doctor                              环境体检（flutter/cargo doctor 先例；ASC-03 改名落位）——契约预置
 
+completions <shell>               生成 shell 补全（bash|zsh|fish；gh/kubectl 先例）
 model list [--format table|json|quiet]
            本地已下载清单（先例：docker image ls / ollama list / modelscope-ng list——零参默认本地）
 ```
@@ -90,6 +92,18 @@ GLOBAL ████████████░░░░░░░░░░░░�
 | 执行失败 | exit 1 + stderr 详情（缺代理打 hint） |
 | 子命令 help | `reinfer <cmd> help|-h|--help` |
 | env 规则 | **默认值不写进 env 模板**；env 显式设置即生效（通用软件惯例——见"附. 待办"） |
+
+### v2.4 补全（五件套；用户 2026-08-27 定稿）
+
+| 项 | 规则 | 先例 |
+|---|---|---|
+| `-V` / `--version` | 根旗打印版本（不存在 `version` 子命令——避免冗余面） | git/gh/cargo |
+| `completions bash\|zsh\|fish` | 生成 shell 补全脚本（stdout；source 进配置）；覆盖已实现命令+旗子静态词表；不做语境级网络补全 | gh/kubectl/uv |
+| `-v` / `-vv` / `--debug` | 全局诊断级别：默认（错误+警告）→ `-v`（详情）→ `-vv`（每步跟踪）→ `--debug`（全量含库内 trace）；作用于 stderr（机器输出面不变）；**须位于命令前**（gh 惯例） | gh/curl |
+| `--no-color` | 禁色（TTY 着色仅在 `--no-color` 缺省且 NO_COLOR env 未设时启用） | gh/NO_COLOR 标准 |
+| `--` 分隔 | `--` 后一切为位置参数（prompt/文件名以 `-` 开头场景；POSIX 通则） | git/curl |
+
+不做（依据）：`login/logout`（私有仓 Non-Goal）· `-y/--yes`（无破坏性操作）· config 文件（env 体系已定型；P2 需要时再上）· man（help 已覆盖）· 自更新/遥测（未定分发）。
 
 ## 6. 未来命令契约（未立项）
 

@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting）；v2.12：断点续传 + GLOBAL 净落盘）；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting）；v2.12：断点续传 + GLOBAL 净落盘；v2.13：进度渲染=indicatif（三方库，用户拍板））；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -83,6 +83,10 @@ GLOBAL ████████████░░░░░░░░░░░░�
 | Ctrl-C | 保留 temp（与重试纪律一致）；结束打印 `\n` 留最后一帧 |
 
 实现落点：`crates/models` 下载层 `fetch_to_temp` 增可选进度回调（`bytes_done,total`）；CLI 聚合 4 worker。
+**渲染实现（v2.13，用户 2026-08-28 定）**：indicatif（MultiProgress + 每文件 ProgressBar + GLOBAL 底条）——
+替换自研 ANSI（自绘边角成本大：基线漂移/双 GLOBAL/中断吞输出等 6+ 轮实测修复）。契约语义映射保持：
+全清单/waiting（msg）· 完成置顶（insert(0) 重插）· 净落盘 GLOBAL（Σ峰值自聚合）· table+TTY 门控不变 ·
+非 TTY/quiet/json 摘要输出（调用方）。
 
 ## 5. 通用规则
 

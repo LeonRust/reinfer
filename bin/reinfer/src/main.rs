@@ -16,20 +16,16 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use reinfer_models::api::FileEntry;
 use reinfer_models::download::{MANIFEST, Verify, local_hit, read_manifest, target_path};
 use reinfer_models::{LaunchError, ModelResolver, ModelSource, ModelSpec};
-use std::collections::VecDeque;
 use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// 并发 worker 数（modelscope SDK `max_workers=4` 先例；契约 §2 不增 CLI 旗子）。
 const MAX_WORKERS: usize = 4;
-/// 进度条刷新：每 256KB 或 200ms（契约 §4）。
-const DRAW_BYTES: u64 = 256 * 1024;
-const DRAW_TICK: Duration = Duration::from_millis(200);
 
 const AFTER_HELP: &str = "\
 EXAMPLES:
@@ -957,292 +953,14 @@ fn cmd_download_offline(a: &DownloadArgs, fmt: Format, dir: &Path) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// 进度条（契约 §4：两层；TTY-only；纯 std 绘制 \r+\x1b[2K+\x1b[A）
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FileStatus {
-    /// 未开始（行显示 waiting…）。
-    Waiting,
-    Active,
-    Done,
-    Failed,
-}
-
-/// 每个文件一行（index = targets 序；渲染按状态分组排序）。
-struct FileState {
-    bytes: u64,
-    total: u64,
-    last: u64,
-    peak: u64, // 历史最大 bytes（GLOBAL 净落盘聚合：校验重试回退不回退——用户 2026-08-27 A 方案）
-    status: FileStatus,
-    wb: u64,
-    wt: Instant,
-}
-
-struct Global {
-    done: i64,
-    total: u64,
-}
-
-struct ProgressInner {
-    files: Vec<FileEntry>,
-    states: Vec<FileState>,
-    global: Global,
-    last_draw: Instant,
-    last_draw_done: u64,
-    samples: VecDeque<(Instant, u64)>,
-    /// 已绘制的总行数（含 GLOBAL）；首帧为 0 → 原地画，后续帧回撤重写。
-    drawn_rows: usize,
-}
-
-/// 进度视图（契约 §4 v2.11 修订——全文件清单视图，非"活跃 worker 槽"）：
-/// **每个目标文件一行**（未开始的也可见），渲染顺序 = 已完成(Done/Failed) →
-/// 进行中(Active) → 未开始(Waiting)，组内按文件序；GLOBAL 恒底行。
-/// 刷新节流：每 256KB 或 200ms（契约 §4）；校验重试时该文件进度从 0 重计
-/// （回调值为本次 download_file 累计——delta 可为负，GLOBAL 相应回退）。
-struct Progress {
-    inner: Mutex<ProgressInner>,
-}
-
-impl Progress {
-    fn new(targets: &[FileEntry]) -> Self {
-        let total: u64 = targets.iter().map(|e| e.size).sum();
-        Self {
-            inner: Mutex::new(ProgressInner {
-                files: targets.to_vec(),
-                states: targets
-                    .iter()
-                    .map(|_| FileState {
-                        bytes: 0,
-                        total: 0,
-                        last: 0,
-                        peak: 0,
-                        status: FileStatus::Waiting,
-                        wb: 0,
-                        wt: Instant::now(),
-                    })
-                    .collect(),
-                global: Global { done: 0, total },
-                last_draw: Instant::now(),
-                last_draw_done: 0,
-                samples: VecDeque::new(),
-                drawn_rows: 0,
-            }),
-        }
-    }
-
-    /// worker 取到文件 idx 后开始（行=该文件）。
-    fn begin_file(&self, idx: usize) {
-        let Ok(mut g) = self.inner.lock() else { return };
-        let size = g.files[idx].size;
-        let s = &mut g.states[idx];
-        s.bytes = 0;
-        s.last = 0;
-        s.total = size;
-        s.status = FileStatus::Active;
-        s.wb = 0;
-        s.wt = Instant::now();
-        self.draw(&mut g);
-    }
-
-    /// 进度回调（models download_file 的 progress 参数进入点）。
-    fn update(&self, idx: usize, bytes: u64, total: u64) {
-        let Ok(mut g) = self.inner.lock() else { return };
-        let done = {
-            let s = &mut g.states[idx];
-            let delta = bytes as i64 - s.last as i64;
-            s.last = bytes;
-            s.bytes = bytes;
-            if bytes > s.peak {
-                s.peak = bytes; // 峰值（跨重试不回退）
-            }
-            if total > 0 {
-                s.total = total;
-            }
-            g.global.done += delta; // CASH：仍维护（最终一致性）；绘制用 peak 聚合
-            g.global.done.max(0) as u64
-        };
-        let now = Instant::now();
-        if now.duration_since(g.last_draw) >= DRAW_TICK
-            || done.saturating_sub(g.last_draw_done) >= DRAW_BYTES
-        {
-            self.draw(&mut g);
-            g.last_draw = now;
-            g.last_draw_done = done;
-        }
-    }
-
-    /// 结束一个文件（done/failed 标记）。
-    fn end_file(&self, idx: usize, ok: bool) {
-        let Ok(mut g) = self.inner.lock() else { return };
-        let s = &mut g.states[idx];
-        s.status = if ok { FileStatus::Done } else { FileStatus::Failed };
-        if ok {
-            s.bytes = s.total;
-        }
-        self.draw(&mut g);
-        g.last_draw = Instant::now();
-        g.last_draw_done = g.global.done.max(0) as u64;
-    }
-
-    /// 收尾：最终帧保留 ~1s，然后把光标落到条区外一行（后续摘要行在此打印，不交叠）。
-    fn finish(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            self.draw(&mut g);
-        }
-        std::thread::sleep(Duration::from_millis(1000));
-        println!(); // 落出条区（保留最后帧在屏幕）
-        let _ = std::io::stdout().flush();
-    }
-
-    /// 重绘全部行（行数 = slots + GLOBAL）。
-    ///
-    /// 基线控制（修复"每帧下移漂移"）：首帧在当前位置原地画；此后每帧先向上回撤
-    /// 上次绘制的行数（drawn_rows 行），清行重写。结束光标停留在条区下方一行。
-    fn draw(&self, g: &mut ProgressInner) {
-        let now = Instant::now();
-        let done = g.global.done.max(0) as u64;
-        // 2s 滑窗速度采样（GLOBAL）
-        g.samples.push_back((now, done));
-        while let Some((t, _)) = g.samples.front() {
-            if now.duration_since(*t) > Duration::from_secs(2) {
-                g.samples.pop_front();
-            } else {
-                break;
-            }
-        }
-        let gspeed = if g.samples.len() >= 2 {
-            let (t0, d0) = g.samples.front().copied().expect("len>=2");
-            let (t1, d1) = g.samples.back().copied().expect("len>=2");
-            let dt = t1.duration_since(t0).as_secs_f64();
-            if dt > 0.0 { (d1 as f64 - d0 as f64) / dt } else { 0.0 }
-        } else {
-            0.0
-        };
-        // 排序视图：Done/Failed → Active → Waiting（组内按文件序）
-        let mut order: Vec<usize> = (0..g.states.len()).collect();
-        let rank = |st: FileStatus| match st {
-            FileStatus::Done | FileStatus::Failed => 0,
-            FileStatus::Active => 1,
-            FileStatus::Waiting => 2,
-        };
-        order.sort_by_key(|&i| (rank(g.states[i].status), i));
-        let peak_sum: u64 = g.states.iter().map(|s| s.peak).sum(); // 净落盘（重试回退不回退）
-        let mut lines: Vec<String> = order
-            .iter()
-            .map(|&i| file_line(&g.files[i], &g.states[i], i, g.states.len(), now))
-            .collect();
-        lines.push(global_line(g.global.total, peak_sum, gspeed));
-        for s in &mut g.states {
-            s.wb = s.bytes;
-            s.wt = now;
-        }
-        let mut out = String::new();
-        if g.drawn_rows > 0 {
-            // 回撤上次全部行（+1 让光标站到条区首行），重置行首
-            out.push_str(&format!("\x1b[{}A\r", g.drawn_rows));
-        }
-        for (i, line) in lines.iter().enumerate() {
-            out.push_str("\x1b[2K");
-            out.push_str(line);
-            // 行间换行；最后一行留在本行（光标于条区末行，收尾再落出）
-            if i + 1 < lines.len() {
-                out.push('\n');
-            }
-        }
-        g.drawn_rows = lines.len();
-        print!("{out}");
-        let _ = std::io::stdout().flush();
-    }
-}
-
-fn file_line(e: &FileEntry, s: &FileState, idx: usize, files_total: usize, now: Instant) -> String {
-    let name = truncate(&e.name, 44);
-    let pct = pct_of(s.bytes, s.total);
-    let total_s = if s.total > 0 { human_dec(s.total) } else { "?".to_string() };
-    let mut line = format!(
-        "[{}/{}] {:<44} {} {:>3}%  {}/{}",
-        idx + 1,
-        files_total,
-        name,
-        bar(pct),
-        pct,
-        human_dec(s.bytes),
-        total_s
-    );
-    match s.status {
-        FileStatus::Done => line.push_str("  (done)"),
-        FileStatus::Failed => line.push_str("  (failed)"),
-        FileStatus::Waiting => line.push_str("  waiting…"),
-        FileStatus::Active => {
-            if s.total > 0 {
-                let dt = now.duration_since(s.wt).as_secs_f64();
-                let speed =
-                    if dt >= 0.05 && s.bytes >= s.wb { (s.bytes - s.wb) as f64 / dt } else { 0.0 };
-                line.push_str(&format!("  {}/s", human_dec(speed as u64)));
-                let eta = if speed > 0.0 {
-                    format_eta((s.total - s.bytes) as f64 / speed)
-                } else {
-                    "-".to_string()
-                };
-                line.push_str(&format!("  ETA {eta}"));
-            }
-        }
-    }
-    line
-}
-
-/// GLOBAL 行：`done` = 净落盘字节（Σ 每文件历史峰值——重试回退不回退；用户 A 方案）。
-fn global_line(total: u64, done: u64, speed: f64) -> String {
-    let pct = pct_of(done, total);
-    let mut line =
-        format!("GLOBAL {} {:>3}%  {}/{}", bar(pct), pct, human_dec(done), human_dec(total));
-    if total > 0 && done >= total {
-        line.push_str("  (done)");
-    } else if total > 0 {
-        line.push_str(&format!("  {}/s", human_dec(speed as u64)));
-        let eta =
-            if speed > 0.0 { format_eta((total - done) as f64 / speed) } else { "-".to_string() };
-        line.push_str(&format!("  ETA {eta}"));
-    }
-    line
-}
-
-/// 20 格进度条（█ 填充 / ░ 空）。
-/// **向上取整**：>0% 至少 1 格、100% 满格——避免"4% 显示空条"与百分比不符
-/// （用户反馈：起始位置不一致——bar 与 pct 未对齐；2026-08-27 修正）。
-fn bar(pct: u64) -> String {
-    let pct = pct.min(100);
-    let filled = (pct as usize * 20).div_ceil(100); // ceil(pct% × 20 格)
-    let mut out = String::with_capacity(20);
-    for i in 0..20 {
-        out.push(if i < filled { '█' } else { '░' });
-    }
-    out
-}
-
-/// 十进制人类大小（进度条用：MB/GB，1-2 位小数；契约 §4 示例风格）。
-fn human_dec(b: u64) -> String {
-    if b >= 1_000_000_000 {
-        format!("{:.2}GB", b as f64 / 1e9)
-    } else if b >= 1_000_000 {
-        format!("{:.1}MB", b as f64 / 1e6)
-    } else if b >= 1_000 {
-        format!("{:.0}KB", b as f64 / 1e3)
-    } else {
+/// 二进制人类大小（清单/计划用：≤1023 B 显示 B；MiB/GiB 两位小数；契约 v2.7）。
+fn human_bytes(b: u64) -> String {
+    if b <= 1023 {
         format!("{b} B")
-    }
-}
-
-fn format_eta(secs: f64) -> String {
-    if secs >= 3600.0 {
-        format!("{:.0}h{:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0)
-    } else if secs >= 100.0 {
-        format!("{:.0}m{:02.0}s", secs / 60.0, secs % 60.0)
+    } else if b < (1 << 30) {
+        format!("{:.2}MiB", b as f64 / (1 << 20) as f64)
     } else {
-        format!("{:.1}s", secs)
+        format!("{:.2}GiB", b as f64 / (1 << 30) as f64)
     }
 }
 
@@ -1255,14 +973,109 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// 二进制人类大小（清单/计划用：≤1023 B 显示 B；MiB/GiB 两位小数；契约 v2.7）。
-fn human_bytes(b: u64) -> String {
-    if b <= 1023 {
-        format!("{b} B")
-    } else if b < (1 << 30) {
-        format!("{:.2}MiB", b as f64 / (1 << 20) as f64)
-    } else {
-        format!("{:.2}GiB", b as f64 / (1 << 30) as f64)
+// ---------------------------------------------------------------------------
+// 进度条（契约 §4；渲染实现 = indicatif——2026-08-28 用户拍板：成熟三方库
+// 替换自研 ANSI（自绘边角/稳定性的维护成本超大：基线漂移/双 GLOBAL/吞输出……）。
+// 契约语义映射：全文件清单（每文件一个 ProgressBar）· waiting 行 · 完成置顶
+// （MultiProgress::insert(0) 重插顶部）· GLOBAL 底行 + 净落盘（Σ 每文件峰值，
+// A 方案）。非 TTY/quiet/json 不创建（调用门控）；摘要行仍由调用方输出。
+// ---------------------------------------------------------------------------
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+/// 行模板：msg 承载名字/[n/N]（pos/len 是字节，不挤占行首序号语义）。
+const PROG_TEMPLATE: &str =
+    "{msg} {bar:20} {percent:>3}%  {bytes}/{total_bytes}  {bytes_per_sec}  ETA {eta}";
+const GLOBAL_TEMPLATE: &str =
+    "GLOBAL {msg} {bar:20} {percent:>3}%  {bytes}/{total_bytes}  {bytes_per_sec}  ETA {eta}";
+
+struct Progress {
+    mp: MultiProgress,
+    bars: Vec<ProgressBar>,
+    global: ProgressBar,
+    /// 每文件峰值字节（净落盘聚合；重试回退不回退——用户 A 方案）。
+    peaks: Mutex<Vec<u64>>,
+}
+
+impl Progress {
+    fn new(targets: &[FileEntry]) -> Self {
+        let mp = MultiProgress::new();
+        mp.set_draw_target(indicatif::ProgressDrawTarget::stdout());
+        let style = ProgressStyle::with_template(PROG_TEMPLATE)
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("█░");
+        let total = targets.len();
+        let bars: Vec<ProgressBar> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let pb = mp.add(ProgressBar::new(e.size));
+                pb.set_style(style.clone());
+                pb.set_message(format!(
+                    "{:<38} [{}/{}] waiting…",
+                    truncate(&e.name, 40),
+                    i + 1,
+                    total
+                ));
+                pb.enable_steady_tick(Duration::from_millis(200));
+                pb
+            })
+            .collect();
+        let gl = mp.add(ProgressBar::new(targets.iter().map(|e| e.size).sum::<u64>()));
+        gl.set_style(
+            ProgressStyle::with_template(GLOBAL_TEMPLATE)
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("█░"),
+        );
+        gl.set_message("".to_string());
+        gl.enable_steady_tick(Duration::from_millis(200));
+        Self { mp, bars, global: gl, peaks: Mutex::new(vec![0; total]) }
+    }
+
+    fn begin_file(&self, idx: usize) {
+        // 长度/位置已在 new 时预置；begin 时刻标记 active（进度由 update 驱动）
+        self.bars[idx].set_message(self.bars[idx].message().replace("waiting\u{2026}", "").to_string());
+    }
+
+    fn update(&self, idx: usize, bytes: u64, total: u64) {
+        let new_len = total.max(bytes);
+        self.bars[idx].set_length(new_len);
+        self.bars[idx].set_position(bytes);
+        if let Ok(mut peaks) = self.peaks.lock() {
+            if bytes > peaks[idx] {
+                peaks[idx] = bytes;
+            }
+            // GLOBAL 净落盘 = Σ 峰值（视觉不回退——A 方案）
+            let net: u64 = peaks.iter().sum();
+            self.global.set_position(net);
+        }
+    }
+
+    fn end_file(&self, idx: usize, ok: bool) {
+        let pb = &self.bars[idx];
+        if ok {
+            pb.finish_with_message(format!(
+                "{:<38} [{}/{}]",
+                truncate(pb.message().split(' ').next().unwrap_or(""), 40),
+                idx + 1,
+                self.bars.len()
+            ));
+            let _ = self.mp.insert(0, pb.clone()); // 完成置顶
+        } else {
+            pb.abandon_with_message(format!(
+                "{} (failed)",
+                pb.message().trim_end_matches('\u{2026}')
+            ));
+        }
+    }
+
+    /// 收尾：最终帧保留 ~1s → 清屏（回收提示区）→ 落出（摘要行正常打印）。
+    fn finish(&self) {
+        self.global.finish();
+        std::thread::sleep(Duration::from_millis(1000));
+        let _ = self.mp.clear();
+        println!();
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -1562,10 +1375,6 @@ fn model_dir_block(out: &mut Vec<Check>) {
 }
 
 /// 百分比（total=0 → 0；防溢出 clamped）。
-fn pct_of(done: u64, total: u64) -> u64 {
-    done.checked_mul(100).and_then(|d| d.checked_div(total)).map_or(0, |p| p.min(100))
-}
-
 /// 配置回显：REINFER_* 家族全部当前值 + 来源标注（.env / environment；契约 v2.6）。
 fn env_block(out: &mut Vec<Check>, vlog: &Verbosity) {
     let dotenv_keys: std::collections::BTreeSet<String> = dotenvy::dotenv_iter()
@@ -1994,9 +1803,6 @@ mod tests {
         assert_eq!(human_bytes(1024), "0.00MiB");
         assert_eq!(human_bytes(675_710_816), "644.41MiB");
         assert_eq!(human_bytes(2 << 30), "2.00GiB");
-        assert_eq!(human_dec(675_710_816), "675.7MB");
-        assert_eq!(human_dec(5_466_559_488), "5.47GB");
-        assert_eq!(human_dec(1234), "1KB");
     }
 
     #[test]
@@ -2016,18 +1822,6 @@ mod tests {
             assert_eq!(rust_log_level(), 0);
             std::env::remove_var("RUST_LOG");
         }
-    }
-
-    #[test]
-    fn format_eta_and_bar() {
-        assert_eq!(format_eta(2.8), "2.8s");
-        assert_eq!(format_eta(46.0), "46.0s");
-        assert_eq!(format_eta(120.0), "2m00s");
-        let b = bar(62);
-        assert_eq!(b.chars().count(), 20); // █ 是 3 字节——按字符计数
-        assert_eq!(b.chars().filter(|&c| c == '█').count(), 13); // ceil(62%×20=12.4)→13（>0% 至少 1 格）
-        assert_eq!(bar(100), "████████████████████");
-        assert_eq!(bar(0), "░░░░░░░░░░░░░░░░░░░░");
     }
 
     #[test]

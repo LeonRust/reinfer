@@ -5,6 +5,8 @@
 //! 加载/launch 属平台 crate（`crates/cuda`）；本层只做 键/缓存/锁/meta/编译子进程。
 #![forbid(unsafe_code)]
 
+pub mod key;
 pub mod types;
 
+pub use key::JitKey;
 pub use types::{HeaderFile, KernelSource, ToolchainId};

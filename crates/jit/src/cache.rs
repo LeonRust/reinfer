@@ -8,6 +8,7 @@
 use crate::error::fs_err;
 use crate::lock::{self, JitLockGuard};
 use crate::meta::{cubin_path, meta_path, JLibMeta, read_meta, write_meta};
+use crate::types::KernelSource;
 use crate::JitKey;
 use reinfer_kernels::LaunchError;
 use sha2::{Digest, Sha256};
@@ -94,6 +95,38 @@ impl JitCache {
         let _ = std::fs::remove_file(meta_path(&sub, key));
         Ok(())
     }
+
+    /// 获取或构建产物：无锁快速路径 → 持锁 + 双检 → 清理损坏残留 →
+    /// `compile` 一次 → 原子提交。编译失败或提交失败一律上抛（不循环重试；
+    /// "重建一次"= 本调用内至多编译一次）。
+    pub fn build_once(
+        &self,
+        key: &JitKey,
+        src: &KernelSource,
+        compile: impl FnOnce() -> Result<Vec<u8>, LaunchError>,
+    ) -> Result<(JLibMeta, PathBuf), LaunchError> {
+        if let Some(hit) = self.try_load(key)? {
+            return Ok(hit);
+        }
+        let guard = lock::lock(self.dir(), key)?;
+        if let Some(hit) = self.try_load(key)? {
+            return Ok(hit); // 双检：他人已构建
+        }
+        let _ = self.remove(key, &guard)?; // 清理上次失败/损坏残留
+        let bytes = compile()?; // 失败 → 携带编译错误上抛（B2 附 nvcc stderr 尾）
+        let meta = JLibMeta {
+            key: *key,
+            arch: src.arch.clone(),
+            toolchain_ver: src.toolchain_ver.clone(),
+            sha256: hex_sha256(&bytes),
+            size: bytes.len() as u64,
+            gencode: extract_gencode(&src.flags),
+            created_at: now_secs(),
+        };
+        self.store(key, &guard, &bytes, &meta)?;
+        // 同一锁内复核（防御；正常路径必然命中）
+        self.try_load(key)?.ok_or(LaunchError::Fatal)
+    }
 }
 
 /// 默认缓存根（XDG）。
@@ -150,6 +183,15 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 从 flags 提取 gencode 段（meta 记录，诊断/跨设备核对）。
+fn extract_gencode(flags: &[String]) -> Vec<String> {
+    flags
+        .iter()
+        .filter(|f| f.starts_with("-gencode") || f.contains("arch="))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -247,5 +289,103 @@ mod tests {
             c.store(&k, &guard(&c, &k), bytes, &m),
             Err(LaunchError::Fatal)
         ));
+    }
+
+    fn kern_source() -> crate::KernelSource {
+        crate::KernelSource {
+            name: "k",
+            src: "kernel-src",
+            headers: vec![],
+            flags: vec!["-gencode arch=compute_120,code=sm_120a".into()],
+            arch: "sm_120a".into(),
+            toolchain_ver: "release 12.8".into(),
+        }
+    }
+
+    fn tc() -> crate::ToolchainId {
+        crate::ToolchainId {
+            ver_line: "release 12.8".into(),
+            realpath: "/usr/local/cuda-12.8".into(),
+            ccbin: ("/usr/bin/g++".into(), "g++ 12".into()),
+        }
+    }
+
+    #[test]
+    fn build_once_miss_compiles_then_hits() {
+        let c = cache("f");
+        let k = JitKey::new(&kern_source(), &tc());
+        let calls = std::cell::Cell::new(0);
+        let compiled = b"cubin-v1";
+        let (_, _) = c
+            .build_once(&k, &kern_source(), || {
+                calls.set(calls.get() + 1);
+                Ok(compiled.to_vec())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // 再要 → 命中，不编译
+        let (_, _) = c
+            .build_once(&k, &kern_source(), || {
+                calls.set(calls.get() + 1);
+                Ok(vec![0])
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn build_once_cleans_corrupt_and_rebuilds_once() {
+        let c = cache("g");
+        let k = JitKey::new(&kern_source(), &tc());
+        // 预置：meta 有效 + .cubin 坏字节（try_load = miss 状态）
+        let sub = c.dir().join(k.dir_prefix());
+        std::fs::create_dir_all(&sub).unwrap();
+        write_meta(&sub, &k, &meta(&k, b"ok")).unwrap();
+        std::fs::write(cubin_path(&sub, &k), b"corrupt").unwrap();
+
+        let calls = std::cell::Cell::new(0);
+        let (_, _) = c
+            .build_once(&k, &kern_source(), || {
+                calls.set(calls.get() + 1);
+                Ok(b"cubin-v2".to_vec())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1, "损坏态只编译一次");
+        assert!(c.try_load(&k).unwrap().is_some());
+    }
+
+    #[test]
+    fn build_once_compile_error_propagates_no_residue() {
+        let c = cache("h");
+        let k = JitKey::new(&kern_source(), &tc());
+        let err = c.build_once(&k, &kern_source(), || Err(LaunchError::Fatal));
+        assert!(matches!(err, Err(LaunchError::Fatal)));
+        assert!(c.try_load(&k).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_once_concurrent_threads_compile_once() {
+        use std::sync::Arc;
+        let c = Arc::new(cache("i"));
+        let k = JitKey::new(&kern_source(), &tc());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let c = c.clone();
+                let calls = calls.clone();
+                std::thread::spawn(move || {
+                    let _ = c
+                        .build_once(&k, &kern_source(), || {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(b"cubin-v3".to_vec())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

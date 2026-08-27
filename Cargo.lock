@@ -771,6 +771,7 @@ version = "0.1.0"
 name = "reinfer-models"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "reinfer-kernels",
  "serde",
  "serde_json",

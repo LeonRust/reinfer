@@ -186,9 +186,8 @@ pub(crate) fn download_with_url(
     let mut last_err: Option<LaunchError> = None;
     let nm = &entry.name;
     for attempt in 1..=2 {
-        // 重试首次（attempt1）续传已存在残件；attempt2 强制 restart（杜绝坏段循环）
-        match fetch_to_temp(url, to_dir, &entry.name, verify, entry, expected_etag, progress, attempt > 1)
-        {
+        // 重试也续传（wget -c 语义）：每次尝试依据现有残件/服务器行为自动续/降级/重启
+        match fetch_to_temp(url, to_dir, &entry.name, verify, entry, expected_etag, progress) {
             Ok(p) => {
                 append_manifest(
                     to_dir,
@@ -219,11 +218,13 @@ pub(crate) fn download_with_url(
 
 /// GET（302 跟随）→ 流式写 `<to>/.<name>.reinfer-part` → 校验 → rename。
 ///
-/// **断点续传**（用户 2026-08-27 需求）：残件稳定名 + flock；残件非空时发 `Range: bytes=N-`，
-/// 服务端 206 → append 续传；200/不支持 → 从头（截断重下）；416 → 截断重下。
-/// `restart`（重试 attempt2）：强制从 0（截断残件——校验失败过说明字节可疑，杜绝坏段循环）。
-/// `progress`：每块 read 后调用 (文件累计字节, 预期总字节)；`entry.size == 0` → 总字节传 0。
-#[allow(clippy::too_many_arguments)] // 契约重试/续传面
+/// **断点续传**（专业对齐：wget -c / hf——重试也续传，内容不匹配才重启）：
+/// - 残件稳定名 + flock；残件非空 → **HEAD 预检**（size/etag/Accept-Ranges）：
+///   与服务器对齐（size 缩小/etag 变 → 截断重启；size 相等 → 跳过下载直接校验 rename；
+///   支持 Range → `Range: bytes=N-` 续传）；
+/// - GET 响应 206 → append；200/416/未带 Range → 截断从头（降级明确日志）；
+/// - 校验/长度失败 → 删除残件（坏段防循环）；重试（download_with_url）同续传语义。
+///   `progress`：每块 read 后调用 (文件累计字节, 预期总字节)；`entry.size == 0` → 总字节传 0。
 fn fetch_to_temp(
     url: &str,
     to_dir: &Path,
@@ -232,12 +233,8 @@ fn fetch_to_temp(
     entry: &FileEntry,
     expected_etag: Option<&str>,
     progress: Option<&dyn Fn(u64, u64)>,
-    restart: bool,
 ) -> Result<PathBuf, LaunchError> {
     let tmp = part_path(to_dir, name);
-    if restart {
-        let _ = std::fs::remove_file(&tmp);
-    }
     // 并发防护：进程内多 worker 不同 name 天然无冲突；跨进程同文件 → flock 非阻塞锁
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -250,17 +247,14 @@ fn fetch_to_temp(
         eprintln!("reinfer-models: another download in progress for {name} (concurrent process?)");
         return Err(LaunchError::Fatal);
     }
-    let have: u64 = file.metadata().map(|m| m.len()).unwrap_or(0);
-    // 长度已超过期望（服务器变更）→ 截断重下
-    let trust = entry.size > 0 && have <= entry.size;
-    let resume = entry.size > 0 && !trust;
-    if resume {
-        let _ = file.set_len(0);
-    }
-    let resume_from = if !restart && trust && have > 0 { have } else { 0 };
+    let mut have: u64 = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    // ---- GET（Range 或全量）：单一请求同时实现"探测+续传"（wget -c 系）。 ----
+    // 注意：MS resolve 端点不支持 HEAD（404——2026-08-27 实测），故不做 HEAD 预检；
+    // 支持与否由响应状态号决定：206=支持续传；200=从头。
     let mut req = ureq::get(url);
-    if resume_from > 0 {
-        req = req.set("Range", &format!("bytes={resume_from}-"));
+    if have > 0 {
+        req = req.set("Range", &format!("bytes={have}-"));
     }
     let resp = req.call().map_err(|e| {
         eprintln!("reinfer-models: GET {url} failed: {e}");
@@ -280,18 +274,46 @@ fn fetch_to_temp(
         }
     }
     let is_206 = resp.status() == 206;
-    let write_from = if !is_206 && resume_from > 0 {
+    if is_206 && have > 0 {
+        // Content-Range: bytes {have}-{end}/{total}——end+1==total 时残件已完整（上次中断于 rename 前）
+        let cr_total = resp
+            .header("Content-Range")
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|t| t.parse::<u64>().ok());
+        match cr_total {
+            Some(t) if t == have => {
+                eprintln!("reinfer-models: {name}: part already complete - verifying");
+                return verify_and_rename(
+                    &mut file, &tmp, to_dir, name, verify, entry, progress,
+                );
+            }
+            Some(t) if t < have => {
+                // 服务器内容变小 → 截断从头
+                eprintln!("reinfer-models: {name}: server content shrunk - restarting");
+                let _ = file.set_len(0);
+                have = 0;
+            }
+            _ => {
+                eprintln!(
+                    "reinfer-models: resuming {name} at {} of {}",
+                    human_dec(have),
+                    if entry.size > 0 { human_dec(entry.size) } else { "?".to_string() }
+                );
+            }
+        }
+    }
+    let write_from = if have > 0 && !is_206 {
         // 服务器不支持 Range（或重定向丢 Range）→ 从头（截断 + 归位）
+        eprintln!("reinfer-models: {name}: server did not honor Range - restarting download");
         let _ = file.set_len(0);
         let _ = file.seek(std::io::SeekFrom::Start(0));
         if let Some(cb) = progress {
             cb(0, if entry.size == 0 { 0 } else { entry.size });
         }
         0
-    } else if resume_from > 0 {
-        // 仅 206 才从续传点写入
-        file.seek(std::io::SeekFrom::Start(resume_from)).map_err(io_err)?;
-        resume_from
+    } else if have > 0 {
+        file.seek(std::io::SeekFrom::Start(have)).map_err(io_err)?;
+        have
     } else {
         0
     };
@@ -355,6 +377,56 @@ fn fetch_to_temp(
     let path = to_dir.join(name); // 落地目录（=repo 目录）内 rename
     std::fs::rename(&tmp, &path).map_err(io_err)?;
     Ok(path)
+}
+
+/// 残件已完整时：只做校验（全文件 sha 流式重哈希）→ rename（无网络）。
+fn verify_and_rename(
+    file: &mut std::fs::File,
+    tmp: &Path,
+    to_dir: &Path,
+    name: &str,
+    verify: Verify,
+    entry: &FileEntry,
+    progress: Option<&dyn Fn(u64, u64)>,
+) -> Result<PathBuf, LaunchError> {
+    if verify == Verify::Sha256
+        && let Some(expected) = &entry.sha256
+    {
+        let mut hasher = Sha256::new();
+        file.seek(std::io::SeekFrom::Start(0)).map_err(io_err)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(io_err)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let got = digest_hex(&hasher.finalize());
+        if &got != expected {
+            let _ = std::fs::remove_file(tmp); // 坏段 → 删残件
+            return Err(LaunchError::Fatal);
+        }
+    }
+    if let Some(cb) = progress {
+        cb(entry.size, entry.size);
+    }
+    let path = to_dir.join(name);
+    std::fs::rename(tmp, &path).map_err(io_err)?;
+    Ok(path)
+}
+
+/// 人类可读大小（续传日志用；与进度条 human_dec 语义对齐）。
+fn human_dec(b: u64) -> String {
+    if b >= 1_000_000_000 {
+        format!("{:.2}GB", b as f64 / 1e9)
+    } else if b >= 1_000_000 {
+        format!("{:.1}MB", b as f64 / 1e6)
+    } else if b >= 1_000 {
+        format!("{:.0}KB", b as f64 / 1e3)
+    } else {
+        format!("{b} B")
+    }
 }
 
 pub(crate) fn io_err(e: std::io::Error) -> LaunchError {
@@ -486,7 +558,7 @@ mod tests {
             is_lfs: false,
         };
         assert!(
-            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None, false)
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
                 .is_err()
         );
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -668,7 +740,7 @@ mod tests {
             sha256: Some(sha256_hex(&all)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None, false)
+        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
             .unwrap();
         let gotb = std::fs::read(&got).unwrap();
         assert_eq!(gotb.len(), 200);
@@ -695,7 +767,7 @@ mod tests {
             sha256: Some(sha256_hex(&body)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None, false)
+        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
             .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), body); // 旧残件被覆盖为全量
         let _ = std::fs::remove_dir_all(&dir);

@@ -30,7 +30,8 @@ fi
 
 MISSING=""
 while IFS= read -r t; do
-  if ! grep -qxF "$t" "$ALLOWLIST" 2>/dev/null; then
+  # 允许 allowlist 行带注释后缀：`name  # gpu.yml: job`
+  if ! grep -qE "^${t}([[:space:]]+#.*)?\$" "$ALLOWLIST" 2>/dev/null; then
     MISSING="$MISSING\n  - $t"
   fi
 done <<< "$IGNORED"

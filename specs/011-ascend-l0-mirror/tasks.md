@@ -25,8 +25,11 @@
 
 ## T5: NPU 真机 smoke（设备供给后）
 
-- `tests/smoke.rs` 5 类同构用例（设备/往返/事件状态/泄漏/注入）+ allowlist `# can-gpu: smoke`
-- Verification: NPU 上 `--test smoke -- --ignored --test-threads=1` 全绿；**先测后钉**（Event 未 record 行为、peer 错误面走 R3 回填）
+- `tests/smoke.rs` 5 类同构用例（设备/往返/事件状态/泄漏/注入）+ allowlist `# npu.yml: smoke`
+- **执行包已就绪**：`npu-test-checklist.md`（本目录；前置/构建/运行/用例对照/探针 P1-P6/失败排查/回填去向）
+- 运行：`cargo test -p reinfer-ascend --features ffi --test smoke -- --ignored --test-threads=1`
+  （`ffi = ["cann/ffi"]`：目标机构建开关；本地开发机禁止开启——无 CANN 无法链接）
+- Verification: NPU 上全绿；**先测后钉**（P1 未 record 事件行为、P3/P4 实际错误码、P5 peer 语义走 R3 回填）
 
 ## T6: 008 接线 + 差异注记
 

@@ -1,10 +1,10 @@
 # 008-ci-infra D3：`#[ignore]` 测试 allowlist（每行 = 测试名 `crate::path::name`，注释 = gpu.yml job 映射）
 # 约定：任一 GPU 测试必须遵循 "feature 门控 + #[ignore] + allowlist 映射"；无映射的 ignore 会被 checked-ignores.sh 拦截。
 cases::illegal_address_maps_to_driver_in_isolated_process  # 实验：SIGSEGV 毒化（无 job；009 T5 回填）
-smoke::device_info_smoke                            # gpu.yml: smoke
-smoke::memcpy_roundtrip                             # gpu.yml: smoke
-smoke::event_query_states                           # gpu.yml: smoke
-smoke::alloc_free_1000_no_leak                      # gpu.yml: smoke
-smoke::error_injection                              # gpu.yml: smoke
+smoke::device_info_smoke                            # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
+smoke::memcpy_roundtrip                             # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
+smoke::event_query_states                           # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
+smoke::alloc_free_1000_no_leak                      # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
+smoke::error_injection                              # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
 
 

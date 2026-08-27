@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[2] buffers ready (4 MiB)");
 
     let tc = reinfer_jit::probe_toolchain()?;
-    let arch = std::env::var("REINFER_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".into());
+    let arch = reinfer_cuda::arch::resolve_arch().expect("resolve arch");
     let src = reinfer_jit::KernelSource {
         name: "vec_add",
         src: include_str!("../kernels/vec_add.cu"),

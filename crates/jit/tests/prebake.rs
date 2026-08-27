@@ -22,8 +22,10 @@ extern "C" __global__ void vec_add(const float* __restrict__ a,
 }
 "#;
 
-fn arch() -> String {
-    std::env::var("REINFER_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".into())
+fn arch() -> Result<String, ()> {
+    // 无默认特判：预烘焙必须显式指认目标架构（本 crate 零 CUDA 知识，
+    // 不提供设备检测兜底）
+    std::env::var("REINFER_CUDA_ARCH").ok().filter(|s| !s.is_empty()).ok_or(()) // 无默认：必须显式指认
 }
 
 #[test]
@@ -35,7 +37,10 @@ fn prebake_compile_then_reload() {
             return;
         }
     };
-    let arch = arch();
+    let Ok(arch) = arch() else {
+        eprintln!("skipping prebake test: set REINFER_CUDA_ARCH (no default - device-agnostic)");
+        return;
+    };
     let Some((major, minor)) = parse_nvcc_version(&tc.ver_line) else {
         eprintln!("skipping prebake test: cannot parse {}", tc.ver_line);
         return;

@@ -33,6 +33,10 @@ pub mod event;
 #[cfg(feature = "cuda")]
 pub mod jit;
 
+/// 目标架构解析（012；feature `cuda`；env 优先/设备实测兜底，无默认特判）。
+#[cfg(feature = "cuda")]
+pub mod arch;
+
 /// vec_add Jit provider（012 C2；feature `cuda`）。
 #[cfg(feature = "cuda")]
 pub mod jit_provider;

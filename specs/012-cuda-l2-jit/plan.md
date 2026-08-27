@@ -17,7 +17,7 @@
   6. `std::env::consts::TARGET`（triple；防交叉编译误命中）。
   每个元素长度前缀；`key()` 为关联函数（无需 &self）。
 - **D3 缓存布局**：`REINFER_JIT_CACHE` 显式覆盖，否则 `<系统缓存>/reinfer/jit/`；布局 `<key[..2]>/<key>.cubin + <key>.meta.json`；锁目录默认 `<cache>/locks/<key>.lock`（同挂载、同命名空间；`REINFER_JIT_LOCK_DIR` 可覆盖；flock `LOCK_NB` 轮询，`REINFER_JIT_LOCK_TIMEOUT` 默认 300s）；temp 与目标同目录（`<key[..2]>/.<key>.tmp.<pid>.<rand>`），rename 原子、不跨挂载点；提交顺序 = .cubin 先、meta 最后（meta 为提交点），meta 含 `.cubin` sha256 + key 全字段 + toolchain realpath + gencode 全量数组 + created_at。
-- **D4 预烘焙**：`REINFER_CUDA_ARCH`（如 `sm_120a`）→ 同一 nvcc+原子写路径；验收"同工具链同 arch 二次命中 <50ms"（跨机命中受系统头漂移制约 → notes 记录，不承诺）；判定机默认 `sm_120a`（与真机产物同构）。
+- **D4 预烘焙**：`REINFER_CUDA_ARCH`（如 `sm_120a`）→ 同一 nvcc+原子写路径；验收"同工具链同 arch 二次命中 <50ms"（跨机命中受系统头漂移制约 → notes 记录，不承诺）；**无默认架构**：运行时/测试侧由 `arch::resolve_arch`（env 优先→设备实测 `sm_{cc}`），预烘焙侧必须显式提供。
 - **D5 第一次内核**：vec_add 链路最小闭环（无头文件、无布局魔法）；之后按 T5-D7 累积。
 - **D6 差分 harness**：CPU 参考纯函数在 `crates/kernels`；差分 = GPU 输出 vs CPU 参考（fp32 比对，003/plan §D7：rtol 1e-5 / atol 1e-7 逐项 allclose）；**掩码位规则：掩码一致即视为匹配**（不比较 −inf 值，显式跳过 NaN 语义）；固定 seed（如 `0x5eed`），CPU 参考与 GPU 读同一份输入；**bit-exact 仅承诺"同机、同产物（同 key）、固定 grid/block 配置"的 GPU-vs-GPU 两次运行**；内核编译禁 `-use_fast_math`；rms_norm eps=1e-5 与 CPU 参考同语义（全零行两侧 NaN 相同）；dtype 矩阵 f16 入/f32 出为主档（f32 入/f32 出为可选第二档）。
 

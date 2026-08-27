@@ -17,7 +17,7 @@
 
 ## T3: 离线预烘焙路径
 
-- `REINFER_CUDA_ARCH`（判定机默认 `sm_120a`）指定 → 无 GPU 完整走编译→store→try_load；`REINFER_JIT_CACHE` 目录覆盖；`tests/prebake.rs`
+- `REINFER_CUDA_ARCH` **显式指定**（无默认：本 crate 零 CUDA 知识不设设备检测——未设置时 prebake 打印 skip）→ 无 GPU 完整走编译→store→try_load；`REINFER_JIT_CACHE` 目录覆盖；`tests/prebake.rs`
 - Verification: `cargo test -p reinfer-jit --test prebake`（需本机 nvcc 且有 toolkit；入口：`REINFER_CUDA_ARCH=sm_120a`）——产物生成 + 同链二次命中 <50ms + key 一致；**跨机命中不承诺**（系统头漂移；如同 arch 无 GPU 机器可用并带 toolkit，可做搬运实验并记录 notes）
 
 ## T4: vec_add 链路最小闭环（r1 产物形态）

@@ -1,6 +1,8 @@
 //! 012 C3：vec_add Jit 链路真机冒烟（差分 / 命中预算 / 确定性）。
 //!
-//! 运行（判定机；`--test-threads=1` 强制）：
+//! 运行（任意 N 卡；`--test-threads=1` 强制）。`REINFER_CUDA_ARCH` 可选：
+//! 未设置时按设备实测 `sm_{{cc}}`（`arch::resolve_arch`）；`-a` 后缀仅在
+//! 需要 arch-specific 特性时显式指认。
 //! ```text
 //! REINFER_CUDA_NVCC=/usr/local/cuda-12.8/bin/nvcc \
 //! REINFER_JIT_CACHE=/tmp/reinfer-jit-smoke \
@@ -20,7 +22,8 @@ mod smoke {
     const N: u32 = 1 << 20; // 1 Mi 元素（4 MiB/缓冲）
 
     fn nvcc_arch() -> String {
-        std::env::var("REINFER_CUDA_ARCH").unwrap_or_else(|_| "sm_120a".into())
+        // 无默认特判：env 显式覆盖，否则按设备实测（arch::resolve_arch）
+        reinfer_cuda::arch::resolve_arch().expect("resolve arch")
     }
 
     fn host_data(seed: f32) -> (Vec<f32>, Vec<f32>) {

@@ -118,7 +118,7 @@ fn flag_value<'a>(args: &'a [String], i: usize, names: &[&str], short: &str) -> 
 }
 
 fn parse_download(args: &[String]) -> Result<DownloadCmd, String> {
-    let repo = args.get(0).ok_or("download needs <repo>")?.to_string();
+    let repo = args.first().ok_or("download needs <repo>")?.to_string();
     let mut quant = None;
     let mut include = None;
     let mut exclude = None;

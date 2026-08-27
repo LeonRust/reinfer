@@ -168,6 +168,7 @@ impl ModelResolver {
     }
 
     /// 本地 quant glob：文件名含 `-{q}.` 段即命中（任意扩展；无 .gguf 特判——用户铁律）。
+    /// 按 repo 组织：glob 作用于 `root/{repo}`（2026-08-27 用户定）。
     fn resolve_local_name(
         &self,
         spec: &ModelSpec,
@@ -177,7 +178,7 @@ impl ModelResolver {
             return Ok(Some(f.clone()));
         }
         let Some(q) = &spec.quant else { return Ok(None) };
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Ok(entries) = std::fs::read_dir(crate::download::repo_dir(dir, &spec.repo)) {
             let mut hits: Vec<String> = entries
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().to_string())
@@ -224,7 +225,7 @@ impl ModelResolver {
             None if self.autodownload => self.resolve_remote_name(spec)?,
             None => return Err(offline_err(&spec.repo)),
         };
-        let path = target_path(dir, &name);
+        let path = target_path(dir, &spec.repo, &name);
         // 本地命中（glob 文件名 → 存在即相当 hit；verify 深度由条目判定）
         let entry = FileEntry { name: name.clone(), size: 0, sha256: None, is_lfs: false };
         if local_hit(&path, &entry, self.size_first(spec))
@@ -419,12 +420,13 @@ mod tests {
         };
         let spec = ModelSpec::new("stub/models").with_quant("q8_0");
         assert_eq!(r.resolve_local_name(&spec, &dir).unwrap(), None);
-        std::fs::write(dir.join("m-q8_0.safetensors"), [0xCCu8; 32]).unwrap();
+        std::fs::create_dir_all(dir.join("stub/models")).unwrap();
+        std::fs::write(dir.join("stub/models/m-q8_0.safetensors"), [0xCCu8; 32]).unwrap();
         assert_eq!(
             r.resolve_local_name(&spec, &dir).unwrap().as_deref(),
             Some("m-q8_0.safetensors")
         );
-        std::fs::write(dir.join("m-q8_0.gguf"), [0xDDu8; 32]).unwrap();
+        std::fs::write(dir.join("stub/models/m-q8_0.gguf"), [0xDDu8; 32]).unwrap();
         assert!(r.resolve_local_name(&spec, &dir).is_err(), "并列同段 → 歧义");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -546,7 +548,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("reinfer-models-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("m-q8_0.gguf"), [0xBBu8; 64]).unwrap();
+        // 按 repo 组织（root/{repo}）：写入 root/stub/models/
+        std::fs::create_dir_all(dir.join("stub/models")).unwrap();
+        std::fs::write(dir.join("stub/models/m-q8_0.gguf"), [0xBBu8; 64]).unwrap();
         let r = ModelResolver {
             source: ModelSource::Huggingface, // 即使 HF 源，off 也绝不联网
             dir: dir.clone(),
@@ -554,7 +558,7 @@ mod tests {
             autodownload: false,
         };
         let spec = ModelSpec::new("stub/models").with_quant("q8_0");
-        assert_eq!(r.ensure(&spec).unwrap(), dir.join("m-q8_0.gguf"));
+        assert_eq!(r.ensure(&spec).unwrap(), dir.join("stub/models/m-q8_0.gguf"));
         // 空目录 + off → 错误
         let dir2 = std::env::temp_dir().join(format!("reinfer-models-off2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir2);

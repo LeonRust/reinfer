@@ -77,6 +77,15 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 > （契约规则优先于 clap 默认的 8 条适配清单见 cli-contract §5 解析实现）。
 > 依赖：`clap` + `clap_complete`（workspace 依赖表补入）；二进制单文件形态不变。
 
+## r5.2（2026-08-27 存储布局修正——用户定：按 repo 组织）
+
+下载落地与 resolve/清单原为**模型根扁平**（`root/{file}`）；修正为：
+`root/{owner}/{model}/{file}`（hf/modelscope 目录惯例），manifest.json **每 repo 一份**
+（`root/{repo}/manifest.json`——repo 目录自含、可整体迁移）。模型根（`REINFER_MODEL_DIR`/
+`--local-dir`）语义不变（仍是"根"）。旧扁平数据由用户机一次性迁移（本机已迁移）。
+影响面：`download_file`/`target_path`（带 repo 参数）、resolver 本地 glob（作用于 repo 目录）、
+`ro` 层调用点、`model list`（递归收集，repo 名=相对路径，manifest per-repo 关联）。
+
 ## Non-Goals
 
 - 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）

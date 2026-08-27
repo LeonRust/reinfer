@@ -30,12 +30,12 @@ cargo build -p reinfer
 
 | # | 命令 | 预期 | 通过标准 |
 |---|---|---|---|
-| 2.1 | `reinfer model list` | 列出 ~/.reinfer/models 下模型文件（人类可读 size/sha256 前缀/source） | 显示 qwen2.5-0.5b-instruct-q8_0.gguf（675,710,816 B 显示为 ~644.4 MiB） |
+| 2.1 | `reinfer model list` | 列出模型根下**按 repo 组织**的文件（人类可读 size/sha256/source） | 显示 `Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf` 等（repo 前缀） |
 | 2.2 | `reinfer model list --format json` | JSON 数组（原始字节/完整 sha/source） | jq 可解析、字段齐全 |
 | 2.3 | `reinfer model list --format quiet` | 每文件一行名 | 无表格 |
 | 2.4 | 空目录（`REINFER_MODEL_DIR=/tmp/emptydir reinfer model list`） | "no local model files in …" | exit 0 |
 | 2.5 | 目录不存在 | 明确错误 | exit 1 |
-| 2.6 | 目录含非模型文件（manifest.json、.tmp、隐藏文件） | 不显示（格式无关：manifest/tmp/隐藏排除；.gguf 之外模型文件应显示——放一个 dummy `foo.safetensors` 测试） | 显示 foo.safetensors，不显示 manifest.json |
+| 2.6 | 目录含非模型文件（manifest.json、.tmp、隐藏文件） | 不显示；`foo.safetensors`（repo 子目录内）显示——格式无关 | 显示 repo 内文件，不显示 manifest.json |
 | 2.7 | 格式无关 | 同 2.6 | — |
 
 ## 3. download —— 远程（真机）

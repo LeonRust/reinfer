@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环）；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest））；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -42,7 +42,7 @@ model list [--format table|json|quiet]
 | `--include/--exclude <glob>` | 模式过滤：`*` `?`；fnmatch 语义（`*` 跨 `/`）；`--exclude` 须配 `--include` | hf/modelscope 共同 |
 | （无任何选择） | 整个仓库（hf 默认快照） | hf |
 | `--revision <ref>` | 分支/tag/commit；MS=files/download URL `Revision=`，HF=`resolve/{ref}`；None→MS`master`/HF`main` | hf/modelscope |
-| `--local-dir <dir>` | 落地目录；缺省 `REINFER_MODEL_DIR` → `~/.reinfer/models` | hf（kebab） |
+| `--local-dir <dir>` | **模型根目录**（`REINFER_MODEL_DIR` 同类；缺省 `~/.reinfer/models`）；下载落地 `root/{repo}/{file}`（按 repo 组织——用户 2026-08-27 定；每 repo 自含 `manifest.json`；不同 repo 同名文件互不污染） | hf（kebab） |
 | `--dry-run` | 只列计划不下载：文件/大小/`already`（按 verify 深度 local_hit）；不写任何文件 | hf |
 | `--format table` | 默认人类表格 | hf |
 | `--format json` | 机器可读结果 JSON（§3 schema） | hf |

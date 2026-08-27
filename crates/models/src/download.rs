@@ -64,9 +64,15 @@ impl Verify {
     }
 }
 
-/// 目标文件在 `to_dir` 的路径。
-pub fn target_path(to_dir: &Path, name: &str) -> PathBuf {
-    to_dir.join(name)
+/// repo 内容目录 = 模型根/{owner}/{model}（二级目录；hf/modelscope 惯例——
+/// 用户 2026-08-27 定：按 repo 组织，避免不同 repo 同名文件互相污染）。
+pub fn repo_dir(root: &Path, repo: &str) -> PathBuf {
+    root.join(repo)
+}
+
+/// 目标文件路径 = 模型根/{repo}/{name}。
+pub fn target_path(root: &Path, repo: &str, name: &str) -> PathBuf {
+    root.join(repo).join(name)
 }
 
 /// 本地命中判定：存在 + 按 verify 深度校验。
@@ -128,13 +134,14 @@ fn append_manifest(dir: &Path, entry: ManifestEntry) {
 pub fn download_file(
     repo: &str,
     entry: &FileEntry,
-    to_dir: &Path,
+    root: &Path,
     verify: Verify,
     revision: Option<&str>,
     progress: Option<&dyn Fn(u64, u64)>,
 ) -> Result<PathBuf, LaunchError> {
-    std::fs::create_dir_all(to_dir).map_err(io_err)?;
-    let path = target_path(to_dir, &entry.name);
+    let dir = repo_dir(root, repo);
+    std::fs::create_dir_all(&dir).map_err(io_err)?;
+    let path = target_path(root, repo, &entry.name);
     if local_hit(&path, entry, verify) {
         if let (Some(cb), Ok(meta)) = (progress, std::fs::metadata(&path)) {
             cb(meta.len(), meta.len());
@@ -143,7 +150,7 @@ pub fn download_file(
     }
     let branch = revision.unwrap_or("master");
     let url = api::ms_download_url_rev(repo, &entry.name, revision);
-    download_with_url(&url, entry, to_dir, verify, repo, branch, None, progress)
+    download_with_url(&url, entry, &dir, verify, repo, branch, None, progress)
 }
 
 /// GET 响应头（最终跳转后）ETag 规范化（strip 引号/W- 前缀不剥——W 前缀是强弱标记，需要恒等比较两端）。
@@ -273,7 +280,7 @@ fn fetch_to_temp(
             return Err(LaunchError::Fatal);
         }
     }
-    let path = target_path(to_dir, name);
+    let path = to_dir.join(name); // 落地目录（=repo 目录）内 rename
     std::fs::rename(&tmp, &path).map_err(io_err)?;
     Ok(path)
 }
@@ -547,8 +554,12 @@ mod tests {
             sha256: Some(sha256_hex(body)),
             is_lfs: false,
         };
+        // 按 repo 组织：命中判定在 root/org/repo/ 下（先摆放文件）
+        let hit_path = dir.join("org/repo/m.gguf");
+        std::fs::create_dir_all(hit_path.parent().unwrap()).unwrap();
+        std::fs::write(&hit_path, body).unwrap();
         let p = download_file("org/repo", &entry1, &dir, Verify::Sha256, None, Some(&cbh)).unwrap();
-        assert_eq!(p, dir.join("m.gguf"));
+        assert_eq!(p, dir.join("org/repo/m.gguf")); // 按 repo 组织
         assert_eq!(*hit.lock().unwrap(), vec![(body.len() as u64, body.len() as u64)]);
 
         let _ = std::fs::remove_dir_all(&dir);

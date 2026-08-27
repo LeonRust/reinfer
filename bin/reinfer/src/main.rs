@@ -394,26 +394,28 @@ fn cmd_list_local(a: ListArgs, vlog: &Verbosity) -> i32 {
     };
     let dir = resolver.dir.clone();
     vlog.log(1, format!("model dir: {}", dir.display()));
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("reinfer: model dir not readable: {} ({err})", dir.display());
-            return 1;
-        }
-    };
-    let man = read_manifest(&dir);
-    let mut rows: Vec<(String, u64, Option<String>, Option<String>)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !is_listed_file(&name) {
-                return None;
-            }
-            let size = e.metadata().map(|m| m.len()).ok()?;
-            let m = man.iter().find(|m| m.name == name);
-            let sha = m.and_then(|m| m.sha256.clone());
-            let src = m.map(|m| format!("{}@{}", m.repo, m.branch));
-            Some((name, size, sha, src))
+    // 按 repo 组织（root/{owner}/{model}/…）：递归收集 (相对路径, 大小, repo 目录串)
+    let mut found: Vec<(String, u64, String)> = Vec::new();
+    if let Err(err) = collect_model_files(&dir, Path::new(""), &mut found) {
+        eprintln!("reinfer: model dir not readable: {} ({err})", dir.display());
+        return 1;
+    }
+    // manifest 关联：per-repo（root/{repo}/manifest.json）；文件名为末段
+    let mut rows: Vec<(String, u64, Option<String>, String)> = found
+        .iter()
+        .map(|(rel, size, repo)| {
+            let man =
+                if repo.is_empty() { Vec::new() } else { read_manifest(&dir.join(repo)) };
+            let fname = rel.rsplit('/').next().unwrap_or(rel);
+            let m = man.iter().find(|e| e.name == fname);
+            (
+                rel.clone(),
+                *size,
+                m.and_then(|e| e.sha256.clone()),
+                m.map(|e| format!("{}@{}", e.repo, e.branch)).unwrap_or_else(|| {
+                    if repo.is_empty() { "-".to_string() } else { format!("{repo}@-") }
+                }),
+            )
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -425,33 +427,65 @@ fn cmd_list_local(a: ListArgs, vlog: &Verbosity) -> i32 {
             }
             println!("{} ({} file(s)):\n", dir.display(), rows.len());
             println!("{:<48} {:>12}  {:<16}  source", "name", "size", "sha256");
-            for (name, size, sha, src) in &rows {
+            for (rel, size, sha, src) in &rows {
                 let sha16 = sha.as_deref().map(|s| &s[..s.len().min(16)]).unwrap_or("-");
-                let src = src.as_deref().unwrap_or("-");
-                println!("{name:<48} {:>12}  {sha16:<16}  {src}", human_bytes(*size));
+                println!("{rel:<48} {:>12}  {sha16:<16}  {src}", human_bytes(*size));
             }
         }
         Format::Json => {
             let arr: Vec<serde_json::Value> = rows
                 .iter()
-                .map(|(name, size, sha, src)| {
-                    serde_json::json!({"name": name, "size": size, "sha256": sha, "source": src})
+                .map(|(rel, size, sha, src)| {
+                    serde_json::json!({
+                        "name": rel.rsplit('/').next().unwrap_or(rel),
+                        "path": rel,
+                        "size": size,
+                        "sha256": sha,
+                        "source": src
+                    })
                 })
                 .collect();
             println!("{}", serde_json::to_string(&arr).unwrap_or_default());
         }
         Format::Quiet => {
-            for (name, _, _, _) in &rows {
-                println!("{}", dir.join(name).display());
+            for (rel, _, _, _) in &rows {
+                println!("{}", dir.join(rel).display());
             }
         }
     }
     0
 }
 
-/// 清单可见性（格式无关；契约 §2.6/迁移清单①：非隐藏、非 manifest、非下载临时文件）。
+/// 清单可见性（格式无关；契约 v2.7：非隐藏、非 manifest、非下载临时文件）。
 fn is_listed_file(name: &str) -> bool {
     !name.starts_with('.') && name != MANIFEST && !name.contains(".tmp-")
+}
+
+/// 递归收集模型文件（按 repo 组织；排除 manifest/隐藏/tmp；repo=相对目录串）。
+fn collect_model_files(
+    root: &Path,
+    rel: &Path,
+    out: &mut Vec<(String, u64, String)>,
+) -> std::io::Result<()> {
+    let abs = if rel.as_os_str().is_empty() { root.to_path_buf() } else { root.join(rel) };
+    for e in std::fs::read_dir(&abs)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == MANIFEST || name.contains(".tmp-") {
+            continue;
+        }
+        let m = e.metadata()?;
+        if m.is_dir() {
+            collect_model_files(root, &rel.join(&name), out)?;
+        } else {
+            let repo = rel.to_string_lossy().replace('\\', "/");
+            out.push((format!("{repo}/{name}"), m.len(), repo));
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -604,8 +638,10 @@ fn cmd_dry_run(
     let verify =
         if from_hf && resolver.verify == Verify::Sha256 { Verify::Size } else { resolver.verify };
     let total: u64 = targets.iter().map(|e| e.size).sum();
-    let already: Vec<bool> =
-        targets.iter().map(|e| local_hit(&target_path(dir, &e.name), e, verify)).collect();
+    let already: Vec<bool> = targets
+        .iter()
+        .map(|e| local_hit(&target_path(dir, &a.repo, &e.name), e, verify))
+        .collect();
     match fmt {
         Format::Table => {
             println!(

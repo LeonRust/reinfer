@@ -14,7 +14,7 @@
 
 ## T3: `reinfer model` 子命令
 
-- `list`/`get`（--file/--all/--to；缺省 `~/models/reinfer`）+ help 文本；std 参数解析
+- `list`/`get`（--quant/--file/--all/--to；缺省 `~/models/reinfer`）+ help 文本；std 参数解析；--quant 名称匹配（规范化+歧义报错）+ 幂等 hit 输出
 - Verification: `cargo run -p reinfer -- model help` 输出规范；参数解析错误→exit 2 + 用法提示（单测解析函数）
 
 ## T4: 真机端到端（人工；不入日常 CI）

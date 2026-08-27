@@ -31,8 +31,10 @@ pub fn list_files(owner_model: &str) -> Result<Vec<FileEntry>, LaunchError>;
 pub fn download_file(owner_model: &str, entry: &FileEntry, to_dir: &Path) -> Result<PathBuf, LaunchError>;
 // bin
 //   reinfer model list <owner/model>
-//   reinfer model get  <owner/model> --file <name> [--to <dir>]   (缺省 --to ~/models/reinfer)
-//   reinfer model get  <owner/model> --all [--to <dir>]
+//   reinfer model get  <owner/model> --quant <qtag> [--to <dir>]  (缺省 --to ~/models/reinfer)
+//   reinfer model get  <owner/model> --file <name> [--to <dir>]   (与 --quant 互斥；提供则优先精确)
+//   reinfer model get  <owner/model> --all     [--to <dir>]
+//  --quant 语义：文件名后缀规范化匹配（q8_0 ↔ "-q8_0.gguf"）；命中多个 → 列候选要求 --file
 ```
 
 错误面：网络/超时/解析/校验 → 重试一次 → `Fatal`（stderr 含详情与代理提示）；ENOSPC → `Oom`；目标已存在且 sha256 匹配 → 跳过（幂等，打印 hit）。

@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod key;
+pub mod lock;
 pub mod meta;
 pub mod types;
 

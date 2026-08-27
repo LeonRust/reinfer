@@ -145,6 +145,82 @@ pub fn probe_toolchain() -> Result<ToolchainId, LaunchError> {
     Ok(ToolchainId { ver_line, realpath, ccbin: probe_ccbin() })
 }
 
+/// 候选 nvcc 路径（去重、去不存在者）：解析链（env→PATH）+ `/usr/local/cuda-*`
+/// 常见安装目录扫描。
+pub fn all_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(p) = std::env::var(NVCC_ENV).ok().filter(|p| !p.is_empty()) {
+        out.push(PathBuf::from(p));
+    }
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Some(home) = std::env::var(var).ok().filter(|h| !h.is_empty()) {
+            out.push(PathBuf::from(home).join("bin/nvcc"));
+        }
+    }
+    if let Some(p) = find_on_path("nvcc") {
+        out.push(p);
+    }
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            if n.starts_with("cuda") {
+                out.push(e.path().join("bin/nvcc"));
+            }
+        }
+    }
+    out.retain(|p| p.is_file());
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out.sort();
+    out
+}
+
+/// 纯逻辑：从"已探测的 (ToolchainId, 版本)"中选出支持 `arch` 的最优
+/// （版本最高，同版本取 realpath 字典序——确定性）。
+pub fn select_toolchain_for(
+    arch: &str,
+    mut cands: Vec<(ToolchainId, (u32, u32))>,
+) -> Option<ToolchainId> {
+    cands.retain(|(_, ver)| check_arch_supported(arch, *ver).is_ok());
+    cands.sort_by(|(a, av), (b, bv)| bv.cmp(av).then_with(|| a.realpath.cmp(&b.realpath)));
+    cands.into_iter().next().map(|(tc, _)| tc)
+}
+
+/// 按目标 arch 探测可用工具链：扫描全部候选 → 探测版本 → 梯度过滤 →
+/// 选择最优（自动适配任意 N 卡与任意安装布局；`REINFER_CUDA_NVCC` 仍是
+/// 最高优先级显式覆盖）。无支持工具链 → `Fatal`（消息含所需最小版本）。
+pub fn probe_toolchain_for_arch(arch: &str) -> Result<ToolchainId, LaunchError> {
+    let mut probed = Vec::new();
+    for p in all_candidates() {
+        let Some((major, minor)) = version_of(&p) else { continue }; // 不可读版本跳过
+        let ver = (major, minor);
+        if check_arch_supported(arch, ver).is_err() {
+            continue;
+        }
+        let realpath = std::fs::canonicalize(&p).unwrap_or(p);
+        let ver_line = nvcc_ver_line(&realpath).unwrap_or_default();
+        probed.push((ToolchainId { ver_line, realpath, ccbin: probe_ccbin() }, ver));
+    }
+    select_toolchain_for(arch, probed).ok_or_else(|| {
+        eprintln!(
+            "reinfer-jit: no nvcc supports {arch} - set REINFER_CUDA_NVCC (or install >= {} check table)",
+            match arch.split('_').nth(1) {
+                Some("90") | Some("90a") => "12.3",
+                Some("100") | Some("100a") | Some("120") | Some("120a") => "12.8",
+                _ => "a compatible toolchain",
+            }
+        );
+        LaunchError::Fatal
+    })
+}
+
+/// 探测单个候选 nvcc 的版本（不可执行/不可解析 → None）。
+fn version_of(nvcc: &Path) -> Option<(u32, u32)> {
+    let line = nvcc_ver_line(nvcc).ok()?;
+    parse_nvcc_version(&line)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
@@ -168,6 +244,41 @@ mod tests {
         assert!(check_arch_supported("sm_100a", (12, 7)).is_err());
         assert!(check_arch_supported("sm_99b", (11, 0)).is_ok()); // 未知放行
         assert!(check_arch_supported("ms_120", (12, 8)).is_ok()); // 非 CUDA 名放行
+    }
+
+    #[test]
+    fn select_prefers_highest_supported_version() {
+        let tc = |ver_line: &str, path: &str| ToolchainId {
+            ver_line: ver_line.into(),
+            realpath: PathBuf::from(path),
+            ccbin: (PathBuf::from("g++"), String::new()),
+        };
+        let cands = vec![
+            (tc("release 12.6", "/usr/local/cuda-12.6/bin/nvcc"), (12, 6)),
+            (tc("release 12.9", "/usr/local/cuda-12.9/bin/nvcc"), (12, 9)),
+            (tc("release 12.8", "/usr/local/cuda-12.8/bin/nvcc"), (12, 8)),
+        ];
+        // sm_120a：12.6 被梯度过滤，选 12.9
+        let picked = select_toolchain_for("sm_120a", cands.clone()).expect("pick");
+        assert!(picked.realpath.to_string_lossy().contains("12.9"));
+        // sm_86：全部支持 → 仍取最高版本（确定性）
+        let picked = select_toolchain_for("sm_86", cands.clone()).expect("pick");
+        assert!(picked.realpath.to_string_lossy().contains("12.9"));
+        // sm_36b（虚构，梯度无判据→放行）：也取最高
+        let picked = select_toolchain_for("sm_36b", cands).expect("pick");
+        assert!(picked.realpath.to_string_lossy().contains("12.9"));
+    }
+
+    #[test]
+    fn select_empty_and_unsupported() {
+        assert!(select_toolchain_for("sm_120a", vec![]).is_none());
+        // 全部过旧 → None（调用方 Fatal+消息）
+        let tc = ToolchainId {
+            ver_line: "release 12.6".into(),
+            realpath: PathBuf::from("/x"),
+            ccbin: (PathBuf::from("g++"), String::new()),
+        };
+        assert!(select_toolchain_for("sm_120a", vec![(tc, (12, 6))]).is_none());
     }
 
     #[test]

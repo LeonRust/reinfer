@@ -17,5 +17,8 @@ pub mod types;
 pub use cache::JitCache;
 pub use key::JitKey;
 pub use meta::JLibMeta;
-pub use toolchain::{check_arch_supported, probe_toolchain, resolve_nvcc};
+pub use toolchain::{
+    check_arch_supported, probe_toolchain, probe_toolchain_for_arch, resolve_nvcc,
+    select_toolchain_for,
+};
 pub use types::{HeaderFile, KernelSource, ToolchainId};

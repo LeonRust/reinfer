@@ -7,7 +7,7 @@
 use crate::jit::{CtxGuard, JLib, KernelFn};
 use crate::stream::CudaStream;
 use reinfer_jit::compile::{compile_cubin, gencode_flags};
-use reinfer_jit::{JitCache, JitKey, KernelSource, check_arch_supported, probe_toolchain};
+use reinfer_jit::{JitCache, JitKey, KernelSource, probe_toolchain_for_arch};
 use reinfer_kernels::LaunchError;
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -30,10 +30,9 @@ impl DiffKernels {
         cache_dir: Option<PathBuf>,
         stream: CudaStream,
     ) -> Result<Self, LaunchError> {
-        let tc = probe_toolchain()?;
-        let ver =
-            reinfer_jit::toolchain::parse_nvcc_version(&tc.ver_line).ok_or(LaunchError::Fatal)?;
-        check_arch_supported(arch, ver)?;
+        // 工具链自适配：按目标 arch 在所有候选里选最优（env 仍可显式覆盖）；
+        // 无支持工具链 → Fatal（不静默）
+        let tc = probe_toolchain_for_arch(arch)?;
         let src = KernelSource {
             name: "diff_kernels",
             src: include_str!("../kernels/diff_kernels.cu"),

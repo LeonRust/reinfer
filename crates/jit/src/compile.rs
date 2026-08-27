@@ -38,8 +38,11 @@ pub fn build_flags(src: &KernelSource) -> Vec<String> {
 
 /// 编译：临时目录布局 `<tmp>/<name>.cu` + `headers/`（按 basename），
 /// 运行 `nvcc <flags>` → 收集 stdout 字节。
-pub fn compile_cubin(src: &KernelSource, _tc: &ToolchainId) -> Result<Vec<u8>, LaunchError> {
-    let nvcc = resolve_nvcc()?;
+///
+/// 工具链一致性：使用调用方给定的 `ToolchainId.realpath`（探测/自动选择的
+/// 那个）——若不可用再回退解析链；绝不允许"探测选 A、编译用 B"。
+pub fn compile_cubin(src: &KernelSource, tc: &ToolchainId) -> Result<Vec<u8>, LaunchError> {
+    let nvcc = if tc.realpath.is_file() { tc.realpath.clone() } else { resolve_nvcc()? };
     let tmp = std::env::temp_dir().join(format!(
         "reinfer-jit-compile-{}-{}",
         src.name,

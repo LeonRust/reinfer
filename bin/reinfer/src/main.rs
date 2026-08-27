@@ -926,6 +926,8 @@ fn cmd_download_offline(a: &DownloadArgs, fmt: Format, dir: &Path) -> i32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotStatus {
+    /// 槽已建但还未取到文件（防首帧空名）。
+    Waiting,
     Active,
     Done,
     Failed,
@@ -954,6 +956,8 @@ struct ProgressInner {
     last_draw: Instant,
     last_draw_done: u64,
     samples: VecDeque<(Instant, u64)>,
+    /// 已绘制的总行数（含 GLOBAL）；首帧为 0 → 原地画，后续帧回撤重写。
+    drawn_rows: usize,
 }
 
 /// 两层进度：文件条（每 worker 一行）+ GLOBAL 条（底行固定）。
@@ -976,7 +980,7 @@ impl Progress {
                         bytes: 0,
                         total: 0,
                         last: 0,
-                        status: SlotStatus::Active,
+                        status: SlotStatus::Waiting,
                         wb: 0,
                         wt: Instant::now(),
                     })
@@ -986,6 +990,7 @@ impl Progress {
                 last_draw: Instant::now(),
                 last_draw_done: 0,
                 samples: VecDeque::new(),
+                drawn_rows: 0,
             }),
         }
     }
@@ -1040,17 +1045,20 @@ impl Progress {
         g.last_draw_done = g.global.done.max(0) as u64;
     }
 
-    /// 收尾：最终帧 (done) 保留 ~1s 回收，然后补 \n（契约 §4）。
+    /// 收尾：最终帧保留 ~1s，然后把光标落到条区外一行（后续摘要行在此打印，不交叠）。
     fn finish(&self) {
         if let Ok(mut g) = self.inner.lock() {
             self.draw(&mut g);
         }
         std::thread::sleep(Duration::from_millis(1000));
-        println!();
+        println!(); // 落出条区（保留最后帧在屏幕）
         let _ = std::io::stdout().flush();
     }
 
-    /// 重绘全部行（光标位于条区下方 → 自底向上画；结束于顶行）。
+    /// 重绘全部行（行数 = slots + GLOBAL）。
+    ///
+    /// 基线控制（修复"每帧下移漂移"）：首帧在当前位置原地画；此后每帧先向上回撤
+    /// 上次绘制的行数（drawn_rows 行），清行重写。结束光标停留在条区下方一行。
     fn draw(&self, g: &mut ProgressInner) {
         let now = Instant::now();
         let done = g.global.done.max(0) as u64;
@@ -1071,19 +1079,27 @@ impl Progress {
         } else {
             0.0
         };
-        let lines: Vec<String> = g.slots.iter().map(|s| slot_line(s, g.files_total, now)).collect();
+        let mut lines: Vec<String> =
+            g.slots.iter().map(|s| slot_line(s, g.files_total, now)).collect();
+        lines.push(global_line(&g.global, gspeed));
         for s in &mut g.slots {
             s.wb = s.bytes;
             s.wt = now;
         }
         let mut out = String::new();
-        out.push_str(&format!("\x1b[{}B", g.slots.len() + 1));
-        out.push_str("\r\x1b[2K");
-        out.push_str(&global_line(&g.global, gspeed));
-        for line in lines.iter().rev() {
-            out.push_str("\x1b[A\r\x1b[2K");
-            out.push_str(line);
+        if g.drawn_rows > 0 {
+            // 回撤上次全部行（+1 让光标站到条区首行），重置行首
+            out.push_str(&format!("\x1b[{}A\r", g.drawn_rows));
         }
+        for (i, line) in lines.iter().enumerate() {
+            out.push_str("\x1b[2K");
+            out.push_str(line);
+            // 行间换行；最后一行留在本行（光标于条区末行，收尾再落出）
+            if i + 1 < lines.len() {
+                out.push('\n');
+            }
+        }
+        g.drawn_rows = lines.len();
         print!("{out}");
         let _ = std::io::stdout().flush();
     }
@@ -1106,6 +1122,7 @@ fn slot_line(s: &Slot, files_total: usize, now: Instant) -> String {
     match s.status {
         SlotStatus::Done => line.push_str("  (done)"),
         SlotStatus::Failed => line.push_str("  (failed)"),
+        SlotStatus::Waiting => line.push_str("  waiting…"),
         SlotStatus::Active => {
             if s.total > 0 {
                 let dt = now.duration_since(s.wt).as_secs_f64();

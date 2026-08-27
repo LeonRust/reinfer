@@ -1,0 +1,12 @@
+# 模板：复制为 `.cargo/config.toml`（该文件已 gitignore，不会入库）。
+# 用途：本地开发 / NPU 目标机使用本机 cann-rs checkout（改动即时生效），
+# 其余环境（CI、仅测试者）无需该文件——按 Cargo.toml 默认从 crates.io 拉取。
+#
+# 布局约定：reinfer 与 cann-rs 为兄弟目录（任何机器上保持并排，无需改本文件）：
+#   <父目录>/reinfer
+#   <父目录>/cann-rs
+# 路径按工作区根解析，与 cargo 运行目录无关；cann-rs 改动即时生效（path 依赖）。
+#
+[patch.crates-io]
+cann = { path = "../cann-rs/cann" }
+cann-sys = { path = "../cann-rs/cann-sys" }

@@ -10,8 +10,12 @@
 - NPU device + driver present: `npu-smi info` shows ≥1 device, no `[ERROR]` lines.
 - CANN toolkit (SDK 8.x) installed; `libascendcl` discoverable both at build
   (headers/libs) and runtime (`LD_LIBRARY_PATH`).
-- Repo checkout at latest `main` (this suite + ffi gate); `../cann-rs/{cann,cann-sys}`
-  on disk (workspace `[patch.crates-io]`).
+- Repo checkout at latest `main` (this suite + ffi gate).
+- cann/cann-sys source: locally-patched checkout preferred (copy
+  `.cargo/config.toml.example` to `.cargo/config.toml`; keep reinfer and
+  cann-rs as sibling directories so `../cann-rs/*` resolves on any machine) —
+  the repo default is crates.io, and the published 0.1.2 predates the memcpy
+  primitives (expect a 0.1.3 publish before relying on it).
 - Rust toolchain ≥ 1.85 (edition 2024), same as dev machine.
 
 ```bash

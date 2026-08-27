@@ -26,7 +26,7 @@ reinfer-cuda      = { path = "crates/cuda" }
 reinfer-ascend       = { path = "crates/ascend" }
 reinfer-server    = { path = "crates/server" }
 cudarc            = { version = "0.19", default-features = false, features = ["driver", "runtime", "dynamic-linking"] }  # 收窄（评审 F10）：L1 仅需 runtime/driver + 动态链接模式；cublas 等增至 L2/L3 再开
-cann              = { path = "../cann-rs/cann" }   # 昇腾安全层（cann-rs，本地桥接；无 SDK 桩可编译）
+cann              = { version = "0.1" }   # 昇腾安全层；默认来自 crates.io；本地开发/目标机用 .cargo/config.toml 的 [patch] 覆盖（见 .cargo/config.toml.example，勿入库）
 
 
 [workspace.lints.rust]
@@ -49,8 +49,3 @@ strip = "symbols"
 # 如确需最终二进制 abort：可将 [profile.release] 下加 panic="abort"，
 # 代价是库侧 catch_unwind 失效（宪法 §2.1 的 FFI 捕获即不可用），
 # 故默认保持 unwind，逐调用处用 Result / catch_unwind 消化错误。
-
-
-[patch.crates-io]
-cann = { path = "../cann-rs/cann" }
-cann-sys = { path = "../cann-rs/cann-sys" }

@@ -7,3 +7,4 @@
 profiler/
 .idea/
 .vscode/
+.cargo/config.toml

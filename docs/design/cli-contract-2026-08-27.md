@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显））；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径）；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -141,6 +141,38 @@ CUDA_VISIBLE_DEVICES · DEVICE_ID/ASCEND_* · CUDA_HOME/CUDA_PATH/PATH · XDG_CA
 | `--` 分隔 | `--` 后一切为位置参数（prompt/文件名以 `-` 开头场景；POSIX 通则） | git/curl |
 
 不做（依据）：`login/logout`（私有仓 Non-Goal）· `-y/--yes`（无破坏性操作）· config 文件（env 体系已定型；P2 需要时再上）· man（help 已覆盖）· 自更新/遥测（未定分发）。
+
+### v2.7 小件定稿（议题 1-5；用户 2026-08-27 批准"按建议"）
+
+- **help 文档面**：英文惯例（repo 通用）；usage 首行 `reinfer <command> [args]`；`-h/--help` 根与
+  子命令均可用（clap 自动排版 + 我们一行摘要/示例文案）；版本 banner `reinfer x.y.z`；
+  未立项命令不进 help（ghost 禁则延续）。
+- **错误消息体系**：两层——① 用法/参数错误：clap 统一格式（含 usage 行）→ exit 2；② 运行时
+  失败：单行摘要 + 可选 hint 行（代理/离线提示风格保持）→ exit 1。错误一律 stderr；stdout 只承载
+  结果数据（机器面纯净）。
+- **进度条**：**不加 `--no-progress`**（quiet/json/dry-run 已覆盖全部抑制场景；降级矩阵即唯一标准）。
+- **`model list` 展示**：size 列人类可读（GiB/MiB，>1GiB 显示两位小数+原始 bytes 在 json）；**不加
+  --sort/--limit**（无场景）；--format json 保持原始字节/完整 sha/source。
+- **别名**：**不加**（最小面；git 式 alias 属于 config 文件面= P2）。
+
+### 实现迁移路径（v2.7；设计→实施交接）
+
+```
+阶段 A｜CLI 重写为 clap：bin/reinfer 解析层一次性迁移（derive + clap_complete；命令面
+       download/model list/completions/help + 全局旗）；现存解析单测迁移为 try_parse 断言；
+       行为契约全保留（§5 8 条适配清单逐条断言）。
+阶段 B｜download 增强实现：进度回调（fetch_to_temp）→ 4 并发（manifest 互斥）→ --format/
+       --quiet 输出层 → --dry-run。
+阶段 C｜其余命令：serve/run/chat/bench/doctor 按各自 specification（005/003/008/002）立项后
+       按本契约落位。
+随行清理（阶段 A/B 内完成）：① 格式无关摘除（resolver/bin 3 处 .gguf 过滤 + 文案）；
+② .env.example 移除 REINFER_MODEL_DIR 默认行；③ REINFER_SERVE_* 接入点；
+④ 进度条 TTY 色彩接 --no-color/NO_COLOR。
+```
+
+**预留注记（各 spec 立项时细化，不入本契约）**：bench 指标定义（warmup/计时口径、-r/-l 缺省）·
+chat REPL 交互细节（历史/编辑、Ctrl-C 语义）· serve 日志风格（结构化 vs 人类双式、访问日志面）
+——届时以对应 spec 修约本契约。
 
 ## 6. 未来命令契约（未立项）
 

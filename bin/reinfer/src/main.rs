@@ -1060,6 +1060,7 @@ impl Progress {
                 idx + 1,
                 self.bars.len()
             ));
+            self.mp.remove(pb); // 从当前位置移除（避免 insert 复制导致双行——用户实测 2026-08-28）
             let _ = self.mp.insert(0, pb.clone()); // 完成置顶
         } else {
             pb.abandon_with_message(format!(

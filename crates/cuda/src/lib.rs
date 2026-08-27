@@ -33,6 +33,10 @@ pub mod event;
 #[cfg(feature = "cuda")]
 pub mod jit;
 
+/// vec_add Jit provider（012 C2；feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod jit_provider;
+
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;
 #[cfg(feature = "cuda")]

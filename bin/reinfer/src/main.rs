@@ -457,6 +457,7 @@ fn cmd_list_local(a: ListArgs, vlog: &Verbosity) -> i32 {
 }
 
 /// 清单可见性（格式无关；契约 v2.7：非隐藏、非 manifest、非下载临时文件）。
+#[cfg(test)]
 fn is_listed_file(name: &str) -> bool {
     !name.starts_with('.') && name != MANIFEST && !name.contains(".tmp-")
 }

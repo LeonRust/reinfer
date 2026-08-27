@@ -4,7 +4,7 @@
 
 **reinfer** is a memory-safe, high-throughput LLM inference engine written in **Rust**, targeting **NVIDIA CUDA** and **Ascend CANN** (Huawei NPU) with single-binary delivery.
 
-> ⚠️ Status: early development. **CUDA**: runtime base (L1) + JIT kernel pipeline (L2) implemented and machine-verified (RTX 5090, 6/6 smoke). **Ascend**: L0 consumer mirror implemented and NPU-verified (5/5 smoke). Serving (P1) lands next.
+> ⚠️ Status: early development. **CUDA**: runtime base (L1) + JIT kernel pipeline (L2) implemented and machine-verified (RTX 5090, 6/6 smoke); L3 single-request pipeline in flight. **Model fetch** (pure-Rust, ModelScope-first) implemented and verified against the real repo. **Ascend**: L0 consumer mirror implemented and NPU-verified (5/5 smoke). Serving (P1) lands next.
 
 ## Highlights
 
@@ -16,7 +16,43 @@
 - **Structured generation** — llguidance-backed grammar / JSON / FSM constraints with zero C FFI
 - **Quantization** — GGUF-compatible Q4_0 / Q8_0 / K-quants / IQ family, FP8 / NVFP4 paths
 - **Single binary** — `server` / `cli` / `bench` in one executable; GPU backends selected via cargo features
+- **Model fetch** — pure-Rust ModelScope client (no Python); `reinfer model list/get` with sha256-verified atomic downloads + runtime auto-download (`ModelResolver`), ModelScope-first with optional HuggingFace fallback
 - **Dual hardware** — NVIDIA and Ascend (ACLNN + AscendC kernels); the JIT cache layer is shared, platform-neutral, zero-unsafe
+
+## Model fetch
+
+`reinfer model` downloads GGUF models with pure Rust — no Python, no pip, no external CLI
+(`crates/models`, spec [`specs/013-model-fetch`](specs/013-model-fetch/spec.md)):
+
+```bash
+# list GGUF files of a repo (name / size / sha256)
+reinfer model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# download a quantized GGUF (resolves quant tag → file name, verifies size + sha256)
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0
+
+# exact file / every GGUF / custom dir
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0 --to ~/models/reinfer
+```
+
+Source priority and download policy come from env (CLI args win):
+
+| Var | Values | Default | Meaning |
+|---|---|---|---|
+| `REINFER_MODEL_SOURCE` | `modelscope`/`huggingface`/`auto` | `auto` | `auto` = ModelScope first, falls back to HuggingFace on miss |
+| `REINFER_MODEL_DIR` | path | `~/models/reinfer` | download/search root (`~` is expanded) |
+| `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | verify depth; HF source degrades sha256 → ETag+size (no sha field upstream) |
+| `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | `off` = never dials out (missing model → error) |
+| `REINFER_MODEL_REPO`/`QUANT`/`FILE` | repo, quant tag, exact name | — | convenience injection (CLI takes precedence) |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | standard | — | egress, e.g. `http://192.168.0.1:7890`; `NO_PROXY=...,modelscope.cn,huggingface.co` for direct |
+
+Downloads stream to a temp file, verify against the ModelScope files API sha256 (ETag+size
+for HuggingFace), rename atomically and record a `manifest.json` entry; a failed verification
+retries once and fails loudly — no half-written leftovers. `AUTODOWNLOAD=off` keeps the
+runtime fully offline. Model identifiers are never hardcoded in the engine: repo/file names
+always come from CLI/env.
 
 ## Quick start
 

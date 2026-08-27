@@ -22,6 +22,7 @@
 | P0-02 | GGUF reader (header/meta/tensor table + mmap views) | `crates/gguf` | 001/tasks T2–T3 | golden-file + proptest | ✅ ready |
 | P0-03 | Quant codecs naive (Q8_0 / Q4_0 / F16 / FP32) + proptest | `crates/gguf` | 001/tasks T4 | ≤1 ULP golden blocks | ✅ ready |
 | P0-04 | Arch config loader (Llama metadata → typed config; Qwen2 parse) | `crates/arch` | 001/plan §Modules | parse tests | ✅ ready |
+| P0-08 | Model fetch: pure-Rust ModelScope/HF client (`reinfer model list/get` + runtime `ModelResolver` env policy: SOURCE/DIR/VERIFY/AUTODOWNLOAD, ModelScope-first, HF fallback) | `crates/models`, `bin/reinfer` | ✅ specs/013-model-fetch | stub network tests + end-to-end (q8_0 675710816 B, sha256 matches repo value; manifest left) | ✅ done (f35205b + T3 CLI) |
 | P0-05 | GGUF tokenizer (SPM/BPE encode + increment-decode from GGUF tokenizer models) | `crates/tokenizer` | ✅ `specs/004-tokenizer` | golden vs llama.cpp tokens | ✅ spec ready |
 | P0-06 | CPU inference loop: RMSNorm/RoPE/softmax/MHA naive + contiguous KV (GQA), streamed decode | `crates/cpu`, `crates/arch` | 🔒 spec **007-core-inference** (CPU 全链路，为 005 `--backend cpu` 与无 GPU CI 提供载体) | 000/spec parity criteria | 🔒 spec first |
 | P0-07 | `info` + `cli` subcommands + differential harness vs llama.cpp | `bin/reinfer`, `bench/` | 001/tasks T5–T6; 000 | PNG: token 100% on 20 prompts; ≥60% llama.cpp decode | ↔ after P0-05/06 |

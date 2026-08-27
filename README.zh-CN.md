@@ -4,7 +4,7 @@
 
 **reinfer** 是一款用 **Rust** 编写的内存安全、高吞吐 LLM 推理引擎，面向 **NVIDIA CUDA** 与 **昇腾 CANN**（华为 NPU），以单二进制形式交付。
 
-> ⚠️ 状态：早期开发中。**CUDA**：运行时基座（L1）+ JIT 内核流水线（L2）已实现并经真机验证（RTX 5090，6/6 smoke）。**昇腾**：L0 消费镜像已实现并经 NPU 验证（5/5 smoke）。服务能力（P1）随后落地。
+> ⚠️ 状态：早期开发中。**CUDA**：运行时基座（L1）+ JIT 内核流水线（L2）已实现并经真机验证（RTX 5090，6/6 smoke）；L3 单请求流水线推进中。**模型获取**（纯 Rust、ModelScope 优先）已实现并经真实仓库验证。**昇腾**：L0 消费镜像已实现并经 NPU 验证（5/5 smoke）。服务能力（P1）随后落地。
 
 ## 亮点
 
@@ -16,7 +16,40 @@
 - **结构化生成** —— llguidance 支撑的 grammar / JSON / FSM 约束，零 C FFI
 - **量化** —— 兼容 GGUF Q4_0 / Q8_0 / K-quants / IQ 家族，FP8 / NVFP4 路径
 - **单二进制** —— `server` / `cli` / `bench` 合于一个可执行文件；GPU 后端按 cargo feature 选择
+- **模型获取** —— 纯 Rust ModelScope 客户端（无 Python）；`reinfer model list/get`（sha256 校验、原子落盘 + 运行时自动下载 `ModelResolver`），ModelScope 优先、可选 HuggingFace 回退
 - **双硬件** —— NVIDIA 与昇腾（ACLNN + AscendC 内核）；JIT 缓存层为平台无关共享层、零 unsafe
+
+## 模型获取
+
+`reinfer model` 用纯 Rust 下载 GGUF 模型——无 Python、无 pip、无外部 CLI（`crates/models`，规范见 [`specs/013-model-fetch`](specs/013-model-fetch/spec.md)）：
+
+```bash
+# 列出仓库 GGUF 文件（名 / 大小 / sha256）
+reinfer model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# 下载量化 GGUF（量化段 → 文件名解析，校验大小 + sha256）
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0
+
+# 精确文件 / 全部 GGUF / 自定义目录
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0 --to ~/models/reinfer
+```
+
+源优先级与下载策略由 env 控制（CLI 参数优先）：
+
+| 变量 | 取值 | 缺省 | 语义 |
+|---|---|---|---|
+| `REINFER_MODEL_SOURCE` | `modelscope`/`huggingface`/`auto` | `auto` | `auto` = ModelScope 优先，缺（404/文件缺失）→ HuggingFace 回退 |
+| `REINFER_MODEL_DIR` | 路径 | `~/models/reinfer` | 下载/查找根（`~` 自动展开） |
+| `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | 校验深度；HF 源缺 sha 字段 → 降级 ETag+size |
+| `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | `off` = 绝不联网（缺模型即报错） |
+| `REINFER_MODEL_REPO`/`QUANT`/`FILE` | 仓库名、量化段、精确文件名 | — | 便捷注入（CLI 参数优先） |
+| `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | 标准 | — | 网络出口，如 `http://192.168.0.1:7890`；`NO_PROXY=...,modelscope.cn,huggingface.co` 可直连 |
+
+下载流式写临时文件、经 ModelScope files API 的 sha256 校验（HF 为 ETag+size）、原子改名并记录
+`manifest.json`；校验失败重试一次、失败即报错——不留半成品。`AUTODOWNLOAD=off` 令运行时完全离线。
+引擎内**不硬编码任何模型标识**：仓库/文件名一律来自 CLI/env。
 
 ## 快速开始
 

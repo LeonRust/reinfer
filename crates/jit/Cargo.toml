@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 publish = false
+
 [dependencies]
+reinfer-kernels = { workspace = true }
+fs2 = { workspace = true }        # flock 跨进程锁 safe wrapper（零 unsafe 依据）
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

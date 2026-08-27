@@ -170,7 +170,7 @@ mod smoke {
 
             let mut dx = DeviceBuffer::alloc(dev, n * 4).expect("dx");
             let mut dw = DeviceBuffer::alloc(dev, n * 4).expect("dw");
-            let mut dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
+            let dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
             host_to_dev(&mut dx, &x);
             host_to_dev(&mut dw, &w);
             dk.launch_rms_norm(
@@ -218,7 +218,7 @@ mod smoke {
             let want = reinfer_kernels::refs::rope_ref(&x, half, 7, 5000.0);
 
             let mut dx = DeviceBuffer::alloc(dev, n * 4).expect("dx");
-            let mut dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
+            let dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
             host_to_dev(&mut dx, &x);
             dk.launch_rope(
                 0,
@@ -248,15 +248,15 @@ mod smoke {
             let mut seed = 0x900du64;
             let mut mask = Vec::with_capacity(n);
             let mut x = vec![0.0f32; n];
-            for i in 0..n {
+            for (i, slot) in x.iter_mut().enumerate() {
                 let m = (i * 37) % 10 < 6; // 伪随机混合掩码（确定性）
                 mask.push(m);
-                x[i] = if m { lcg(&mut seed) } else { f32::NEG_INFINITY };
+                *slot = if m { lcg(&mut seed) } else { f32::NEG_INFINITY };
             }
             let want = reinfer_kernels::refs::masked_softmax_ref(&x, &mask);
 
             let mut dx = DeviceBuffer::alloc(dev, n * 4).expect("dx");
-            let mut dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
+            let dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
             host_to_dev(&mut dx, &x);
             dk.launch_masked_softmax(
                 0,
@@ -315,7 +315,7 @@ mod smoke {
         let p_cpu = reinfer_kernels::refs::masked_softmax_ref(&logits, &mask);
 
         let mut dx = DeviceBuffer::alloc(dev, n * 4).expect("dx");
-        let mut dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
+        let dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
         host_to_dev(&mut dx, &logits);
         dk.launch_masked_softmax(
             0,

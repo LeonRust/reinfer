@@ -156,10 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pctx: cudarc::driver::sys::CUcontext = std::ptr::null_mut();
         let r2 = unsafe { cudarc::driver::sys::cuDevicePrimaryCtxRetain(&mut pctx, 0) };
         println!("[s4] retain rc={r2:?} pctx={pctx:?}");
-        println!(
-            "[s4] same? {}",
-            ctx_out as *const std::ffi::c_void == pctx as *const std::ffi::c_void
-        );
+        println!("[s4] same? {}", std::ptr::eq(ctx_out, pctx as *const std::ffi::c_void));
         return Ok(());
     }
 
@@ -169,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let d_b: cudarc::driver::sys::CUdeviceptr = db.as_ptr() as cudarc::driver::sys::CUdeviceptr;
         let d_c: cudarc::driver::sys::CUdeviceptr =
             do_.as_ptr() as cudarc::driver::sys::CUdeviceptr;
-        let n = N as u32;
+        let n = N;
         let p_a = &d_a as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void;
         let p_b = &d_b as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void;
         let p_c = &d_c as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void;

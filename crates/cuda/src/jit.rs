@@ -27,10 +27,16 @@ use cudarc::driver::sys;
 /// 为什么需要（C3 实测）：`cuLaunchKernel` 需要线程的 **driver current context**；
 /// 仅 runtime 面（cudaSetDevice）在 driver API 视角下 current 未必然被设置——
 /// 直接 launch 实测 SIGSEGV。guard 在 launch 线程创建（current 是线程局部），
-/// Drop 释放 primary 引用（runtime 侧的引用保持存活，上下文不销毁）。
+/// Drop 释放 primary 引用（runtime 侧的引用保持存活，上下文不销毁；
+/// 删除对象持有 `ctx` 值——Drop 仅按设备释放引用）。
 pub struct CtxGuard {
     dev: sys::CUdevice,
-    ctx: sys::CUcontext,
+}
+
+impl std::fmt::Debug for CtxGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CtxGuard(dev={})", self.dev)
+    }
 }
 
 impl CtxGuard {
@@ -46,7 +52,7 @@ impl CtxGuard {
         // SAFETY: ctx 为刚 retain 的合法 primary context。
         let r = unsafe { sys::cuCtxSetCurrent(ctx) };
         rc(r)?;
-        Ok(Self { dev: dev as sys::CUdevice, ctx })
+        Ok(Self { dev: dev as sys::CUdevice })
     }
 }
 
@@ -146,8 +152,6 @@ impl std::fmt::Debug for JLib {
     }
 }
 
-impl JLib {}
-
 impl Drop for JLib {
     fn drop(&mut self) {
         // SAFETY: 句柄唯一所有权；unload 失败忽略（进程退出兜底）。
@@ -174,7 +178,7 @@ pub unsafe fn launch_vec_add(
         return Ok(());
     }
     // driver launch 需要线程 current context（C3 实测约束）
-    let guard = CtxGuard::set_current(dev)?;
+    let _guard = CtxGuard::set_current(dev)?;
     // C3 实测（595.84 驱动）：参数必须以**局部变量取址**打包进 kernelParams
     // （与 loadtest4/s2/s5 已验证写法一致）；直接以转换链内联值（s3 写法）
     // 会在 driver 内部 SIGSEGV——值相同但打包方式被驱动敏感。

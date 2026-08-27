@@ -13,6 +13,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 
 /// 三个行式 diff 内核的装载单元。
+#[derive(Debug)]
 pub struct DiffKernels {
     lib: JLib,
     rms: KernelFn,
@@ -72,7 +73,7 @@ impl DiffKernels {
         n: u32,
         eps: f32,
     ) -> Result<(), LaunchError> {
-        let guard = CtxGuard::set_current(dev)?;
+        let _guard = CtxGuard::set_current(dev)?;
         // SAFETY（C3 纪律）：指针由调用方保证为设备缓冲；参数局部变量取址。
         let mut args: [*mut c_void; 5] = [
             (&x as *const *const f32) as *mut c_void,
@@ -94,7 +95,7 @@ impl DiffKernels {
         pos: u32,
         eta: f32,
     ) -> Result<(), LaunchError> {
-        let guard = CtxGuard::set_current(dev)?;
+        let _guard = CtxGuard::set_current(dev)?;
         // SAFETY：同上；线程数 = half（每线程一对）。
         let mut args: [*mut c_void; 5] = [
             (&x as *const *const f32) as *mut c_void,
@@ -114,7 +115,7 @@ impl DiffKernels {
         out: *mut f32,
         n: u32,
     ) -> Result<(), LaunchError> {
-        let guard = CtxGuard::set_current(dev)?;
+        let _guard = CtxGuard::set_current(dev)?;
         // SAFETY：同上。
         let mut args: [*mut c_void; 3] = [
             (&x as *const *const f32) as *mut c_void,

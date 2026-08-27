@@ -29,6 +29,10 @@ pub mod stream;
 #[cfg(feature = "cuda")]
 pub mod event;
 
+/// Jit 产物加载与 launch（012 C1；feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod jit;
+
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;
 #[cfg(feature = "cuda")]

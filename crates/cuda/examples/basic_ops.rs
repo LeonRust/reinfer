@@ -26,7 +26,7 @@ fn fill_host(buf: &HostBuffer, seed: u8) {
 fn xor_checksum(buf: &HostBuffer) -> u64 {
     // SAFETY：只读
     unsafe {
-        core::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.size())
+        core::slice::from_raw_parts(buf.as_ptr(), buf.size())
             .iter()
             .fold(0u64, |acc, &b| acc.wrapping_add(acc.wrapping_mul(31).wrapping_add(b as u64)))
     }
@@ -121,9 +121,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("== [5] 错误注入演示（精确变体）==");
     let total_mem = CudaContext::device_info(0)?.total_mem;
-    let err = DeviceBuffer::alloc(dev, total_mem as usize + 1).unwrap_err();
+    let err = DeviceBuffer::alloc(dev, total_mem as usize + 1).expect_err("must fail");
     println!("  over-alloc  -> {err}（预期 Oom）");
-    let err = CudaContext::init(DeviceId::new(count)).unwrap_err();
+    let err = CudaContext::init(DeviceId::new(count)).expect_err("must fail");
     println!("  bad index   -> {err}（预期 Fatal：101 不在白名单，fail-closed）");
 
     println!("OK — L1 全功能演示完成");

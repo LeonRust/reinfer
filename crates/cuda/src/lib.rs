@@ -13,6 +13,9 @@ pub mod error;
 /// 设备信息纯数据与格式化（无 feature 依赖）。
 pub mod device_info;
 
+/// MemRef 拷贝校验纯逻辑（无 feature）。
+pub mod buffer_check;
+
 /// 设备上下文（feature `cuda`）。
 #[cfg(feature = "cuda")]
 pub mod context;
@@ -33,3 +36,11 @@ pub mod event;
 pub use event::CudaEvent;
 #[cfg(feature = "cuda")]
 pub use stream::CudaStream;
+
+/// 设备/主机内存缓冲（feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod buffer;
+
+#[cfg(feature = "cuda")]
+pub use buffer::{DeviceBuffer, HostBuffer};
+pub use buffer_check::MemcpyKind;

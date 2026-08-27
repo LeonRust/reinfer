@@ -6,6 +6,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+reinfer-core = { workspace = true }
 reinfer-kernels = { workspace = true }
 cudarc = { workspace = true, optional = true }
 

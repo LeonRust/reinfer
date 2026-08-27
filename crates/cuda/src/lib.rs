@@ -9,3 +9,14 @@ pub use cudarc as _cudarc;
 
 /// `cudaError → LaunchError` 白名单映射（003 T3；纯 CPU 可测）。
 pub mod error;
+
+/// 设备信息纯数据与格式化（无 feature 依赖）。
+pub mod device_info;
+
+/// 设备上下文（feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod context;
+
+#[cfg(feature = "cuda")]
+pub use context::CudaContext;
+pub use device_info::DeviceInfo;

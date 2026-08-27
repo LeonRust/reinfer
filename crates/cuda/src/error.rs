@@ -7,7 +7,8 @@
 //! 注意：CUDA 12.x 将 `cudaErrorDeviceUnavailable` 更名为
 //! **`cudaErrorDevicesUnavailable = 46`**（官方 ABI 值稳定，名称演进）。
 
-use reinfer_kernels::LaunchError;
+// 经模块聚合导出（crate::error::LaunchError），并作为本地可见名使用
+pub use reinfer_kernels::LaunchError;
 
 /// `cudaError_t` 原始值（C ABI 稳定，此类型避免过度绑定 cudarc）。
 pub type CudaErrorCode = i32;

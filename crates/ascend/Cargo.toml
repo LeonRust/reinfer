@@ -10,5 +10,9 @@ reinfer-core = { workspace = true }
 reinfer-kernels = { workspace = true }
 cann = { workspace = true }   # 经 [patch.crates-io] 本地桥接；无 ffi 默认桩可编译
 
+[features]
+# 目标机（NPU + CANN SDK）构建开关：本地开发机无 CANN，禁止开启。
+ffi = ["cann/ffi"]
+
 [lints]
 workspace = true

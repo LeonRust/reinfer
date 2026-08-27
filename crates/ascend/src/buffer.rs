@@ -194,7 +194,7 @@ pub fn copy_async(
     Ok(evt)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "ffi")))]
 mod tests {
     use super::*;
 

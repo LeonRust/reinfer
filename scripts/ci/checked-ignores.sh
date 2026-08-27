@@ -16,9 +16,16 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 # 1) 先完整跑 --list --ignored：失败（构建错误/无 nvcc）→ set -e 使脚本整体失败
+#    2026-08-27：reinfer-ascend 引入 `ffi` feature（cann/ffi，仅 NPU 机可链接）
+#    —— 无 CANN 的机器上 `--all-features` 会链接失败，故：
+#    - 非昇腾侧：--all-features（覆盖 feature 门控的 GPU target 可见性）；
+#    - reinfer-ascend：默认特性（stub）单独列出——其 smoke 用例非 feature 门控，
+#      列表与 ffi 构建一致（5 条用例名同 CUDA 侧，allowlist 同一行映射）。
 LIST_FILE="$(mktemp)"
 trap 'rm -f "$LIST_FILE"' EXIT
-cargo test --all-features --workspace --no-fail-fast -- --list --ignored >"$LIST_FILE" 2>&1
+cargo test --workspace --all-features --no-fail-fast --exclude reinfer-ascend \
+  -- --list --ignored >"$LIST_FILE" 2>&1
+cargo test -p reinfer-ascend --no-fail-fast -- --list --ignored >>"$LIST_FILE" 2>&1
 
 # 2) 再解析：grep 空匹配是合法的（无 ignore 测试），用 || true 兜底
 IGNORED="$(grep -E ': test$' "$LIST_FILE" | sed 's/: test$//' | sort -u || true)"

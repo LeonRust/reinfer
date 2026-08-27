@@ -25,7 +25,7 @@
 
 - [ ] `.github/workflows/` 三个文件落地：`ci.yml`（PR 主档）、`gpu.yml`（label/路径触发：`nvidia-run`）、`bench.yml`（nightly：baseline 更新 + 性能报告）
 - [ ] runner 规范文档化：标签（`nvidia-gpu`/`can-gpu`）+ 每 runner 单设备 + 硬件记录（GPU UUID、driver、cuBLAS、sm 型号 → parity.md 引用）
-- [ ] `#[ignore]` 契约：测试按 `cuda`/`ascend` 特性分层；`scripts/ci-check-ignore.sh` 校验"每个 ignore 测试有 job 清单项"；无 GPU 档 `cargo test --all-features --no-default-features` 之外对 `#[]` 白名单
+- [ ] `#[ignore]` 契约：测试按 `cuda`/`ascend` 特性分层；`scripts/ci/checked-ignores.sh` 校验"每个 ignore 测试有 job 清单项"（**须用 `--list --ignored`；构建失败必须 exit 1，禁止恒绿**，2026-08-27 评审 C-F1）；无 GPU 档仅 `cargo test --workspace`（不含 `--all-features`——它会因无 nvcc 失败）
 - [ ] 缓存/工件：cargo build 缓存（按 lock 哈希）；JitCache 预烘焙（`REINFER_CUDA_ARCH`）入缓存并在 GPU job 恢复；golden/notes/baseline 为工件
 - [ ] 门禁接线表（下文）逐行可判定；`perf` label 回归判定（≤0.9× 基线 = 红）有 fixture 测试
 - [ ] 运行成本：main PR 主档 < 5 min；GPU 档排队/超时/并发限制（并发=1 runner 自持）声明

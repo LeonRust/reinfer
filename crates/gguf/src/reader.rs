@@ -155,6 +155,11 @@ pub struct ModelMeta {
 }
 
 impl ModelMeta {
+    /// 从 KV 列表构造元数据表（程序化嵌入/测试场景；与解析路径共用同一内部表示）。
+    pub fn from_kvs(kvs: impl IntoIterator<Item = (String, MetaValue)>) -> Self {
+        Self { kvs: kvs.into_iter().collect() }
+    }
+
     /// 原始值访问（未知键返回 `None`）。
     pub fn get(&self, key: &str) -> Option<&MetaValue> {
         self.kvs.get(key)
@@ -916,7 +921,8 @@ mod tests {
             dtype: GgufDtype::F32,
             data: [1.0f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat(),
         };
-        let with_tensor = || build_gguf(3, &[("a", MetaValue::U32(7))], std::slice::from_ref(&tensor));
+        let with_tensor =
+            || build_gguf(3, &[("a", MetaValue::U32(7))], std::slice::from_ref(&tensor));
 
         // 坏 utf8 键（'a' 在偏移 32）
         let mut bytes = with_tensor();

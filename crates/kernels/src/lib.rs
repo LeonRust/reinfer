@@ -4,8 +4,10 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod provider;
 
 pub use error::LaunchError;
+pub use provider::{KernelProvider, LaunchArgs, OpConfig, ProviderTier, TuneEntry, select};
 
 /// 内存拷贝校验共享纯逻辑（CUDA / 昇腾共用）。
 pub mod mem_check;

@@ -212,6 +212,9 @@ dependencies = [
 [[package]]
 name = "reinfer-kernels"
 version = "0.1.0"
+dependencies = [
+ "reinfer-core",
+]
 
 [[package]]
 name = "reinfer-memory"

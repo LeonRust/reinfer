@@ -5,6 +5,7 @@ edition = "2024"
 
 publish = false
 [dependencies]
+reinfer-core = { workspace = true }
 
 [lints]
 workspace = true

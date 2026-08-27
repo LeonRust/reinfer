@@ -4,8 +4,8 @@
 > ③ 下载 = 顶层 `download`（hf/modelscope 同名先例）；④ 无显式文件选择 = 整仓库（hf 默认）；
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
-> **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节——
-> 模型引用三态 + 参数全集 + P1 功能面）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
+> **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
+> v2.3：doctor 章节定稿）；CLI 整体方案仍在与用户继续探讨；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
 ## 1. 命令面
@@ -22,7 +22,7 @@ serve   <model> [--host...]      HTTP 推理服务（P1-05 / specs/005；先例 
 chat    <model>                   交互对话（specs/005）——契约预置
 run     <model> [prompt...]       单次生成（prompt 剩余位置拼接）——契约预置
 bench   <model>                   性能基准（003 / specs/008）——契约预置
-diag                               环境诊断（ASC-03 / specs/002）——契约预置
+doctor                              环境体检（flutter/cargo doctor 先例；ASC-03 改名落位）——契约预置
 
 model list [--format table|json|quiet]
            本地已下载清单（先例：docker image ls / ollama list / modelscope-ng list——零参默认本地）
@@ -130,9 +130,26 @@ bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len
 - **bench**：`-r/--reps`、`-l/--seq-len`；指标=prefill tps·decode tps·首 token 延迟·峰值显存；
   `--format table|json`（数字面机读；008 gate_throughput.sh 消费 json）；gate 阈值逻辑在脚本层（008），不进 CLI。
 
+### doctor（v2.3 定稿——原预置名 diag，用户 2026-08-27 定版改名）
+
+```
+reinfer doctor [--backend auto|cuda|ascend] [--format table|json|quiet] [--net]
+```
+
+- **语义**：环境体检（先例：flutter doctor / cargo doctor / npm doctor）——逐项 ✓/⚠/✗ 判定 +
+  修复建议 + 结论行；**exit**：出现 ✗（阻塞级：无设备/无工具链/模型目录不可写）→ 1；
+  仅 ⚠（建议级：如代理未设）→ 0。
+- **检查块**：CUDA（driver/型号/多卡/显存视图）· CUDA 工具链（nvcc 位置与可用性——JIT 依赖）·
+  CANN（version/aclnn/昇腾卡数）· 模型目录（存在/可写/余量）· 配置回显（`REINFER_*` 家族全部，
+  含来源）· `--net` 追加 ModelScope/HF 连通性探针（**默认离线**，与 AUTODOWNLOAD 纪律同精神）。
+- **输出**：flutter 风表格（`[✓]`/`[⚠]`/`[✗]` + 修复建议）；`--format json`（CI 环境门控）；
+  `--format quiet`=只打阻塞项。`--backend` 限定栈（auto=双栈，缺省）。
+- **命名决策依据**：doctor=体检判定+建议（flutter/cargo/npm 行业标准）；diag=事后采集（无统一
+  先例）；本命令语义同候诊体检 → doctor；不设 diag 别名（保持命令面最小）。ASC-03 预置名同步。
+
 ### 其他
 
-`diag`（ASC-03：环境诊断，无模型参数，已定名）。上述 run/chat/bench 的 <model> 三态同 serve（§6 serve）。
+上述 run/chat/bench 的 <model> 三态同 serve（§6 serve）。
 
 ## 7. 先例对照表
 
@@ -161,7 +178,7 @@ bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len
 | download（file.../`-q`/--include/--exclude/--revision/--local-dir/无选择=全量）· model list | ✅ 已实现（67ced3a/494c877） |
 | 默认目录 `~/.reinfer/models` 平台化 | ✅ 150122 实现＋本机迁移 |
 | `--dry-run` / `--format` / `--quiet` / 4 并发 / 进度两层 | ⏸ **待定稿后实现**（用户已确认设计，实现动工等整体方案探讨完） |
-| serve/chat/run/bench/diag | 契约预置，未立项 |
+| serve/chat/run/bench/doctor | 契约预置，未立项 |
 
 ## 附. 待办（等用户批准）
 

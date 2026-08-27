@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod compile;
 pub mod error;
 pub mod key;
 pub mod lock;

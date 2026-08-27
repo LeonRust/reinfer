@@ -69,6 +69,14 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
   两家官方 CLI 均无"列仓库文件"命令；需要时网页查看。`model get` 废弃（旧 r3 形态）。
 - 通用旗子规则与先例对照表：docs/design/cli-contract-2026-08-27.md。
 
+## r5.1（2026-08-27 修订——解析实现契约：clap）
+
+> r1 Constraints 的"解析仍用 std（不引入 clap 等新命令依赖）"为早期决策；2026-08-27 用户
+> 重新拍板：**CLI 解析统一采用 clap（derive 家族）+ clap_complete**（补全生成）。本 spec 已
+> 实现的 std 手写解析器（T3 交付）视为阶段性实现，**CLI 重构时按 cli-contract v2.5 迁移**
+> （契约规则优先于 clap 默认的 8 条适配清单见 cli-contract §5 解析实现）。
+> 依赖：`clap` + `clap_complete`（workspace 依赖表补入）；二进制单文件形态不变。
+
 ## Non-Goals
 
 - 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）

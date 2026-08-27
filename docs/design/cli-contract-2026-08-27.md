@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`））；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap）；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -92,6 +92,27 @@ GLOBAL ████████████░░░░░░░░░░░░�
 | 执行失败 | exit 1 + stderr 详情（缺代理打 hint） |
 | 子命令 help | `reinfer <cmd> help|-h|--help` |
 | env 规则 | **默认值不写进 env 模板**；env 显式设置即生效（通用软件惯例——见"附. 待办"） |
+
+### 解析实现（v2.5 定稿：clap，用户 2026-08-27 拍板）
+
+- **采用 `clap`（derive 家族）实现 CLI 解析**——废弃 spec 013 早期"std 手写"决定（该决定为
+  r1 时代约束；现以本契约为准；013 spec 侧 r6 决策段同步）。
+- **契约规则优先于 clap 默认**（实现时逐条显式配置，不以 clap 默认替代契约语义）：
+  1. `reinfer <cmd> help` 子命令 help 形态（clap 默认 `--help` 之外补显式 `help` 子命令）；
+  2. `--flag=value` 与 `--flag value` 两种形式（clap 默认即支持，确认行为一致）；
+  3. 全局旗（`-v/-vv/--debug/--no-color/-V`）**仅命令前**（gh 惯例；clap 全局旗另有默认，配置对齐）；
+  4. `-q/--quant` = quant（**不是** quiet；quiet 仅 `--quiet` 长旗）；
+  5. `--format` 枚举（table|json|quiet 等按命令面）；`-v/-vv` 叠用（ArgAction::Count）；
+  6. 用法错误 → **exit 2**（clap 默认为 2，验证）；执行失败 exit 1（保持）；
+  7. 模型引用三态的 `-q|-f` 互斥/条件（conflicts/requires 声明式表述）；
+  8. `--` 分隔、value 以 `-` 开头的显式传参模式。
+- **为何 clap**（用户定稿）：声明式类型安全、自动 help/error/`--version`、
+  `clap_complete` 五 shell 补全（bash/zsh/fish/powershell/elvish）、冲突/条件校验；规模收益
+  （serve/run/bench/doctor 定稿后总旗子 >50，手写解析维护成本已超库成本）。
+- **completions 命令契约**（v2.4）改为：`clap_complete` 生成（不再手写模板）；词表覆盖
+  已实现命令+旗子（与 help 同则）。
+- **成本项记录**：依赖树增长（clap+clap_complete+derive）、编译时间、release 体积（~+0.8MB）、
+  契约默认 override 工作——均有评估，定稿接受。
 
 ### v2.4 补全（五件套；用户 2026-08-27 定稿）
 

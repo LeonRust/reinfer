@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod provider;
+pub mod refs;
 
 pub use error::LaunchError;
 pub use provider::{KernelProvider, LaunchArgs, OpConfig, ProviderTier, TuneEntry, select};

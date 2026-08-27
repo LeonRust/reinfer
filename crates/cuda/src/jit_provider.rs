@@ -19,6 +19,7 @@ use std::any::Any;
 use std::path::PathBuf;
 
 /// vec_add launch 参数（设备指针 + 元素数；全部为 borrow-free——Any 契约）。
+#[derive(Debug)]
 pub struct VecAddArgs {
     /// 输入 a 设备指针（`DeviceBuffer::as_ptr().cast::<f32>()`）。
     pub a: *const f32,
@@ -33,6 +34,7 @@ pub struct VecAddArgs {
 impl LaunchArgs for VecAddArgs {}
 
 /// Jit tier provider：编译签名的 vec_add（`extern "C" __global__`）。
+#[derive(Debug)]
 pub struct VecAddProvider {
     lib: JLib,
     kernel: KernelFn,
@@ -73,6 +75,11 @@ impl VecAddProvider {
     /// 目标架构（诊断用）。
     pub fn arch(&self) -> &str {
         &self.arch
+    }
+
+    /// 底层库句柄（诊断/未来 vendor 面；保证 `lib` 的存活语义被引用）。
+    pub fn raw_lib(&self) -> cudarc::driver::sys::CUlibrary {
+        self.lib.raw()
     }
 
     /// 校验 size 供应的匹配（buffer 分配与 args 一致性）。

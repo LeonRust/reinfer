@@ -26,7 +26,7 @@ NO_PROXY=localhost,127.0.0.1,modelscope.cn,huggingface.co
 ## 验证 1 — `model list`（files API 契约）
 
 ```bash
-cargo run -p reinfer -- model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
+cargo run -p reinfer -- model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF
 ```
 
 结果：9 个 GGUF 列出；关键锚值——
@@ -41,7 +41,7 @@ cargo run -p reinfer -- model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
 ## 验证 2 — `model get`（端到端 sha256 校验 + manifest）
 
 ```bash
-cargo run -p reinfer -- model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0
+cargo run -p reinfer -- model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
 ```
 
 输出（摘）：
@@ -59,6 +59,7 @@ manifest: repo=Qwen/Qwen2.5-0.5B-Instruct-GGUF branch=master size=675710816 sha2
 ## 验证 3 — 幂等与 off（本机）
 
 - 二次 `model get` 同参数：立即返回路径，无网络动作（日志无 GET）。
+- r3 定版后命令面：`model list`（本地）/`model ls-remote`（远端）/`model get -q|-f|--all [--local-dir]`（2026-08-27）。
 - `REINFER_MODEL_AUTODOWNLOAD=off` 且目录空：报 "not found locally … refusing to dial out"，exit 1。
 
 ## 已知偏差 / 备注

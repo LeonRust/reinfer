@@ -50,6 +50,13 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 - **校验强度差异**：ModelScope 有官方 Sha256；HuggingFace 无 sha 字段——`VERIFY=sha256` 对 HF 源降级为 ETag+size（docs 声明）。
 - 契约前提不变：网络出口经标准 `HTTP(S)_PROXY` 等 env；端到端在用户机验证。
 
+## r3（2026-08-27 CLI 定版——对齐成熟工具惯例，非自创范式）
+
+- `reinfer model list` —— **本地**已下载清单（先例：`docker image ls`/`ollama list`/`pip list`：默认本地、零参）；
+- `reinfer model ls-remote <repo>` —— 远端仓库文件清单（先例：git `ls-remote`）；
+- `reinfer model get <repo>` —— `hf download` 语义：repo 位置参数；`-q/--quant`、`-f/--file`、`--all` 互斥选其一（无任何缺省行为——无默认模型）；目录参数 `--local-dir <dir>`（hf 命名；缺省 `REINFER_MODEL_DIR`）；支持 `--flag=value`（git/gh 风格）；
+- 参数错误 → exit 2 + 用法提示。**不沿用**旧雏形 `list <repo>`（远端）/`--to` 语义——r1 文档里的 bin 契约块整体由此段替代。
+
 ## Non-Goals
 
 - 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）

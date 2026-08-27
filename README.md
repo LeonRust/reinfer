@@ -25,16 +25,19 @@
 (`crates/models`, spec [`specs/013-model-fetch`](specs/013-model-fetch/spec.md)):
 
 ```bash
-# list GGUF files of a repo (name / size / sha256)
-reinfer model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
+# list locally downloaded GGUF files (name / size / sha256 / source
+reinfer model list
 
-# download a quantized GGUF (resolves quant tag → file name, verifies size + sha256)
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0
+# list GGUF files in a remote repo (name / size / sha256)
+reinfer model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# download a quantized GGUF (-q: resolves quant tag → file name, verifies size + sha256)
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
 
 # exact file / every GGUF / custom dir
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q8_0.gguf
 reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0 --to ~/models/reinfer
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models/reinfer
 ```
 
 Source priority and download policy come from env (CLI args win):

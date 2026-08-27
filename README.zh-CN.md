@@ -24,16 +24,19 @@
 `reinfer model` 用纯 Rust 下载 GGUF 模型——无 Python、无 pip、无外部 CLI（`crates/models`，规范见 [`specs/013-model-fetch`](specs/013-model-fetch/spec.md)）：
 
 ```bash
-# 列出仓库 GGUF 文件（名 / 大小 / sha256）
-reinfer model list Qwen/Qwen2.5-0.5B-Instruct-GGUF
+# 列出本地已下载 GGUF（名/大小/sha256/来源；关联 manifest）
+reinfer model list
 
-# 下载量化 GGUF（量化段 → 文件名解析，校验大小 + sha256）
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0
+# 列出远端仓库 GGUF 文件（名 / 大小 / sha256）
+reinfer model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF
+
+# 下载量化 GGUF（-q：量化段 → 文件名解析，校验大小 + sha256）
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0
 
 # 精确文件 / 全部 GGUF / 自定义目录
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -f qwen2.5-0.5b-instruct-q8_0.gguf
 reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --all
-reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0 --to ~/models/reinfer
+reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models/reinfer
 ```
 
 源优先级与下载策略由 env 控制（CLI 参数优先）：

@@ -1,7 +1,13 @@
 //! reinfer —— 支持 CUDA / 昇腾 CANN 的 Rust 推理引擎（server | cli | bench）
 //!
-//! 013：`model` 子命令（list/get）——纯 Rust 模型获取（ModelScope 优先、auto 回退 HF）。
+//! 013：`model` 子命令（list / ls-remote / get）——纯 Rust 模型获取（ModelScope 优先、auto 回退 HF）。
 //! 解析用 std（无 clap——宪法"单二进制/最小依赖"）；参数错误 → exit 2 + 用法提示。
+//!
+//! CLI 设计对齐成熟工具惯例（非自创范式）：
+//! - `list` 本地清单——`docker image ls` / `ollama list` / `pip list`：默认本地、零参；
+//! - `ls-remote <repo>` 远端清单——git `ls-remote` 的"列远端"表述；
+//! - `get` —— `hf download` 语义（repo 必填位置参数、`--local-dir` 命名、`-q`/`-f` 短旗、
+//!   `--flag=value` 形式；`--quant`/`--file`/`--all` 互斥语义见 specs/013 plan D6）。
 
 use reinfer_models::api::FileEntry;
 use reinfer_models::{LaunchError, ModelResolver, ModelSpec};
@@ -43,20 +49,21 @@ fn print_usage() {
          \x20   reinfer model <subcommand> [args]\n\
          \n\
          SUBCOMMANDS (model):\n\
-         \x20   list <repo>                        List GGUF files (name/size/sha256)\n\
-         \x20   get  <repo> --quant <q>            Download quantized GGUF\n\
-         \x20   get  <repo> --file <name>          Download exact file\n\
-         \x20   get  <repo> --all                  Download all GGUF files\n\
-         \x20   get  <repo> [--quant|--file] --to <dir>\n\
-         \"                                  Override model dir (default: $HOME/models/reinfer)\n\
+         \x20   list                               List locally downloaded GGUF files\n\
+         \x20   ls-remote <repo>                   List GGUF files in a remote repo\n\
+         \x20   get <repo> [-q <qtag> | -f <file>] Download a GGUF (quant tag or exact file)\n\
+         \x20                            [--all]      Download every GGUF in the repo\n\
+         \x20                            [--local-dir <dir>]  Override model dir (default: $HOME/models/reinfer)\n\
          \n\
          MODEL SOURCE: env REINFER_MODEL_SOURCE=modelscope|huggingface|auto (default auto);\n\
-         \x20   auto = ModelScope first, falls back to HuggingFace. VERIFY=sha256|size|none,\n\
-         \x20   AUTODOWNLOAD=on|off (default on; off never dials out).\n\
+         \x20   auto = ModelScope first, falls back to HuggingFace.\n\
+         \x20   REINFER_MODEL_VERIFY=sha256|size|none · REINFER_MODEL_AUTODOWNLOAD=on|off,\n\
+         \x20   REINFER_MODEL_DIR override (env) · autodownload off never dials out.\n\
          \n\
          EXAMPLES:\n\
-         \x20   reinfer model list Qwen/Qwen2.5-0.5B-Instruct-GGUF\n\
-         \x20   reinfer model get  Qwen/Qwen2.5-0.5B-Instruct-GGUF --quant q8_0\n\
+         \x20   reinfer model list\n\
+         \x20   reinfer model ls-remote Qwen/Qwen2.5-0.5B-Instruct-GGUF\n\
+         \x20   reinfer model get  Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0\n\
          \n\
          PROXY: standard HTTP_PROXY / HTTPS_PROXY / NO_PROXY env (e.g. http://192.168.0.1:7890).",
         env!("CARGO_PKG_VERSION")
@@ -67,7 +74,10 @@ fn print_usage() {
 #[derive(Debug, PartialEq, Eq)]
 enum ModelCmd {
     Help,
-    List {
+    /// 本地清单。
+    List,
+    /// 远端仓库文件清单。
+    LsRemote {
         repo: String,
     },
     Get {
@@ -75,60 +85,97 @@ enum ModelCmd {
         quant: Option<String>,
         file: Option<String>,
         all: bool,
-        to: Option<PathBuf>,
+        local_dir: Option<PathBuf>,
     },
+}
+
+/// 切分 `--flag=value`（git/gh 风格）为 (flag, Some(value))；无 `=` → (flag, None)。
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((f, v)) => (f, Some(v)),
+        None => (arg, None),
+    }
+}
+
+/// 取 `--<long>[-q]`/`-x value` 形式的值（第 i 项为旗子；紧跟一项或 `=` 内联）。
+fn flag_value<'a>(
+    args: &'a [String],
+    i: usize,
+    names: &[&str],
+    short: &str,
+) -> Result<&'a str, String> {
+    let raw = args[i].as_str();
+    let (flag, inline) = split_flag(raw);
+    if inline.is_some() {
+        if !names.contains(&flag) && flag != short {
+            return Err(format!("unknown option '{raw}'"));
+        }
+    } else if !names.contains(&flag) && flag != short {
+        return Err(format!("unknown option '{raw}'"));
+    }
+    if let Some(v) = inline {
+        return Ok(v);
+    }
+    args.get(i + 1).map(|s| s.as_str()).ok_or(format!("{flag} needs a value"))
 }
 
 /// 解析 `model <args...>`（`args[0]='model'` 之后的部分）。
 fn parse_model(args: &[String]) -> Result<ModelCmd, String> {
     let Some(sub) = args.first() else {
-        return Err("model needs a subcommand (list|get|help)".into());
+        return Err("model needs a subcommand (list|ls-remote|get|help)".into());
     };
     match sub.as_str() {
         "help" | "-h" | "--help" => Ok(ModelCmd::Help),
         "list" => {
-            let repo = args.get(1).ok_or("list needs <owner/model>")?.to_string();
-            if args.len() > 2 {
-                return Err("list takes exactly one argument".into());
+            if args.len() > 1 {
+                return Err("list takes no arguments".into());
             }
-            Ok(ModelCmd::List { repo })
+            Ok(ModelCmd::List)
+        }
+        "ls-remote" => {
+            if args.len() != 2 {
+                return Err("ls-remote takes exactly one <repo>".into());
+            }
+            Ok(ModelCmd::LsRemote { repo: args[1].clone() })
         }
         "get" => {
-            let repo = args.get(1).ok_or("get needs <owner/model>")?.to_string();
+            let repo = args.get(1).ok_or("get needs <repo>")?.to_string();
             let mut quant = None;
             let mut file = None;
             let mut all = false;
-            let mut to = None;
+            let mut local_dir = None;
             let mut i = 2;
             while i < args.len() {
-                match args[i].as_str() {
-                    "--quant" => {
-                        quant = Some(args.get(i + 1).ok_or("--quant needs a value")?.clone());
-                        i += 2;
+                let (flag, _) = split_flag(&args[i]);
+                match flag {
+                    "--quant" | "-q" => {
+                        quant = Some(flag_value(args, i, &["--quant"], "-q")?.to_string());
+                        i += if args[i].contains('=') { 1 } else { 2 };
                     }
-                    "--file" => {
-                        file = Some(args.get(i + 1).ok_or("--file needs a value")?.clone());
-                        i += 2;
+                    "--file" | "-f" => {
+                        file = Some(flag_value(args, i, &["--file"], "-f")?.to_string());
+                        i += if args[i].contains('=') { 1 } else { 2 };
                     }
-                    "--to" => {
-                        let v = args.get(i + 1).ok_or("--to needs a value")?;
-                        to = Some(PathBuf::from(v.as_str()));
-                        i += 2;
+                    "--local-dir" => {
+                        local_dir = Some(PathBuf::from(
+                            flag_value(args, i, &["--local-dir"], "")?.to_string(),
+                        ));
+                        i += if args[i].contains('=') { 1 } else { 2 };
                     }
                     "--all" => {
                         all = true;
                         i += 1;
                     }
-                    other => return Err(format!("unknown get option '{other}'")),
+                    _ => return Err(format!("unknown get option '{}'", args[i])),
                 }
             }
             if all && (quant.is_some() || file.is_some()) {
-                return Err("--all is exclusive with --quant/--file".into());
+                return Err("--all is exclusive with -q/--file".into());
             }
             if quant.is_some() && file.is_some() {
-                return Err("--quant and --file are mutually exclusive".into());
+                return Err("-q and -f are mutually exclusive".into());
             }
-            Ok(ModelCmd::Get { repo, quant, file, all, to })
+            Ok(ModelCmd::Get { repo, quant, file, all, local_dir })
         }
         other => Err(format!("unknown model subcommand '{other}' (try `reinfer model help`)")),
     }
@@ -147,12 +194,65 @@ fn run_model(args: &[String]) -> i32 {
             print_usage();
             0
         }
-        ModelCmd::List { repo } => cmd_list(&repo),
-        ModelCmd::Get { repo, quant, file, all, to } => cmd_get(&repo, quant, file, all, to),
+        ModelCmd::List => cmd_list_local(),
+        ModelCmd::LsRemote { repo } => cmd_ls_remote(&repo),
+        ModelCmd::Get { repo, quant, file, all, local_dir } => {
+            cmd_get(&repo, quant, file, all, local_dir)
+        }
     }
 }
 
-fn cmd_list(repo: &str) -> i32 {
+/// 本地已下载 GGUF 清单（`list`——docker/ollama 惯例：默认本地）。
+fn cmd_list_local() -> i32 {
+    let resolver = match ModelResolver::from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reinfer: {e:?}");
+            return 1;
+        }
+    };
+    let dir = resolver.dir.clone();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("reinfer: model dir not readable: {} ({err})", dir.display());
+            return 1;
+        }
+    };
+    let man = reinfer_models::download::read_manifest(&dir);
+    let mut rows: Vec<(String, u64, String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".gguf") {
+                return None;
+            }
+            let size = e.metadata().map(|m| m.len()).ok()?;
+            let m = man.iter().find(|m| m.name == name);
+            let sha = m
+                .and_then(|m| m.sha256.as_deref())
+                .map(|s| s[..s.len().min(16)].to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let src = m.map(|m| format!("{}@{}", m.repo, m.branch)).unwrap_or_else(|| "-".into());
+            Some((name, size, sha, src))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if rows.is_empty() {
+        println!("no local GGUF files in {}", dir.display());
+        return 0;
+    }
+    println!("{} ({} GGUF file(s)):\n", dir.display(), rows.len());
+    let (n, s, h, src) = ("name", "size", "sha256", "source");
+    println!("{n:<48} {s:>12}  {h:<16}  {src}");
+    for (name, size, sha, src) in &rows {
+        println!("{name:<48} {size:>12}  {sha:<16}  {src}");
+    }
+    0
+}
+
+/// 远端仓库文件清单（`ls-remote`——git 惯用表述）。
+fn cmd_ls_remote(repo: &str) -> i32 {
     match list_files(repo) {
         Ok(entries) => {
             let (n, s, h) = ("name", "size", "sha256");
@@ -173,7 +273,7 @@ fn cmd_list(repo: &str) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("reinfer: model list failed: {e:?}");
+            eprintln!("reinfer: model ls-remote failed: {e:?}");
             print_proxy_hint();
             1
         }
@@ -192,7 +292,7 @@ fn cmd_get(
     quant: Option<String>,
     file: Option<String>,
     all: bool,
-    to: Option<PathBuf>,
+    local_dir: Option<PathBuf>,
 ) -> i32 {
     let resolver = match ModelResolver::from_env() {
         Ok(r) => r,
@@ -201,7 +301,7 @@ fn cmd_get(
             return 1;
         }
     };
-    let dir = to.unwrap_or_else(|| resolver.dir.clone());
+    let dir = local_dir.unwrap_or_else(|| resolver.dir.clone());
     if all {
         return cmd_get_all(&resolver, repo, &dir);
     }
@@ -231,7 +331,7 @@ fn cmd_get_all(resolver: &ModelResolver, repo: &str, dir: &Path) -> i32 {
     let entries = match list_files(repo) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("reinfer: model list failed: {e:?}");
+            eprintln!("reinfer: model ls-remote failed: {e:?}");
             print_proxy_hint();
             return 1;
         }
@@ -257,7 +357,7 @@ fn cmd_get_all(resolver: &ModelResolver, repo: &str, dir: &Path) -> i32 {
 }
 
 /// manifest 留痕提示（有则打印）。
-fn print_manifest_line(dir: &std::path::Path, path: &std::path::Path) {
+fn print_manifest_line(dir: &Path, path: &Path) {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let man = reinfer_models::download::read_manifest(dir);
     if let Some(e) = man.iter().find(|e| e.name == name) {
@@ -281,20 +381,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_list_ok() {
-        let a: Vec<String> = ["list", "Qwen/Qwen2.5-0.5B-Instruct-GGUF"].map(String::from).to_vec();
-        assert_eq!(
-            parse_model(&a).unwrap(),
-            ModelCmd::List { repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into() }
-        );
-        assert!(parse_model(&["list".into(), "a/b".into(), "extra".into()]).is_err());
-        assert!(parse_model(&["list".into()]).is_err());
+    fn parse_list_local() {
+        assert_eq!(parse_model(&["list".into()]).unwrap(), ModelCmd::List);
+        // 零参：多余参数 → 错
+        assert!(parse_model(&["list".into(), "x".into()]).is_err());
     }
 
     #[test]
-    fn parse_get_ok() {
+    fn parse_ls_remote() {
         let a: Vec<String> =
-            ["get", "a/b", "--quant", "q8_0", "--to", "/tmp/m"].map(String::from).to_vec();
+            ["ls-remote", "Qwen/Qwen2.5-0.5B-Instruct-GGUF"].map(String::from).to_vec();
+        assert_eq!(
+            parse_model(&a).unwrap(),
+            ModelCmd::LsRemote { repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into() }
+        );
+        assert!(parse_model(&["ls-remote".into()]).is_err());
+        assert!(parse_model(&["ls-remote".into(), "a/b".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_get_ok_long_and_short() {
+        let a: Vec<String> =
+            ["get", "a/b", "--quant", "q8_0", "--local-dir", "/tmp/m"].map(String::from).to_vec();
         assert_eq!(
             parse_model(&a).unwrap(),
             ModelCmd::Get {
@@ -302,11 +410,11 @@ mod tests {
                 quant: Some("q8_0".into()),
                 file: None,
                 all: false,
-                to: Some(PathBuf::from("/tmp/m")),
+                local_dir: Some(PathBuf::from("/tmp/m")),
             }
         );
-        // --file 精确名
-        let b: Vec<String> = ["get", "a/b", "--file", "x.gguf"].map(String::from).to_vec();
+        // 短旗 + 等号形式（`-f=x.gguf`、`--quant=q8_0`——git/gh 惯例）
+        let b: Vec<String> = ["get", "a/b", "-f=x.gguf"].map(String::from).to_vec();
         assert_eq!(
             parse_model(&b).unwrap(),
             ModelCmd::Get {
@@ -314,12 +422,23 @@ mod tests {
                 quant: None,
                 file: Some("x.gguf".into()),
                 all: false,
-                to: None
+                local_dir: None
+            }
+        );
+        let c: Vec<String> = ["get", "a/b", "-q", "q8_0"].map(String::from).to_vec();
+        assert_eq!(
+            parse_model(&c).unwrap(),
+            ModelCmd::Get {
+                repo: "a/b".into(),
+                quant: Some("q8_0".into()),
+                file: None,
+                all: false,
+                local_dir: None
             }
         );
         // --all
-        let c: Vec<String> = ["get", "a/b", "--all"].map(String::from).to_vec();
-        match parse_model(&c).unwrap() {
+        let d: Vec<String> = ["get", "a/b", "--all"].map(String::from).to_vec();
+        match parse_model(&d).unwrap() {
             ModelCmd::Get { all, .. } => assert!(all),
             other => panic!("{other:?}"),
         }
@@ -328,10 +447,9 @@ mod tests {
     #[test]
     fn parse_get_errors() {
         // 互斥
-        let args: Vec<String> =
-            ["get", "a/b", "--quant", "q8", "--file", "x"].map(String::from).to_vec();
+        let args: Vec<String> = ["get", "a/b", "-q", "q8", "-f", "x"].map(String::from).to_vec();
         assert!(parse_model(&args).is_err());
-        let args: Vec<String> = ["get", "a/b", "--all", "--quant", "q8"].map(String::from).to_vec();
+        let args: Vec<String> = ["get", "a/b", "--all", "-q", "q8"].map(String::from).to_vec();
         assert!(parse_model(&args).is_err());
         // 缺值/未知选项
         let args: Vec<String> = ["get", "a/b", "--quant"].map(String::from).to_vec();
@@ -353,7 +471,6 @@ mod tests {
     #[test]
     fn run_unknown_command_is_usage() {
         let args = vec!["frobnicate".to_string()];
-        // 直接验证解析层；exit code 路径由 run() 返回
         assert_eq!(run(&args), EXIT_USAGE);
     }
 }

@@ -427,6 +427,15 @@ pub enum GgufError {
         /// 期望的类型描述。
         why: &'static str,
     },
+    /// 解量化失败：数据长度/缓冲不符（`at` 为上下文值，如 blob 长度或所需缓冲元素数）。
+    BadData {
+        /// 失败原因。
+        what: &'static str,
+        /// 上下文值（blob 长度或所需缓冲元素数）。
+        at: u64,
+    },
+    /// 解量化不支持的 dtype（K 系/IQ 系等 codec 未实现）。
+    UnsupportedDtype(GgufDtype),
 }
 
 impl fmt::Display for GgufError {
@@ -453,6 +462,12 @@ impl fmt::Display for GgufError {
             }
             GgufError::InvalidMetadata { key, why } => {
                 write!(f, "gguf: metadata key {key}: {why}")
+            }
+            GgufError::BadData { what, at } => {
+                write!(f, "gguf: bad tensor data: {what} (context {at})")
+            }
+            GgufError::UnsupportedDtype(dt) => {
+                write!(f, "gguf: dtype {} not supported for dequantization", dt.name())
             }
         }
     }

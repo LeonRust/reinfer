@@ -10,11 +10,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod codes;
 pub mod reader;
 pub mod schema;
 
 #[cfg(test)]
 mod fixture;
 
+pub use codes::{
+    Q8_0_BLOCK_BYTES, QK8_0, dequantize_f16, dequantize_q8_0, dequantize_tensor, f16_to_f32,
+};
 pub use reader::{GgufReader, ModelMeta};
 pub use schema::{ArrayValue, GgufDtype, GgufError, GgufTensor, MetaValue};

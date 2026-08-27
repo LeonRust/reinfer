@@ -212,6 +212,14 @@ impl ModelMeta {
         })
     }
 
+    /// 字节数组访问（`tokenizer.ggml.model` 等二进制小值）。
+    pub fn meta_bytes(&self, key: &str) -> Result<Option<&[u8]>, GgufError> {
+        typed(&self.kvs, key, "expected byte array", |v| match v {
+            MetaValue::Array(ArrayValue::U8(xs)) => Some(xs.as_slice()),
+            _ => None,
+        })
+    }
+
     /// f32 二维数组访问（Qwen 系 rope 多维参数；扁平 f32 数组视为单行）。
     pub fn meta_nested_f32(&self, key: &str) -> Result<Option<Vec<Vec<f32>>>, GgufError> {
         match self.kvs.get(key) {
@@ -675,6 +683,7 @@ mod tests {
                 ])),
             ),
             ("tokenizer.ggml.token_type", MetaValue::Array(ArrayValue::U32(vec![2, 3, 1, 1, 1]))),
+            ("tokenizer.ggml.byte_probe", MetaValue::Array(ArrayValue::U8(vec![1, 2, 3]))),
             ("tokenizer.ggml.add_bos_token", MetaValue::Bool(true)),
             (
                 "qwen2.attention.rope_scaling",
@@ -747,6 +756,7 @@ mod tests {
         assert_eq!(meta.meta_u32("qwen2.rope.dimension_count").unwrap(), Some(64));
         let tokens = meta.meta_array_str("tokenizer.ggml.tokens").unwrap().expect("tokens");
         assert_eq!(tokens, &["<unk>", "<s>", "hello", "世界", "🙂"]);
+        assert_eq!(meta.meta_bytes("tokenizer.ggml.byte_probe").unwrap(), Some(&[1u8, 2, 3][..]));
         assert_eq!(
             meta.meta_nested_f32("qwen2.attention.rope_scaling").unwrap(),
             Some(vec![vec![1.0, 2.0], vec![3.0]])

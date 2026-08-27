@@ -28,3 +28,8 @@ pub mod stream;
 /// CUDA 事件（feature `cuda`）。
 #[cfg(feature = "cuda")]
 pub mod event;
+
+#[cfg(feature = "cuda")]
+pub use event::CudaEvent;
+#[cfg(feature = "cuda")]
+pub use stream::CudaStream;

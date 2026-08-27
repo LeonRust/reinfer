@@ -37,6 +37,8 @@ impl fmt::Display for LaunchError {
     }
 }
 
+impl std::error::Error for LaunchError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

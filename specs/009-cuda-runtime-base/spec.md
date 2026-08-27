@@ -42,5 +42,5 @@ L1 提供**可安全消费**的 CUDA 运行时基座：五个类型 + 拷贝族�
 
 ## Constraints
 
-- 仅经 cudarc（runtime/driver 子集，`default-features=false`）；错误收敛 T3 白名单（fail-closed）；本 crate 是 CUDA FFI 唯一宿主——`crates/jit` 只做编译流水线（nvcc 子进程/缓存/锁），装载/执行（`cuModuleLoad/Launch`）留在此处（决策见 plan D1）
+- 仅经 cudarc（runtime/driver 子集，`default-features=false`）；错误收敛 T3 白名单（fail-closed）；本 crate 是 CUDA FFI 唯一宿主——`crates/jit` 只做编译流水线（nvcc 子进程/缓存/锁），装载/执行留在此处（决策见 plan D1）。changelog(2026-08-27, 012 r1)：加载 API 更新为 `cuLibraryLoadData/cuLibraryGetKernel/cuKernelGetFunction/cuLaunchKernel`（模块型旧 API 在现代驱动面弱化；另三条真机纪律见 specs/012 差异注记）
 - 不修改 cudarc 类型；不新增第三方 GPU 依赖；`DeviceId` 使用 `crates/core` 类型

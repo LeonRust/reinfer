@@ -11,7 +11,7 @@
 ### 1.1 设计目标
 
 - 与 vLLM 的 attention backend registry、FLA 的 `@dispatch`/BackendRegistry 同构，但用 Rust trait 把它写出来；
-- 三档语义：**Vendor**（预编译 cubin / CANN aclnn 官方算子）> **Native**（Rust 原生 kernel）> **Jit**（外部 DSL：Triton/TileLang/AscendC 桥接）；
+- 三档语义：**Vendor**（预编译 cubin / CANN aclnn 官方算子）> **Jit**（引擎自有源码经 JitCache 现场编译：CUDA C++/nvcc、AscendC/bisheng——数值主路径档）> **Native**（直写 Rust/CubeCL 内核；CUDA 侧暂缺，保留档位）。注：2026-08-27 r1 裁决改序（原"Jit=末档外部 DSL"表述与本条第 93 行同步回写——依据 specs/012 差异注记与 A-M1 谱系）；
 - autotune 结果落盘 `kernels/{device}/{op}/{cfg-key}/tune.json`，冷启动无调参也能跑（预置 heuristic）；
 - **窄 FFI 原则**：所有 `unsafe` 收敛在三个 Provider 各自的 `launch` 内部，调度/服务层零 unsafe。
 
@@ -90,7 +90,7 @@ impl JitProvider {
 ### 1.4 选择与自动调优
 
 ```rust
-/// 确定性选择：调优测量值优先，同分按 tier 稳定排序（Vendor > Native > Jit）
+/// 确定性选择：调优测量值优先，同分按 tier 稳定排序（Vendor > Jit > Native；012 r1 裁决改序）
 pub fn select<'a>(providers: &'a [Box<dyn KernelProvider>], cfg: &OpConfig)
     -> &'a dyn KernelProvider {
     providers.iter()

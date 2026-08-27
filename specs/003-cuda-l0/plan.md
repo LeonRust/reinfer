@@ -5,7 +5,7 @@
 ## Architecture Decisions
 
 - **D1 依赖**：仅 `cudarc`（driver/runtime/cublas，feature `cuda`）；FFI 面收敛于 `crates/cuda`（unsafe 宿主）。
-- **D2 Tier 语义（与深入设计补充 §1 对齐并补谱系）**：`Vendor`（预编译 cubin/vendor 库）> `Jit`（引擎自有 CUDA C++ 经 JitCache nvcc 编译——含本切片全部 kernel）> `Native`（直写 Rust/CubeCL 内核——CUDA 侧暂缺，保留档位）> CPU 参考。本切片选择链实为 `Jit(dense)` 单档；006 升级为 `Vendor > Jit(fmha) > Jit(dense)`。`select()` 与 TuneDb 位于 `crates/kernels`（safe 层），Provider 实现（触 FFI）位于 `crates/cuda`。**gencode 梯度（2026-08-27 对齐判定档 sm_120）**：sm90a≥12.3 / sm100a≥12.8 / **sm120a≥13.0**（本机 toolkit 13.2 ✅；RTX 5090 记入基准机）。
+- **D2 Tier 语义（谱系溯源；2026-08-27 r1 裁决改序并回写深入设计 §1.1）**：`Vendor`（预编译 cubin/vendor 库）> `Jit`（引擎自有 CUDA C++ 经 JitCache nvcc 编译——含本切片全部 kernel）> `Native`（直写 Rust/CubeCL 内核——CUDA 侧暂缺，保留档位）> CPU 参考。本切片选择链实为 `Jit(dense)` 单档；006 升级为 `Vendor > Jit(fmha) > Jit(dense)`。`select()` 与 TuneDb 位于 `crates/kernels`（safe 层），Provider 实现（触 FFI）位于 `crates/cuda`。**gencode 梯度（工具链实测基线，锚 specs/012 r1 R6）**：sm90a≥12.3 / sm100a≥12.8 / **sm120a≥12.8**（12.6 不支持 sm_120；12.8 产物在判定机加载+launch 位精确——原"≥13.0"为事实错误）。
 - **D3 GEMM**：cuBLAS。F16 路径用 fp16 累积（与 llama.cpp `CUBLAS_COMPUTE_16F` 一致），比对时双侧强制同 compute type；Q8_0 为"dequant→fp16→GEMM"（与 referee mmq 不同的算法，作为记录差异，见 spec 三层门禁）。
 - **D4 JitCache**（按评审加固）：键 = sha256(源码 + 头传递闭包(nvcc -M depfile) + gencode/flags + nvcc --version + capability)；写入 temp+rename；`cuModuleLoad` 失败→删除重建一次；prewarm = 启动**阻塞**前滚完成（不在后台与首请求并发）；按 key 粒度文件锁（双检）；锁文件放 /tmp；无 GPU CI 用 `REINFER_CUDA_ARCH` + 预烘焙 cubin 缓存。
 - **D5 错误映射**：`cudaError→LaunchError` 白名单 fail-closed（表锚定 002/plan）。

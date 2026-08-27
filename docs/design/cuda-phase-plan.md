@@ -20,10 +20,10 @@
 验收：真机 smoke —— 设备列表/alloc+copy 往返/事件同步；无 GPU 单测（构造/Debug）。
 提交：`feat(cuda): add device, stream and buffer wrappers`。
 
-### L2 算子层（003 T4/T5）
-功能：JitCache v1（hash+头闭包+gencode/flags+nvcc 版本、temp+rename、load 失败重建一次、阻塞式预烘焙、`REINFER_CUDA_ARCH`）+ 内核 `RMSNorm/masked-softmax/RoPE` + 每内核 CPU 参考。
-验收：kernel 差分（D7 容差表）本机真机跑；无 GPU 档含 CPU 参考与接口单测。
-提交：`feat(jit): add JitCache v1` → `feat(cuda): add norm/softmax/rope kernels`。
+### L2 算子层（003 T4/T5）—— **✅ 已完成（2026-08-27，锚 specs/012。真实提交见 git log，非计划清单）**
+功能：JitCache v1（键=嵌入内容+flags 保序+toolchain realpath+triple；temp+rename/meta 提交点；跨进程锁+双检+重建一次；`REINFER_CUDA_ARCH` 预烘焙；实测梯度 sm120a≥12.8）+ 内核 `rms_norm/RoPE/masked-softmax` + vec_add 链路闭环 + sampler host 管线 + KernelProvider 选择链（D0）。
+验收：真机 6/6 smoke 绿（差分 D7 容差、bit-exact 确定性、命中 <50ms、跨进程单次编译）——`REINFER_CUDA_NVCC=/usr/local/cuda-12.8/bin/nvcc REINFER_JIT_CACHE=... cargo test -p reinfer-cuda --features cuda --test jit_smoke -- --ignored --test-threads=1`。
+注：启动阻塞式 prewarm（003 T4 原文）**延至 L3 引擎启动切片**（012 r1 R3/R8）——本切片为离线预烘焙 + 懒构建。
 
 ### L3 单请求闭环（003 T9-T12 + 004 tokenizer）
 功能：GGUF/arch(001-003) → F16/Q8_0 dequant → cuBLAS GEMM（16F-acc 对齐 llama.cpp）→ paged decode attention（先正确后优化）→ sampler（greedy+gumbel 纯函数）→ `reinfer cli --backend cuda` 流式输出。

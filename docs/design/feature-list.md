@@ -30,7 +30,7 @@
 
 | ID | Feature | Notes |
 |---|---|---|
-| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop)；L1 wrappers 展开锚 `specs/009-cuda-runtime-base` — spec ready |
+| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop)；L1 wrappers 展开锚 `specs/009-cuda-runtime-base`；L2 展开锚 `specs/012-cuda-l2-jit`（JitCache v1 + vec_add/rms_norm/rope/masked_softmax + sampler host 管线 + KernelProvider 选择链，真机 6/6 smoke 绿） — spec ready |
 | P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | included in 003 T9; policy-side is ours (boundary §4) |
 | P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | ✅ `specs/005-scheduler-serving` |
 | P1-04 | CUDA graph bucket capture + stream overlap | ✅ `specs/006-cuda-perf` (FA3 vendor cubin optional) |

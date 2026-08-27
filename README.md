@@ -43,7 +43,7 @@ Source priority and download policy come from env (CLI args win):
 | Var | Values | Default | Meaning |
 |---|---|---|---|
 | `REINFER_MODEL_SOURCE` | `modelscope`/`huggingface`/`auto` | `auto` | `auto` = ModelScope first, falls back to HuggingFace on miss |
-| `REINFER_MODEL_DIR` | path | `~/models/reinfer` | download/search root (`~` is expanded) |
+| `REINFER_MODEL_DIR` | path | `~/.reinfer/models` | download/search root (default `~/.reinfer/models`; Windows `%USERPROFILE%\.reinfer\models`) |
 | `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | verify depth; HF source degrades sha256 → ETag+size (no sha field upstream) |
 | `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | `off` = never dials out (missing model → error) |
 | `REINFER_MODEL_REPO`/`QUANT`/`FILE` | repo, quant tag, exact name | — | convenience injection (CLI takes precedence) |

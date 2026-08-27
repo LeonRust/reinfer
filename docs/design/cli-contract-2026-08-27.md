@@ -37,7 +37,7 @@ reinfer <command> [args]
   - `-q <qtag>`：引擎专属"量化档选择"（量化段 → 文件名匹配，如 `q8_0`→`-q8_0.gguf`；
     两家 CLI 无此概念，属自有领域词；除该词外其他旗子均有两家先例）。`-q` 与 file.../--include 互斥。
 - **`--revision`**：分支/tag/commit（hf、modelscope 同款）；None → ModelScope `master` / HF `main`。
-- **`--local-dir`**：落地目录（hf 命名）；缺省 `REINFER_MODEL_DIR`（env 或 `~/models/reinfer`）。
+- **`--local-dir`**：落地目录（hf 命名）；缺省 `REINFER_MODEL_DIR`（env 或 `~/.reinfer/models`；Windows `%USERPROFILE%\.reinfer\models`——平台取家目录 env：Windows=USERPROFILE，Linux/macOS=HOME）。
   modelscope 官方同义参数名为 `--local_dir`（snake）——本项目统一 kebab（hf 系 + Rust 生态），
   modelscope 的 snake 形式不兼容吸收。
 - 校验/幂等/metadata 不变（013 D6：sha256/ETag+size；manifest 留痕；`AUTODOWNLOAD=off` 拒绝网络）。

@@ -42,7 +42,7 @@ reinfer download Qwen/Qwen2.5-0.5B-Instruct-GGUF -q q8_0 --local-dir ~/models --
 | 变量 | 取值 | 缺省 | 语义 |
 |---|---|---|---|
 | `REINFER_MODEL_SOURCE` | `modelscope`/`huggingface`/`auto` | `auto` | `auto` = ModelScope 优先，缺（404/文件缺失）→ HuggingFace 回退 |
-| `REINFER_MODEL_DIR` | 路径 | `~/models/reinfer` | 下载/查找根（`~` 自动展开） |
+| `REINFER_MODEL_DIR` | 路径 | `~/.reinfer/models` | 下载/查找根（缺省 `~/.reinfer/models`；Windows 为 `%USERPROFILE%\.reinfer\models`；`~` 自动展开） |
 | `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | 校验深度；HF 源缺 sha 字段 → 降级 ETag+size |
 | `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | `off` = 绝不联网（缺模型即报错） |
 | `REINFER_MODEL_REPO`/`QUANT`/`FILE` | 仓库名、量化段、精确文件名 | — | 便捷注入（CLI 参数优先） |

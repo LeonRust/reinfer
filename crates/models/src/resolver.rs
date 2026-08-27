@@ -11,17 +11,22 @@ use crate::hf::{hf_download_file, hf_list_files};
 use reinfer_kernels::LaunchError;
 use std::path::{Path, PathBuf};
 
-/// 缺省模型目录。
+/// 用户主目录 env（平台惯例：Windows=USERPROFILE，Linux/macOS=HOME）。
+fn home_var() -> &'static str {
+    if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+}
+
+/// 缺省模型目录：`~/.reinfer/models`（Linux/macOS；Windows 为 `%USERPROFILE%\.reinfer\models`）。
 pub fn default_dir() -> PathBuf {
-    std::env::var("HOME")
+    std::env::var(home_var())
         .ok()
-        .map(|h| PathBuf::from(h).join("models/reinfer"))
+        .map(|h| PathBuf::from(h).join(".reinfer").join("models"))
         .unwrap_or_else(|| PathBuf::from("models"))
 }
 
-/// `~` 前缀展开为 `$HOME`（env/CLI 值可写 `~/models/reinfer`；无 HOME → 原样）。
+/// `~` 前缀展开为家目录（env/CLI 值可写 `~/…`；家目录不可得 → 原样）。
 fn expand_tilde(p: &str) -> PathBuf {
-    if let (Some(rest), Ok(h)) = (p.strip_prefix("~/"), std::env::var("HOME")) {
+    if let (Some(rest), Ok(h)) = (p.strip_prefix("~/"), std::env::var(home_var())) {
         return PathBuf::from(h).join(rest);
     }
     PathBuf::from(p)

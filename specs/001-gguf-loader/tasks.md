@@ -7,7 +7,9 @@
 - Add `DType` enum (F16/BF16/FP32/Q8_0/Q4_0 placeholder for more), `TensorId(u32)`, `Error` (thiserror)
 - Verification: `cargo test -p reinfer-core` green; `#![forbid(unsafe_code)]` compiles
 
-## Task 2: GGUF header + metadata parsing (reinfer-gguf)
+## Task 2: GGUF header + metadata
+
+> **2026-08-27 承接注记**：本 Task 与 Task 3 的实施由 **specs/014 T1 承接**（014 r1：001 为 proposal 状态，双头写入风险裁决——实施锚转移至 014；本 spec 保持验收锚语义）。 parsing (reinfer-gguf)
 
 - Implement magic/version/alignment validation, metadata KV table with typed enum keys, string/array/u32/u64 types
 - Verification: unit tests with hand-crafted byte fixtures; `cargo test -p reinfer-gguf`

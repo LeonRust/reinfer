@@ -53,6 +53,7 @@ pub fn run_cli(backend, model_path, prompt, seed) -> ...;      // 模型路径=C
 | cuBLAS compute | "cuBLAS F16 默认" | **显式 CUBLAS_COMPUTE_16F（sys 直调）** | cudarc safe 层硬编码 32F——默认表述为事实错误 |
 | parity 层数 | "F16 三层 / Q8_0 ≥99.9%" | **四层显式枚举**（tokenizer/F16/Q8_0/logits 记录） | parity.md 未约定"三层"简称 |
 | 模型铁律 | "一律 ModelScope" | **经 013 resolver（ModelScope 优先，auto 回退 HF）** | 013 r2 修订 |
+| mmap | 001 原案 memmap2 | **pread（FileExt::read_at）替代** | 实现决策（2026-08-27 T1 交付）：memmap2 map 0.7+ 为 unsafe 且并发截断即 UB（与 forbid(unsafe_code) 冲突）；OS 页缓存语义等价；非 unix 退路=seek+read；正式 golden 为真实 tiny GGUF（001 原案，随 001/013 交付补水） |
 
 ## Risk Assessment
 

@@ -47,7 +47,7 @@ pub fn sample_argmax(logits: &[f32], mask: &[bool]) -> Result<usize, LaunchError
         if !m {
             continue;
         }
-        if best.map_or(true, |(_, bl)| l > bl) {
+        if best.is_none_or(|(_, bl)| l > bl) {
             best = Some((i, l));
         }
     }
@@ -58,7 +58,7 @@ pub fn sample_argmax(logits: &[f32], mask: &[bool]) -> Result<usize, LaunchError
 /// 概率和为 ≤1（浮点）；全 0/全 masked → 错误。
 pub fn sample_from_probs(probs: &[f32], rng: &mut SplitMix64) -> Result<usize, LaunchError> {
     let total: f32 = probs.iter().copied().sum();
-    if !(total > 0.0) {
+    if total <= 0.0 {
         return Err(LaunchError::Fatal);
     }
     let u = rng.next_f32_unit().min(0.999_999) * total;

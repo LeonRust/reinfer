@@ -4,8 +4,8 @@
 > ③ 下载 = 顶层 `download`（hf/modelscope 同名先例）；④ 无显式文件选择 = 整仓库（hf 默认）；
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
-> **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节定稿——模型引用三态 + 参数全集 +
-> P1 功能面）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
+> **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节——
+> 模型引用三态 + 参数全集 + P1 功能面）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
 ## 1. 命令面
@@ -108,9 +108,31 @@ reinfer serve <model> [-q <qtag> | -f <file>] [--revision <ref>] [--local-dir <d
 - 输出面：启动信息 + 运行日志（结构化/人类两式），与 download 的结果面（table/json/quiet）分离；`--metrics`（prometheus）挂 008。
 - 不做（P1）：speculative decode、graph bucket（006）、radix cache/grammar（P3-01）、TP/PP/CP、多实例编排。
 
+### run / chat / bench（v2.2 定稿；决策：OpenAI 缺省表 · run/chat 无 json · REPL 核心组现定）
+
+```
+run   <model> [-q|-f] [--device] [-n <max-tokens>] [-t <temp>] [--top-p <p>] [--top-k <k>]
+             [--seed <s>] [--max-model-len <n>] [prompt...]
+chat  <model> [-q|-f] [--device] [-n] [-t] [--top-p] [--top-k] [--seed] [--max-model-len]
+bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len <n>]
+             [--format table|json]
+```
+
+- **工程缺省表（用户 2026-08-27 定：OpenAI API 缺省）**：`-t/--temperature=1.0` · `--top-p=1.0` ·
+  `--top-k=关` · `-n/--max-tokens=模型上下文上限`。`--seed=<optional>`：给则全链确定（012 sampler host
+  管线）；未给 = 随机。**缺省纪律边界**：仅约束"模型身份"选择（不得隐式选定模型/数据源）；
+  计算参数允许标准工程缺省。
+- **run**：`[prompt...]` 位置拼接；无 prompt → 读 stdin（llama-cli 惯例）；输出=token 流式打印
+  （stdout），stats（tps/首 token/延迟）→ **stderr**（管道干净）；**无 --format**（决策②：文本面
+  属语义直达；结构化消费属 API/streaming；stat 经 stderr 可取）。
+- **chat**：同 run 参数子集（多轮保持 KV）；REPL 内 `/` 命令核心组（决策③现定）：`/help` · `/system <text>` ·
+  `/clear` · `/temp <t>` · `/top-p <p>` · `/top-k <k>` · `/seed <n>` · `/quit`；退出 /quit 或 Ctrl-D/Ctrl-C。
+- **bench**：`-r/--reps`、`-l/--seq-len`；指标=prefill tps·decode tps·首 token 延迟·峰值显存；
+  `--format table|json`（数字面机读；008 gate_throughput.sh 消费 json）；gate 阈值逻辑在脚本层（008），不进 CLI。
+
 ### 其他
 
-`chat <model>` · `run <model> [prompt...]` · `bench <model> [--gate...]`（003/008）· `diag`（ASC-03）；其 <model> 三态同 serve。
+`diag`（ASC-03：环境诊断，无模型参数，已定名）。上述 run/chat/bench 的 <model> 三态同 serve（§6 serve）。
 
 ## 7. 先例对照表
 

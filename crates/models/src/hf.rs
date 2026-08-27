@@ -61,6 +61,7 @@ pub fn hf_download_file(
         repo,
         branch,
         head.etag.as_deref(),
+        None, // HF 源暂不暴露进度（bin 侧按需接入）
     )
 }
 

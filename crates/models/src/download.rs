@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// manifest 文件名（下载目录内）。
 pub const MANIFEST: &str = "manifest.json";
@@ -98,7 +99,14 @@ pub fn read_manifest(dir: &Path) -> Vec<ManifestEntry> {
     std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+/// 进程内 manifest 写锁（read→write 事务互斥；rename 仍是原子提交点）。
+/// 多线程并发下载时防止 read-modify-write 丢失更新（OneShot 初始化，零成本无竞争路径）。
+static MANIFEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 fn append_manifest(dir: &Path, entry: ManifestEntry) {
+    // 毒锁恢复：panic 线程未持锁完成写 → 内容可能已写盘，read_manifest 容错兜底即可。
+    let _guard =
+        MANIFEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
     let p = dir.join(MANIFEST);
     let mut all = read_manifest(dir);
     all.retain(|e| e.name != entry.name);
@@ -115,21 +123,27 @@ fn append_manifest(dir: &Path, entry: ManifestEntry) {
 ///
 /// 幂等：已完成且校验通过 → 返回路径（hit）；`verify` 深度见 [`Verify`]。
 /// `revision`：None → master（`--revision` 同语义，manifest branch 记录实际值）。
+/// `progress`：回调 (已读字节, 预期总字节)；本地命中时以 (len, len) 调用一次告知 hit；
+/// 下载中在每块 read 后调用（`entry.size == 0` → 总字节传 0，表示未知）。
 pub fn download_file(
     repo: &str,
     entry: &FileEntry,
     to_dir: &Path,
     verify: Verify,
     revision: Option<&str>,
+    progress: Option<&dyn Fn(u64, u64)>,
 ) -> Result<PathBuf, LaunchError> {
     std::fs::create_dir_all(to_dir).map_err(io_err)?;
     let path = target_path(to_dir, &entry.name);
     if local_hit(&path, entry, verify) {
+        if let (Some(cb), Ok(meta)) = (progress, std::fs::metadata(&path)) {
+            cb(meta.len(), meta.len());
+        }
         return Ok(path);
     }
     let branch = revision.unwrap_or("master");
     let url = api::ms_download_url_rev(repo, &entry.name, revision);
-    download_with_url(&url, entry, to_dir, verify, repo, branch, None)
+    download_with_url(&url, entry, to_dir, verify, repo, branch, None, progress)
 }
 
 /// GET 响应头（最终跳转后）ETag 规范化（strip 引号/W- 前缀不剥——W 前缀是强弱标记，需要恒等比较两端）。
@@ -142,6 +156,8 @@ pub(crate) fn normalize_etag(v: &str) -> &str {
 ///
 /// `expected_etag`：指定时若最终响应头含 ETag/X-Linked-Etag 且不同 → 校验失败；
 /// 响应头无 ETag 字段 → 降级（仅 size/sha 档），打警告（r2：ETag+size 为 HF 上限）。
+/// `progress`：原样透传给 [`fetch_to_temp`]（重试时同一回调；语义见 [`download_file`]）。
+#[allow(clippy::too_many_arguments)] // 冻结接口（bin 侧按此签名并行开发）；8 参为契约
 pub(crate) fn download_with_url(
     url: &str,
     entry: &FileEntry,
@@ -150,11 +166,12 @@ pub(crate) fn download_with_url(
     repo: &str,
     branch: &str,
     expected_etag: Option<&str>,
+    progress: Option<&dyn Fn(u64, u64)>,
 ) -> Result<PathBuf, LaunchError> {
     let mut last_err: Option<LaunchError> = None;
     let nm = &entry.name;
     for attempt in 1..=2 {
-        match fetch_to_temp(url, to_dir, &entry.name, verify, entry, expected_etag) {
+        match fetch_to_temp(url, to_dir, &entry.name, verify, entry, expected_etag, progress) {
             Ok(p) => {
                 append_manifest(
                     to_dir,
@@ -184,6 +201,8 @@ pub(crate) fn download_with_url(
 }
 
 /// GET（跟随重定向）→ 流式写 `<to>/.<name>.tmp-<pid>` → 校验 → rename。
+///
+/// `progress`：每块 read 后调用 (累计已读, 预期总字节)；`entry.size == 0` → 总字节传 0。
 fn fetch_to_temp(
     url: &str,
     to_dir: &Path,
@@ -191,6 +210,7 @@ fn fetch_to_temp(
     verify: Verify,
     entry: &FileEntry,
     expected_etag: Option<&str>,
+    progress: Option<&dyn Fn(u64, u64)>,
 ) -> Result<PathBuf, LaunchError> {
     let resp = ureq::get(url).call().map_err(|e| {
         eprintln!("reinfer-models: GET {url} failed: {e}");
@@ -229,6 +249,9 @@ fn fetch_to_temp(
         #[cfg(test)]
         debug_capture.extend_from_slice(&buf[..n]);
         file.write_all(&buf[..n]).map_err(io_err)?;
+        if let Some(cb) = progress {
+            cb(total, if entry.size == 0 { 0 } else { entry.size });
+        }
     }
     drop(file);
     if verify != Verify::None && entry.size != 0 && total != entry.size {
@@ -349,7 +372,14 @@ mod tests {
         };
         // 共享入口（download_with_url）→ 下载+校验+rename+manifest 记录
         let got = download_with_url(
-            &stub.url("/x"), &entry, &dir, Verify::Sha256, "org/repo", "master", None,
+            &stub.url("/x"),
+            &entry,
+            &dir,
+            Verify::Sha256,
+            "org/repo",
+            "master",
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), body);
@@ -363,7 +393,6 @@ mod tests {
         assert_eq!(man[0].sha256.as_deref(), Some(expected_hex.as_str()));
         // 幂等命中由调用方 local_hit 负责（见 download_file）；此处只验证 下载+校验+rename+manifest。
         let _ = std::fs::remove_dir_all(&dir);
-        drop(stub);
         j.join().unwrap();
     }
 
@@ -378,7 +407,8 @@ mod tests {
             is_lfs: false,
         };
         assert!(
-            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None).is_err()
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+                .is_err()
         );
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -388,15 +418,14 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp must be cleaned: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
-        drop(stub);
         j.join().unwrap();
     }
 
     /// ETag 坏值 → 校验失败（重试）；第二次与预期一致 → 成功（T7 验收）。
     #[test]
     fn etag_bad_then_ok_retry_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let n = Arc::new(AtomicUsize::new(0));
         let seq = Arc::clone(&n);
         let (stub, j) = Stub::spawn(move |_| {
@@ -414,13 +443,13 @@ mod tests {
             "org/repo",
             "main",
             Some("good"),
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), b"data");
         let hits = n.load(Ordering::SeqCst);
         assert!(hits >= 2, "bad etag must have triggered a retry (n={hits})");
         let _ = std::fs::remove_dir_all(&dir);
-        drop(stub);
         j.join().unwrap();
     }
 
@@ -438,11 +467,91 @@ mod tests {
             "org/repo",
             "main",
             Some("good"),
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), b"data");
         let _ = std::fs::remove_dir_all(&dir);
-        drop(stub);
+        j.join().unwrap();
+    }
+
+    /// progress 回调：下载中每块 read 后调用 (累计, 预期)；size==0 → 总字节 0；hit → (len, len)。
+    #[test]
+    fn progress_download_unknown_size_and_hit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let body = b"hello-models";
+        let (stub, j) = Stub::spawn(|_| (200, "hello-models".to_string(), vec![]));
+        let dir = tmpdir("prog");
+
+        // 已知大小：每块 read 后 (累计, 预期)，最后一块 = (len, len)
+        let entry = FileEntry {
+            name: "m.gguf".into(),
+            size: body.len() as u64,
+            sha256: Some(sha256_hex(body)),
+            is_lfs: false,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cb = {
+            let calls = Arc::clone(&calls);
+            move |read: u64, total: u64| calls.lock().unwrap().push((read, total))
+        };
+        let got = download_with_url(
+            &stub.url("/x"),
+            &entry,
+            &dir,
+            Verify::Sha256,
+            "org/repo",
+            "master",
+            None,
+            Some(&cb),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), body);
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty(), "progress must be reported");
+        assert_eq!(*calls.last().unwrap(), (body.len() as u64, body.len() as u64));
+        drop(calls);
+
+        // 未知大小（size=0）：总字节恒传 0
+        let unknown = Arc::new(AtomicUsize::new(0));
+        let cb0 = {
+            let unknown = Arc::clone(&unknown);
+            move |_read: u64, total: u64| unknown.store(total as usize, Ordering::SeqCst)
+        };
+        let entry0 = FileEntry { name: "m0.gguf".into(), size: 0, sha256: None, is_lfs: true };
+        let got0 = download_with_url(
+            &stub.url("/x"),
+            &entry0,
+            &dir,
+            Verify::Size,
+            "org/repo",
+            "master",
+            None,
+            Some(&cb0),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&got0).unwrap(), body);
+        assert_eq!(unknown.load(Ordering::SeqCst), 0);
+
+        // 本地命中：progress(len, len) 恰好一次
+        let hit = Arc::new(Mutex::new(Vec::new()));
+        let cbh = {
+            let hit = Arc::clone(&hit);
+            move |read: u64, total: u64| hit.lock().unwrap().push((read, total))
+        };
+        let entry1 = FileEntry {
+            name: "m.gguf".into(),
+            size: body.len() as u64,
+            sha256: Some(sha256_hex(body)),
+            is_lfs: false,
+        };
+        let p = download_file("org/repo", &entry1, &dir, Verify::Sha256, None, Some(&cbh)).unwrap();
+        assert_eq!(p, dir.join("m.gguf"));
+        assert_eq!(*hit.lock().unwrap(), vec![(body.len() as u64, body.len() as u64)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
         j.join().unwrap();
     }
 

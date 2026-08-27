@@ -158,7 +158,8 @@ impl ModelResolver {
     }
 
     /// 解析期望文件名（本地 glob，**绝不联网**）→ 否则远端列表（组合式；`off` 调用方保证不触网）。
-    /// `quant` 段匹配：文件名含 `-{quant}.gguf` 后缀；精确 file 直用；多命中 → 列候选。
+    /// `quant` 段匹配：文件名含 `-{quant}.` 段（任意扩展——用户铁律，无 .gguf 特判）；
+    /// 精确 file 直用；多命中 → 列候选。
     pub fn resolve_file_name(&self, spec: &ModelSpec, dir: &Path) -> Result<String, LaunchError> {
         if let Some(n) = self.resolve_local_name(spec, dir)? {
             return Ok(n);
@@ -166,6 +167,7 @@ impl ModelResolver {
         self.resolve_remote_name(spec)
     }
 
+    /// 本地 quant glob：文件名含 `-{q}.` 段即命中（任意扩展；无 .gguf 特判——用户铁律）。
     fn resolve_local_name(
         &self,
         spec: &ModelSpec,
@@ -179,7 +181,7 @@ impl ModelResolver {
             let mut hits: Vec<String> = entries
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| n.ends_with(".gguf") && n.contains(&format!("-{q}.")))
+                .filter(|n| n.contains(&format!("-{q}.")))
                 .collect();
             hits.sort();
             match hits.len() {
@@ -268,7 +270,7 @@ fn ms_list(spec: &ModelSpec) -> Result<Vec<FileEntry>, LaunchError> {
     api::parse_ms_files(&body, &url)
 }
 
-/// quant 段文件名匹配（远端列表）：`-{q}.gguf` 后缀；多命中列候选。
+/// quant 段文件名匹配（远端列表）：`-{q}.` 段（任意扩展——无 .gguf 特判）；多命中列候选。
 pub fn select_name(entries: Vec<FileEntry>, spec: &ModelSpec) -> Result<String, LaunchError> {
     if let Some(f) = &spec.file {
         if entries.iter().any(|e| &e.name == f) {
@@ -279,15 +281,15 @@ pub fn select_name(entries: Vec<FileEntry>, spec: &ModelSpec) -> Result<String, 
     }
     if let Some(q) = &spec.quant {
         let qq = format!("-{q}.");
-        let mut hits: Vec<String> = entries
-            .iter()
-            .filter(|e| e.name.ends_with(".gguf") && e.name.contains(&qq))
-            .map(|e| e.name.clone())
-            .collect();
+        let mut hits: Vec<String> =
+            entries.iter().filter(|e| e.name.contains(&qq)).map(|e| e.name.clone()).collect();
         hits.sort();
         match hits.len() {
             0 => {
-                eprintln!("reinfer-models: no .gguf matches --quant {q} in repo {}", spec.repo);
+                eprintln!(
+                    "reinfer-models: no model file matches --quant {q} in repo {}",
+                    spec.repo
+                );
                 Err(LaunchError::Fatal)
             }
             1 => Ok(hits.remove(0)),
@@ -321,7 +323,8 @@ fn ms_fetch(
         eprintln!("reinfer-models: {name} not in {} files", spec.repo);
         LaunchError::Fatal
     })?;
-    download_file(&spec.repo, &entry, dir, verify, spec.branch.as_deref())
+    // 进度回调：resolver 层不暴露（bin 侧直接走 download_file 新签名接入）
+    download_file(&spec.repo, &entry, dir, verify, spec.branch.as_deref(), None)
 }
 
 fn hf_fetch(
@@ -366,6 +369,64 @@ mod tests {
         assert!(select_name(entries.clone(), &ModelSpec::new("r/e").with_quant("q3_0")).is_err());
         // 缺省无 quant/file → 错误（无默认模型）
         assert!(select_name(entries, &ModelSpec::new("r/e")).is_err());
+    }
+
+    /// quant 段匹配与扩展名无关（无 .gguf 特判）：同段不同扩展命中；并列 → 歧义列候选。
+    #[test]
+    fn select_quant_any_extension() {
+        let safe = vec![FileEntry {
+            name: "m-q8_0.safetensors".into(),
+            size: 1,
+            sha256: None,
+            is_lfs: false,
+        }];
+        assert_eq!(
+            select_name(safe, &ModelSpec::new("r/e").with_quant("q8_0")).unwrap(),
+            "m-q8_0.safetensors"
+        );
+        // 同 quant 段两种扩展并列 → 歧义（列候选错误）
+        let both = vec![
+            FileEntry { name: "m-q8_0.gguf".into(), size: 1, sha256: None, is_lfs: false },
+            FileEntry { name: "m-q8_0.safetensors".into(), size: 2, sha256: None, is_lfs: false },
+        ];
+        assert!(select_name(both, &ModelSpec::new("r/e").with_quant("q8_0")).is_err());
+        // 非本 quant 段的任意扩展仍不命中（q4_0 缺）
+        assert!(
+            select_name(
+                vec![FileEntry {
+                    name: "m-q8_0.safetensors".into(),
+                    size: 1,
+                    sha256: None,
+                    is_lfs: false
+                }],
+                &ModelSpec::new("r/e").with_quant("q4_0")
+            )
+            .is_err()
+        );
+    }
+
+    /// 本地 glob 同样任意扩展：safetensors 命中；与 .gguf 并列 → 歧义。
+    #[test]
+    fn local_glob_any_extension() {
+        let dir = std::env::temp_dir().join(format!("reinfer-models-glob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = ModelResolver {
+            source: ModelSource::Modelscope,
+            dir: dir.clone(),
+            verify: Verify::Size,
+            autodownload: false,
+        };
+        let spec = ModelSpec::new("stub/models").with_quant("q8_0");
+        assert_eq!(r.resolve_local_name(&spec, &dir).unwrap(), None);
+        std::fs::write(dir.join("m-q8_0.safetensors"), [0xCCu8; 32]).unwrap();
+        assert_eq!(
+            r.resolve_local_name(&spec, &dir).unwrap().as_deref(),
+            Some("m-q8_0.safetensors")
+        );
+        std::fs::write(dir.join("m-q8_0.gguf"), [0xDDu8; 32]).unwrap();
+        assert!(r.resolve_local_name(&spec, &dir).is_err(), "并列同段 → 歧义");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

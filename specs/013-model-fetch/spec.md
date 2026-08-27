@@ -86,9 +86,18 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 影响面：`download_file`/`target_path`（带 repo 参数）、resolver 本地 glob（作用于 repo 目录）、
 `ro` 层调用点、`model list`（递归收集，repo 名=相对路径，manifest per-repo 关联）。
 
+## r5.3（2026-08-27 断点续传 + GLOBAL 净落盘）
+
+- **断点续传**：残件稳定名 `.<name>.reinfer-part`（跨进程/中断保留）；非空残件 → `Range: bytes=N-`；
+  206 → 追加续传；200/不支持 → 从头降级；416 → 从头；重试 attempt2 强制 restart（坏段防循环）；
+  残件 fs2 跨进程 flock（并发下载明确报错）；完成后**全文件 sha256**（流式重哈希已有段兜底）；
+  长度/校验失败 → 删除残件。进度回调从续传点起计。
+- **GLOBAL 净落盘**（用户 A 方案）：GLOBAL = Σ 每文件"历史峰值字节"——校验重试回退时
+  GLOBAL 不回退（视觉不倒退；文件条仍显示真实重试回退）。
+
 ## Non-Goals
 
-- 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）
+- 分片并发（单流 + 续传已实现；分片/多段并发为性能项，后续再说）
 - 私有/付费仓库（认证、SDK 式 token）与 `IsLFS=true` 的 git-lfs 拉取
 - HuggingFace 侧 sha256 等价强校验（官方 API 无该字段——ETag+size 为上限）
 - Revision 非 master（SNAPSHOT 语义将来扩展）

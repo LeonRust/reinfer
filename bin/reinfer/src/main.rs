@@ -975,6 +975,7 @@ struct FileState {
     bytes: u64,
     total: u64,
     last: u64,
+    peak: u64, // 历史最大 bytes（GLOBAL 净落盘聚合：校验重试回退不回退——用户 2026-08-27 A 方案）
     status: FileStatus,
     wb: u64,
     wt: Instant,
@@ -1017,6 +1018,7 @@ impl Progress {
                         bytes: 0,
                         total: 0,
                         last: 0,
+                        peak: 0,
                         status: FileStatus::Waiting,
                         wb: 0,
                         wt: Instant::now(),
@@ -1048,15 +1050,20 @@ impl Progress {
     /// 进度回调（models download_file 的 progress 参数进入点）。
     fn update(&self, idx: usize, bytes: u64, total: u64) {
         let Ok(mut g) = self.inner.lock() else { return };
-        let s = &mut g.states[idx];
-        let delta = bytes as i64 - s.last as i64;
-        s.last = bytes;
-        s.bytes = bytes;
-        if total > 0 {
-            s.total = total;
-        }
-        g.global.done += delta;
-        let done = g.global.done.max(0) as u64;
+        let done = {
+            let s = &mut g.states[idx];
+            let delta = bytes as i64 - s.last as i64;
+            s.last = bytes;
+            s.bytes = bytes;
+            if bytes > s.peak {
+                s.peak = bytes; // 峰值（跨重试不回退）
+            }
+            if total > 0 {
+                s.total = total;
+            }
+            g.global.done += delta; // CASH：仍维护（最终一致性）；绘制用 peak 聚合
+            g.global.done.max(0) as u64
+        };
         let now = Instant::now();
         if now.duration_since(g.last_draw) >= DRAW_TICK
             || done.saturating_sub(g.last_draw_done) >= DRAW_BYTES
@@ -1122,11 +1129,12 @@ impl Progress {
             FileStatus::Waiting => 2,
         };
         order.sort_by_key(|&i| (rank(g.states[i].status), i));
+        let peak_sum: u64 = g.states.iter().map(|s| s.peak).sum(); // 净落盘（重试回退不回退）
         let mut lines: Vec<String> = order
             .iter()
             .map(|&i| file_line(&g.files[i], &g.states[i], i, g.states.len(), now))
             .collect();
-        lines.push(global_line(&g.global, gspeed));
+        lines.push(global_line(g.global.total, peak_sum, gspeed));
         for s in &mut g.states {
             s.wb = s.bytes;
             s.wt = now;
@@ -1186,17 +1194,17 @@ fn file_line(e: &FileEntry, s: &FileState, idx: usize, files_total: usize, now: 
     line
 }
 
-fn global_line(g: &Global, speed: f64) -> String {
-    let done = g.done.max(0) as u64;
-    let pct = pct_of(done, g.total);
+/// GLOBAL 行：`done` = 净落盘字节（Σ 每文件历史峰值——重试回退不回退；用户 A 方案）。
+fn global_line(total: u64, done: u64, speed: f64) -> String {
+    let pct = pct_of(done, total);
     let mut line =
-        format!("GLOBAL {} {:>3}%  {}/{}", bar(pct), pct, human_dec(done), human_dec(g.total));
-    if g.total > 0 && done >= g.total {
+        format!("GLOBAL {} {:>3}%  {}/{}", bar(pct), pct, human_dec(done), human_dec(total));
+    if total > 0 && done >= total {
         line.push_str("  (done)");
-    } else if g.total > 0 {
+    } else if total > 0 {
         line.push_str(&format!("  {}/s", human_dec(speed as u64)));
         let eta =
-            if speed > 0.0 { format_eta((g.total - done) as f64 / speed) } else { "-".to_string() };
+            if speed > 0.0 { format_eta((total - done) as f64 / speed) } else { "-".to_string() };
         line.push_str(&format!("  ETA {eta}"));
     }
     line
@@ -1207,7 +1215,7 @@ fn global_line(g: &Global, speed: f64) -> String {
 /// （用户反馈：起始位置不一致——bar 与 pct 未对齐；2026-08-27 修正）。
 fn bar(pct: u64) -> String {
     let pct = pct.min(100);
-    let filled = (pct as usize * 20 + 99) / 100; // ceil(pct% × 20 格)
+    let filled = (pct as usize * 20).div_ceil(100); // ceil(pct% × 20 格)
     let mut out = String::with_capacity(20);
     for i in 0..20 {
         out.push(if i < filled { '█' } else { '░' });

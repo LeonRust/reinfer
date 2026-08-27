@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting））；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting）；v2.12：断点续传 + GLOBAL 净落盘）；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -48,6 +48,7 @@ model list [--format table|json|quiet]
 | `--format json` | 机器可读结果 JSON（§3 schema） | hf |
 | `--format quiet` / `--quiet` | 每成功文件仅打印路径行（失败走 stderr）；`-q` 已被 quant 占用，quiet 仅长旗 | hf |
 | 并发 | 固定 4 workers（文件间并行）；不增 CLI 旗子 | modelscope SDK `max_workers=4` |
+| 断点续传（r5.3） | 中断/残件保留（`.<name>.reinfer-part`）→ 重跑自动 `Range` 续传；服务器不支持 → 从头；全程全文件 sha256 兜底 | modelscope `--resume-download` 要素（自研实现） |
 
 ## 3. 输出契约（table/json/quiet + dry-run）
 

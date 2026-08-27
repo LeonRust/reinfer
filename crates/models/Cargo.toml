@@ -13,6 +13,7 @@ sha2 = { workspace = true }
 # 轻量同步 HTTP（默认 rustls——纯 Rust TLS、无 OpenSSL 系统依赖、无 async 运行时；
 # 自动读取标准 HTTP(S)_PROXY/NO_PROXY env）——013 决策
 ureq = "2"
+fs2 = { workspace = true }   # 断点续传残件跨进程锁（并发写 part 防互踩）
 
 [lints]
 workspace = true

@@ -26,6 +26,7 @@ reinfer-cuda      = { path = "crates/cuda" }
 reinfer-ascend       = { path = "crates/ascend" }
 reinfer-server    = { path = "crates/server" }
 cudarc            = { version = "0.19", default-features = false, features = ["driver", "runtime", "dynamic-linking"] }  # 收窄（评审 F10）：L1 仅需 runtime/driver + 动态链接模式；cublas 等增至 L2/L3 再开
+cann              = { path = "../cann-rs/cann" }   # 昇腾安全层（cann-rs，本地桥接；无 SDK 桩可编译）
 
 
 [workspace.lints.rust]

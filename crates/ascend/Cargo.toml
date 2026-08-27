@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 publish = false
+
 [dependencies]
+reinfer-core = { workspace = true }
+reinfer-kernels = { workspace = true }
+cann = { workspace = true }   # 经 [patch.crates-io] 本地桥接；无 ffi 默认桩可编译
 
 [lints]
 workspace = true

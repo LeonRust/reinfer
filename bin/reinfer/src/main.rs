@@ -521,7 +521,7 @@ fn cmd_download(a: DownloadArgs, vlog: &Verbosity) -> i32 {
             a.revision.as_deref().map(|r| format!("@{r}")).unwrap_or_default()
         ),
     );
-    let (entries, from_hf) = match list_entries(resolver.source, &a.repo, a.revision.as_deref()) {
+    let (mut entries, from_hf) = match list_entries(resolver.source, &a.repo, a.revision.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("reinfer: {e:?}");

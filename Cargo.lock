@@ -558,6 +558,7 @@ dependencies = [
  "reinfer-ascend",
  "reinfer-core",
  "reinfer-cuda",
+ "reinfer-models",
 ]
 
 [[package]]

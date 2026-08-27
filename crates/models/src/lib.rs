@@ -12,4 +12,5 @@ pub mod resolver;
 
 pub use api::FileEntry;
 pub use download::{ManifestEntry, Verify, download_file};
+pub use reinfer_kernels::LaunchError;
 pub use resolver::{ModelResolver, ModelSource, ModelSpec};

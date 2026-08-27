@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 reinfer-core = { workspace = true }
 reinfer-cuda = { workspace = true }
+reinfer-models = { workspace = true }
 reinfer-ascend = { workspace = true, optional = true }
 dotenvy = { workspace = true }   # 启动读取 .env（开发测试环境；无文件静默跳过）
 

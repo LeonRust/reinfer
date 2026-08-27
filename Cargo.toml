@@ -15,6 +15,7 @@ reinfer-gguf      = { path = "crates/gguf" }
 reinfer-tokenizer = { path = "crates/tokenizer" }
 reinfer-arch      = { path = "crates/arch" }
 reinfer-memory    = { path = "crates/memory" }
+reinfer-models    = { path = "crates/models" }
 reinfer-cache     = { path = "crates/cache" }
 reinfer-scheduler = { path = "crates/scheduler" }
 reinfer-kernels   = { path = "crates/kernels" }

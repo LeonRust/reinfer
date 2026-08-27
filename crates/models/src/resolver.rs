@@ -19,6 +19,14 @@ pub fn default_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("models"))
 }
 
+/// `~` 前缀展开为 `$HOME`（env/CLI 值可写 `~/models/reinfer`；无 HOME → 原样）。
+fn expand_tilde(p: &str) -> PathBuf {
+    if let (Some(rest), Ok(h)) = (p.strip_prefix("~/"), std::env::var("HOME")) {
+        return PathBuf::from(h).join(rest);
+    }
+    PathBuf::from(p)
+}
+
 /// 主源策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
@@ -102,8 +110,10 @@ impl ModelResolver {
                 LaunchError::Fatal
             })?,
         };
-        let dir =
-            std::env::var("REINFER_MODEL_DIR").ok().map(PathBuf::from).unwrap_or_else(default_dir);
+        let dir = std::env::var("REINFER_MODEL_DIR")
+            .ok()
+            .map(|v| expand_tilde(&v))
+            .unwrap_or_else(default_dir);
         let verify = match std::env::var("REINFER_MODEL_VERIFY").ok() {
             None => Verify::Sha256,
             Some(v) => Verify::parse(&v).ok_or_else(|| {
@@ -366,6 +376,13 @@ mod tests {
     }
 
     #[test]
+    fn tilde_expansion_keeps_plain_paths() {
+        // 非 ~/ 前缀 → 原样（HOME 有无都不改）
+        assert_eq!(expand_tilde("/a/b"), PathBuf::from("/a/b"));
+        assert_eq!(expand_tilde("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[test]
     fn spec_has_no_defaults() {
         let s = ModelSpec::new("x/y");
         assert!(s.file.is_none() && s.quant.is_none());
@@ -377,8 +394,8 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn spawn_stub<F>(handle: F) -> (u16, std::thread::JoinHandle<()>)
     where

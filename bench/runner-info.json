@@ -1,0 +1,13 @@
+{
+  "note": "判定机设备四元组（008 D2 工件；cuBLAS 绑定在后续切片补充）",
+  "runner": "local-fixed (2000-08-27 alignment: docs/design/cuda-phase-plan.md)",
+  "gpu": {
+    "device": "NVIDIA GeForce RTX 5090 Laptop GPU",
+    "uuid": "0fd2ce94-3e7e-e1b2-0a95-38357e2ca6ae",
+    "sm": "12.0 (sm_120)",
+    "memory_bytes": 25669664768
+  },
+  "driver": "595.84",
+  "cuda": "13.2",
+  "cublas": "n/a (bind in later slice)"
+}

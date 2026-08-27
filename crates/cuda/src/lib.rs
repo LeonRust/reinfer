@@ -42,5 +42,5 @@ pub use stream::CudaStream;
 pub mod buffer;
 
 #[cfg(feature = "cuda")]
-pub use buffer::{DeviceBuffer, HostBuffer};
+pub use buffer::{DeviceBuffer, HostBuffer, MemRef, copy, copy_async};
 pub use buffer_check::MemcpyKind;

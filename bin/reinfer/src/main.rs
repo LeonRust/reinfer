@@ -1452,6 +1452,20 @@ fn cuda_block(out: &mut Vec<Check>) {
 /// CANN 检查块：昇腾设备数 + SoC 名（feature ascend 才编译 C 侧调用）。
 #[cfg(feature = "ascend")]
 fn cann_block(out: &mut Vec<Check>) {
+    // aclInit 先行（CANN 规定：aclrtGetDeviceCount 等必须初始化后调用；与
+    // device_info 例程同模式——AscendContext::new 保活至本块结束）。此前直接
+    // device_count 在真机上报 "CANN runtime unavailable"（用户 2026-08-27 实测）。
+    let _ctx = match reinfer_ascend::AscendContext::new() {
+        Ok(c) => c,
+        Err(_) => {
+            out.push(Check::fail(
+                "cann.init",
+                "aclInit failed (CANN runtime init)",
+                Some("check ASCEND_TOOLKIT_HOME / Ascend driver installation"),
+            ));
+            return;
+        }
+    };
     match reinfer_ascend::AscendContext::device_count() {
         Ok(n) if n > 0 => {
             let soc = reinfer_ascend::AscendContext::device_info(0)

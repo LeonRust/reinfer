@@ -8,7 +8,7 @@
 
 | ID | Feature | Crate(s) | Spec anchor | Upstream dep | Gate | Status |
 |---|---|---|---|---|---|---|
-| ASC-01 | `cann` wiring: workspace dep + `ascend` feature forwarding (`bin/reinfer`) | `crates/ascend`, `bin/reinfer` | 002/plan §Decision | cann-rs L0 ✅ | `cargo check --workspace` (no SDK) green | ✅ ready |
+| ASC-01 | `cann` wiring: workspace dep + `ascend` feature forwarding (`bin/reinfer`) | `crates/ascend`, `bin/reinfer` | 002/plan §Decision | cann-rs L0 ✅ | `cargo check --workspace --no-default-features` (no SDK) green；ascend/cuda crate default=能力开（2026-08-27 定） | ✅ ready |
 | ASC-02 | `error.rs`: `cann::Error → LaunchError` (whitelist mapping: OOM/Driver/Fatal) | `crates/ascend` | 002/plan §Error mapping | cann::Error (is_oom/is_recoverable) ✅ | unit tests | ✅ ready |
 | ASC-03 | `diag()` + `reinfer diag` subcommand (CANN version str/num, device count, readable errors) | `crates/ascend`, `bin/reinfer` | 002/spec §AC | cann::Version/Context ✅ | NPU-runner smoke | ✅ ready |
 | ASC-04 | Contract conformance tests (signatures vs `cann` HEAD) | `crates/ascend` | 002/tasks T4 | — | CI | ↔ later (needs SDK) |

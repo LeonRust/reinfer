@@ -10,7 +10,7 @@ The reinfer Ascend backend (`crates/ascend`) needs the CANN SDK basics — devic
 
 ## Success Metrics
 
-- `cargo check --workspace` (default features) passes with no CANN SDK installed — Ascend stays inert unless `--features ascend` is used
+- `cargo check --workspace --no-default-features` passes with no CANN SDK installed — Ascend stays inert unless `--features ascend` is used（crc-ascend default=能力开；无 SDK 布尔表示）——2026-08-27 定
 - With CANN SDK 8.x/9.x installed, `cargo build --features ascend` succeeds and `reinfer diag` prints: CANN version string + version number (from `cann::Version`), device count, and a readable error path (no panic)
 - `crates/ascend` contains **zero unsafe**; the `Error → LaunchError` classification mapping is unit-tested in CI
 - cann-rs side: every L0 signature in plan.md §Interface Contracts compiles in `cann` with a smoke test

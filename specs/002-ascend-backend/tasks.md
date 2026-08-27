@@ -15,7 +15,7 @@
 ## Task 3: crate wiring
 
 - `crates/ascend/Cargo.toml`: `cann = { workspace = true }` (optional via feature `ascend`); `bin/reinfer` forwards `ascend` feature + `diag` subcommand behind it
-- Verification: `cargo check --workspace` (no SDK) passes; `cargo check --features ascend` with SDK present passes
+- Verification: `cargo check --workspace --no-default-features` (no SDK) passes; `cargo check --features ascend` with SDK present passes
 
 ## Task 4: Contract conformance checklist (cross-repo)
 
@@ -30,4 +30,4 @@
 
 ---
 
-Completion gate: Tasks 1–5 accepted; contract table sync'd with cann-rs HEAD; `cargo check --workspace` + fmt + clippy clean.
+Completion gate: Tasks 1–5 accepted; contract table sync'd with cann-rs HEAD; `cargo check --workspace --no-default-features` + fmt + clippy clean.

@@ -26,6 +26,7 @@
 | golden 重建 diff | 004 | ci.yml `goldens` | ubuntu-latest | diff 非空→需人工 | 漂移警示 |
 | ASC 三档 | 002 | can-gpu（预留） | can-gpu | — | 002 复活时 |
 | L1 运行时 smoke（真机：设备/流/事件/缓冲/拷贝） | specs/009 | gpu.yml `smoke` | nvidia-gpu | `cargo test -p reinfer-cuda --features cuda --test smoke -- --ignored --test-threads=1` | 测试退出码 | 全过 |
+| L2 Jit 内核（vec_add/rms/rope/softmax 差分 + 缓存命中 + sampler 组合） | specs/012 | gpu.yml `l2-jit` | nvidia-gpu | `REINFER_CUDA_NVCC=<nvcc≥12.8> cargo test -p reinfer-cuda --features cuda --test jit_smoke -- --ignored --test-threads=1` | 测试退出码 | 全过 |
 
 - **D6 触发与成本**: gpu.yml 仅 manual/label/paths —— main 绿即可合入；超时 45 min；并发 1（runner 单机自持）；nightly 05:00 非整点（与工具冲突）。
 - **D7 与宪法衔接**：AI 提交必须跑本契约（ci.yml 的 `#[ignore]` 校验 + fmt/clippy/test）；CI 工件变更走 spec changelog。

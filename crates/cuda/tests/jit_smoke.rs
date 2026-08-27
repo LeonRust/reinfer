@@ -294,6 +294,55 @@ mod smoke {
         }
     }
 
+    // ---------- D3：GPU softmax → host sampler 组合差分 ----------
+
+    #[test]
+    #[ignore = "gpu.yml: smoke / l2-jit"]
+    fn gpu_softmax_sampler_chain() {
+        use reinfer_kernels::sampler::{SplitMix64, sample_from_probs};
+
+        let ctx = CudaContext::init(DeviceId::new(0)).expect("ctx");
+        let dev = ctx.device_id();
+        let cache = std::env::temp_dir().join("reinfer-jit-d3-chain");
+        let _ = std::fs::remove_dir_all(&cache);
+        let stream = CudaStream::new(dev).expect("stream");
+        let dk = DiffKernels::new(&nvcc_arch(), Some(cache), stream).expect("DiffKernels");
+
+        // logits（含一个 -inf 掩码位）；概率远离阈值避免边界翻转 flake
+        let n = 4usize;
+        let logits = [0.9f32, -0.2, 0.0, f32::NEG_INFINITY];
+        let mask = [true, true, true, false];
+        let p_cpu = reinfer_kernels::refs::masked_softmax_ref(&logits, &mask);
+
+        let mut dx = DeviceBuffer::alloc(dev, n * 4).expect("dx");
+        let mut dout = DeviceBuffer::alloc(dev, n * 4).expect("dout");
+        host_to_dev(&mut dx, &logits);
+        dk.launch_masked_softmax(
+            0,
+            dx.as_ptr().cast(),
+            dout.as_ptr().cast::<f32>() as *mut f32,
+            n as u32,
+        )
+        .expect("launch softmax");
+        dk.sync_stream().expect("sync");
+        let p_gpu = dev_to_host(&dout, n);
+        assert!((p_gpu[3]).abs() < 1e-12, "invalid entry ~0");
+
+        // 同 seed 双管线（SplitMix64 为 Copy）
+        let root = SplitMix64::new(0xdeadbeef);
+        let mut r_gpu = root;
+        let mut r_cpu = root;
+        let mut seq_gpu = Vec::new();
+        let mut seq_cpu = Vec::new();
+        for _ in 0..64 {
+            seq_gpu.push(sample_from_probs(&p_gpu, &mut r_gpu).expect("gpu sample"));
+            seq_cpu.push(sample_from_probs(&p_cpu, &mut r_cpu).expect("cpu sample"));
+        }
+        assert_eq!(seq_gpu, seq_cpu, "combined pipeline determinism");
+        assert!(seq_gpu.iter().all(|t| *t < 3), "never samples masked token");
+        eprintln!("gpu_softmax_sampler_chain: 64-token sequence stable");
+    }
+
     #[test]
     #[ignore = "gpu.yml: smoke / l2-jit"]
     fn jit_cache_reload_budget() {

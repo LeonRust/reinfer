@@ -93,6 +93,7 @@ pub fn select<'a>(providers: &'a [&'a dyn KernelProvider], cfg: &OpConfig) -> Re
 | sampler | 四件套含 GPU sampler | sampler = host 管线（SplitMix64 + 温度 + argmax）；GPU 侧仅 masked_softmax logits | 无独立采样核时差分对象为组合管线；005 的 RNG 数学以 kernels 纯函数为锚 |
 | 档位顺序 | （深入设计 §1.1/§1.4：Vendor>Native>Jit） | Vendor > Jit > Native（Jit=自有核为数值主路径；Native 保留档位） | r1 裁决；回写深入设计与 003 D2（T9） |
 | 错误分类 | 未定义缓存侧 | 磁盘/锁/IO → Fatal；磁盘满 → Oom；编译失败 → Fatal 附 stderr 尾 | fail-closed；重试归上层 |
+| 架构/工具链 | 判定机特判（早稿“默认 sm_120a”） | **无任何硬件默认**：arch=`resolve_arch`（env→实测 cc→`sm_{cc}` base 档）；nvcc=`probe_toolchain_for_arch`（env→PATH→`/usr/local/cuda-*` 全扫，梯度过滤取最高）；`compile_cubin(tc)` 强约束使用选定工具链（防“探测选 A 编译用 B”）| 通用性评审（2026-08-27）：不得为开发机写默认；`-a` 仅显式指认 |
 
 ## Risk Assessment
 

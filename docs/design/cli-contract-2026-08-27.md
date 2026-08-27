@@ -4,8 +4,9 @@
 > ③ 下载 = 顶层 `download`（hf/modelscope 同名先例）；④ 无显式文件选择 = 整仓库（hf 默认）；
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
-> **状态**：v2 已锁定本文件内容的定稿部分；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本
-> 记录在本文件 changelog）；实现动工待整体探讨结束后统一批准。
+> **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节定稿——模型引用三态 + 参数全集 +
+> P1 功能面）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
+> 实现动工待整体探讨结束后统一批准。
 
 ## 1. 命令面
 
@@ -92,7 +93,24 @@ GLOBAL ████████████░░░░░░░░░░░░�
 
 ## 6. 未来命令契约（未立项）
 
-`serve <model> [--host <h>] [--port <p>]`（vllm serve 先例）· `chat <model>` · `run <model> [prompt...]` · `bench <model> [--gate...]`（003/008）· `diag`（ASC-03）。
+### serve（v2.1 定稿部分；功能落位见 005/003/P1-05）
+
+```
+reinfer serve <model> [-q <qtag> | -f <file>] [--revision <ref>] [--local-dir <dir>]
+            [--device <id>] [--host <h>] [--port <p>]
+            [--max-model-len <n>] [--max-num-seqs <n>] [--seed <n>]
+            [--served-model-name <name>] [--api-key <key>] [--metrics]
+```
+
+- **模型引用三态**（ModelRef + loader 注册表候选探测）：① 本地文件/目录 → 直接加载（选择器旗给出 → exit 2）；② repo 单候选（单一权重结构）→ 自动 ensure 下载再运行（无参数）；③ repo 多候选（如量化共存仓）→ 必须 `-q`/`-f`，缺 → exit 2 并列出候选。隐式下载受 `REINFER_MODEL_AUTODOWNLOAD` 纪律（off → 不联网报错）。`run/chat/bench` 的 <model> 同此三态。
+- **`--device <id>`**（用户 2026-08-27 定契约）：计算设备视图下标（0 基；CUDA = `CUDA_VISIBLE_DEVICES` 视图内序号；昇腾 = `DEVICE_ID` 语义）；缺省 `auto`（arch 探测自动选）。注：先例多为 env（llama.cpp/vllm 均为 env），本旗为我方扩展（语义与 env 视图完全一致）；文档标注用例。
+- **功能面（P1 首期，用户拍板 OpenAI 兼容一次到位）**：`GET /v1/models` · `POST /v1/chat/completions`（含 SSE streaming）· `POST /v1/completions` · OpenAI 错误契约 · **`GET /healthz`**（合入 P1）· `--api-key` 认证 · graceful shutdown（SIGINT/SIGTERM）。采样参数（temperature 等）由 API 请求体承载，不进 CLI。
+- 输出面：启动信息 + 运行日志（结构化/人类两式），与 download 的结果面（table/json/quiet）分离；`--metrics`（prometheus）挂 008。
+- 不做（P1）：speculative decode、graph bucket（006）、radix cache/grammar（P3-01）、TP/PP/CP、多实例编排。
+
+### 其他
+
+`chat <model>` · `run <model> [prompt...]` · `bench <model> [--gate...]`（003/008）· `diag`（ASC-03）；其 <model> 三态同 serve。
 
 ## 7. 先例对照表
 

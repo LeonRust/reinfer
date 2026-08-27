@@ -5,7 +5,7 @@
 //! ```text
 //! export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
 //! export LD_LIBRARY_PATH=$ASCEND_TOOLKIT_HOME/lib64:$ASCEND_TOOLKIT_HOME/runtime/lib64:$LD_LIBRARY_PATH
-//! cargo test -p reinfer-ascend --features ffi --test smoke -- --ignored --test-threads=1
+//! cargo test -p reinfer-ascend --features ascend --test smoke -- --ignored --test-threads=1
 //! ```
 //! 与 CUDA 侧差异（镜像对照表/探针清单见 specs/011-ascend-l0-mirror/npu-test-checklist.md）：
 //! - `ensure_ctx()` 全局唯一 context（ACL aclInit/aclFinalize 非引用计数——进程内仅一次，

@@ -3,7 +3,7 @@
 //! ```text
 //! ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest \
 //! LD_LIBRARY_PATH=$ASCEND_TOOLKIT_HOME/lib64:$ASCEND_TOOLKIT_HOME/runtime/lib64:$LD_LIBRARY_PATH \
-//! cargo run -p reinfer-ascend --features ffi --example device_info
+//! cargo run -p reinfer-ascend --features ascend --example device_info
 //! ```
 //!
 //! 预期输出（Ascend 910B 判定机）：

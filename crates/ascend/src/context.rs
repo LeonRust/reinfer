@@ -50,7 +50,7 @@ pub struct DeviceInfo {
     pub soc_name: String,
 }
 
-#[cfg(all(test, not(feature = "ffi")))]
+#[cfg(all(test, not(feature = "ascend")))]
 mod tests {
     use super::*;
 

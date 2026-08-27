@@ -19,7 +19,7 @@ libc = "0.2"                                      # TTY 进度模式 Ctrl-C：�
 [features]
 default = []
 cuda = ["reinfer-cuda/cuda"]
-ascend = ["dep:reinfer-ascend", "reinfer-ascend/ffi"]
+ascend = ["dep:reinfer-ascend", "reinfer-ascend/ascend"]
 
 [lints]
 workspace = true

@@ -27,8 +27,8 @@ export LD_LIBRARY_PATH=$ASCEND_TOOLKIT_HOME/lib64:$ASCEND_TOOLKIT_HOME/runtime/l
 
 ```bash
 cd reinfer
-cargo test -p reinfer-ascend --features ffi --test smoke --no-run        # must link
-cargo test -p reinfer-ascend --features ffi --test smoke -- --list --ignored
+cargo test -p reinfer-ascend --features ascend --test smoke --no-run        # must link
+cargo test -p reinfer-ascend --features ascend --test smoke -- --list --ignored
 ```
 
 Expected 5 listed: `device_info_smoke`, `memcpy_roundtrip`, `event_query_states`,
@@ -37,17 +37,17 @@ Expected 5 listed: `device_info_smoke`, `memcpy_roundtrip`, `event_query_states`
 ## C. Run (acceptance gate)
 
 ```bash
-cargo test -p reinfer-ascend --features ffi --test smoke -- --ignored --test-threads=1
+cargo test -p reinfer-ascend --features ascend --test smoke -- --ignored --test-threads=1
 ```
 
 Expectation: 5 passed, 0 failed, 0 ignored. `--test-threads=1` is mandatory
 (ACL per-thread device binding; parallel tests perturb each other).
 
 Sanity pass (non-smoke tests under ffi — only the 3 pure error-classification tests
-run; stub tests are `#[cfg(not(feature = "ffi"))]`-gated):
+run; stub tests are `#[cfg(not(feature = "ascend"))]`-gated):
 
 ```bash
-cargo test -p reinfer-ascend --features ffi --lib
+cargo test -p reinfer-ascend --features ascend --lib
 ```
 
 Expectation: 3 passed (error.rs classification: 207001→Oom, 507000/507033→Driver,
@@ -58,8 +58,8 @@ unclassified→Fatal).
 Same env as above; results are printed for human inspection, no assertions:
 
 ```bash
-cargo run -p reinfer-ascend --features ffi --example device_info
-cargo run -p reinfer-ascend --features ffi --example basic_ops
+cargo run -p reinfer-ascend --features ascend --example device_info
+cargo run -p reinfer-ascend --features ascend --example basic_ops
 ```
 
 - `device_info`: device count + SoC name per device (DeviceProps gap until 011 T2).

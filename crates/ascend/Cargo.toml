@@ -12,15 +12,15 @@ cann = { workspace = true }   # 经 [patch.crates-io] 本地桥接；无 ffi 默
 
 [features]
 # 目标机（NPU + CANN SDK）构建开关：本地开发机无 CANN，禁止开启。
-ffi = ["cann/ffi"]
+ascend = ["cann/ffi"]   # 对外唯一开关（=cann/ffi 真绑定）；ffi 名退役（2026-08-27 用户定）
 
 [[example]]
 name = "device_info"
-required-features = ["ffi"]
+required-features = ["ascend"]
 
 [[example]]
 name = "basic_ops"
-required-features = ["ffi"]
+required-features = ["ascend"]
 
 [lints]
 workspace = true

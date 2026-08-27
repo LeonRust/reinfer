@@ -4,7 +4,7 @@
 //! ```text
 //! ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest \
 //! LD_LIBRARY_PATH=$ASCEND_TOOLKIT_HOME/lib64:$ASCEND_TOOLKIT_HOME/runtime/lib64:$LD_LIBRARY_PATH \
-//! cargo run -p reinfer-ascend --features ffi --example basic_ops
+//! cargo run -p reinfer-ascend --features ascend --example basic_ops
 //! ```
 
 use reinfer_ascend::{

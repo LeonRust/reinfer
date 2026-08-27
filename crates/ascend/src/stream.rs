@@ -64,7 +64,7 @@ impl AscendEvent {
     }
 }
 
-#[cfg(all(test, not(feature = "ffi")))]
+#[cfg(all(test, not(feature = "ascend")))]
 mod tests {
     use super::*;
 

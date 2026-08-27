@@ -13,9 +13,6 @@ pub mod error;
 /// 设备信息纯数据与格式化（无 feature 依赖）。
 pub mod device_info;
 
-/// MemRef 拷贝校验纯逻辑（无 feature）。
-pub mod buffer_check;
-
 /// 设备上下文（feature `cuda`）。
 #[cfg(feature = "cuda")]
 pub mod context;
@@ -43,4 +40,5 @@ pub mod buffer;
 
 #[cfg(feature = "cuda")]
 pub use buffer::{DeviceBuffer, HostBuffer, MemRef, copy, copy_async};
-pub use buffer_check::MemcpyKind;
+// MemcpyKind 共享于 kernels（昇腾后端复用同一校验逻辑）
+pub use reinfer_kernels::MemcpyKind;

@@ -135,16 +135,16 @@ impl MemRef<'_> {
         }
     }
 
-    pub(crate) fn end(&self) -> crate::buffer_check::MemRefEnd {
-        crate::buffer_check::MemRefEnd { offset: 0, len: self.len(), dev: self.device() }
+    pub(crate) fn end(&self) -> reinfer_kernels::mem_check::MemRefEnd {
+        reinfer_kernels::mem_check::MemRefEnd { offset: 0, len: self.len(), dev: self.device() }
     }
 }
 
 fn kind_of(
     dst: Option<u32>,
     src: Option<u32>,
-) -> Result<crate::buffer_check::MemcpyKind, LaunchError> {
-    use crate::buffer_check::MemcpyKind::*;
+) -> Result<reinfer_kernels::mem_check::MemcpyKind, LaunchError> {
+    use reinfer_kernels::mem_check::MemcpyKind::*;
     match (dst, src) {
         (Some(_), None) => Ok(H2D),
         (None, Some(_)) => Ok(D2H),
@@ -156,7 +156,7 @@ fn kind_of(
 /// 同步/异步拷贝实现：同设备走 `cudaMemcpyAsync`，跨设备 D2D 先
 /// `cudaDeviceCanAccessPeer` 探测再 `cudaMemcpyPeerAsync`（009 评审 B#8）。
 fn memcpy_launch(
-    kind: crate::buffer_check::MemcpyKind,
+    kind: reinfer_kernels::mem_check::MemcpyKind,
     dst: *mut core::ffi::c_void,
     src: *const core::ffi::c_void,
     bytes: usize,
@@ -182,9 +182,9 @@ fn memcpy_launch(
         _ => {
             use cudarc::runtime::sys::cudaMemcpyKind::*;
             let k = match kind {
-                crate::buffer_check::MemcpyKind::H2D => cudaMemcpyHostToDevice,
-                crate::buffer_check::MemcpyKind::D2H => cudaMemcpyDeviceToHost,
-                crate::buffer_check::MemcpyKind::D2D => cudaMemcpyDeviceToDevice,
+                reinfer_kernels::mem_check::MemcpyKind::H2D => cudaMemcpyHostToDevice,
+                reinfer_kernels::mem_check::MemcpyKind::D2H => cudaMemcpyDeviceToHost,
+                reinfer_kernels::mem_check::MemcpyKind::D2D => cudaMemcpyDeviceToDevice,
             };
             unsafe { sys::cudaMemcpyAsync(dst, src, bytes, k, stream) }
                 .result()
@@ -195,7 +195,7 @@ fn memcpy_launch(
 
 /// 阻塞拷贝：`stream` 为 `None` 时使用默认流并立即同步返回。
 ///
-/// 拷贝前经 [`crate::buffer_check::validate_memref`]（方向/边界/归属），
+/// 拷贝前经 [`reinfer_kernels::mem_check::validate_memref`]（方向/边界/归属），
 /// 失败返回 `LaunchError::Fatal`（参数类）。
 pub fn copy(
     dst: &mut MemRef<'_>,
@@ -205,12 +205,12 @@ pub fn copy(
 ) -> Result<(), LaunchError> {
     let current = CudaContext::current_device()?.index();
     let kind = kind_of(dst.device(), src.device())?;
-    crate::buffer_check::validate_memref(
+    reinfer_kernels::mem_check::validate_memref(
         kind,
         &dst.end(),
         &src.end(),
         bytes,
-        &crate::buffer_check::PeerPolicy { current_dev: current, allow_peer: true },
+        &reinfer_kernels::mem_check::PeerPolicy { current_dev: current, allow_peer: true },
     )?;
     let raw_stream = stream.map(CudaStream::handle).unwrap_or(core::ptr::null_mut());
     let dst_ptr = dst.ptr() as *mut core::ffi::c_void;
@@ -234,12 +234,12 @@ pub fn copy_async(
 ) -> Result<CudaEvent, LaunchError> {
     let current = CudaContext::current_device()?.index();
     let kind = kind_of(dst.device(), src.device())?;
-    crate::buffer_check::validate_memref(
+    reinfer_kernels::mem_check::validate_memref(
         kind,
         &dst.end(),
         &src.end(),
         bytes,
-        &crate::buffer_check::PeerPolicy { current_dev: current, allow_peer: true },
+        &reinfer_kernels::mem_check::PeerPolicy { current_dev: current, allow_peer: true },
     )?;
     let dst_ptr = dst.ptr() as *mut core::ffi::c_void;
     let src_ptr = src.ptr() as *const core::ffi::c_void;

@@ -6,3 +6,8 @@
 pub mod error;
 
 pub use error::LaunchError;
+
+/// 内存拷贝校验共享纯逻辑（CUDA / 昇腾共用）。
+pub mod mem_check;
+
+pub use mem_check::MemcpyKind;

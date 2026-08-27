@@ -51,7 +51,7 @@ cargo build -p reinfer
 | 3.7 | `reinfer download <repo>`（无选择） | 全仓库（hf 语义）——**大下载确认后单独执行** | exit 0（谨慎触发） |
 | 3.8 | `reinfer download <repo> -q q8_0 --format json` | 结果 JSON schema（file/bytes/sha256/downloaded） | jq 字段齐全 |
 | 3.9 | `reinfer download <repo> -q q8_0 --quiet` | 仅最终路径一行 | 无表格/进度 |
-| 3.10 | 进度条（TTY） | 全文件清单：每个目标文件一行（含未开始 waiting…）；完成行置顶；GLOBAL 底行（v2.11 排序） | 全部 11 文件可见；完成后退出正常 |
+| 3.10 | 进度条（TTY） | 紧凑视图：`n/11 files` 计数行 + 活跃文件行（≤4）+ GLOBAL 底行（v2.14 方案 A） | 小终端无重复/截断（对照：清单视图在此高度会幽灵双行）；完成即折叠；`model list` 见全清单 |
 | 3.11 | `--format json` 下无进度条 | 纯净 JSON | 无 ANSI 残留 |
 | 3.12 | 并发 | `--include '*.gguf'` 时多文件并行（4 worker） | 观察行为（完成无错误）——**大下载**可选 |
 | 3.13 | `download -q q8_0 -q q4_0` | 重复旗错误 | exit 2 |

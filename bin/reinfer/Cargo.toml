@@ -15,7 +15,7 @@ clap_complete = "4"                               # completions 生成（契约 
 serde_json = { workspace = true }                 # --format json 输出（契约 §3）
 fs2 = { workspace = true }                        # doctor 磁盘余量（statvfs 语义；无新系统依赖）
 libc = "0.2"
-indicatif = "0.17"   # 进度条渲染（2026-08-27 用户定：成熟三方库替代自研 ANSI；语义仍按契约 §4 映射）                                      # TTY 进度模式 Ctrl-C：补 \n 后退出（契约 §4）
+indicatif = "0.18"   # 进度条渲染（2026-08-27 用户定：成熟三方库替代自研 ANSI；语义仍按契约 §4 映射）                                      # TTY 进度模式 Ctrl-C：补 \n 后退出（契约 §4）
 
 [features]
 default = []

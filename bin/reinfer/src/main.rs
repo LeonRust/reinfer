@@ -738,7 +738,7 @@ fn run_downloads(
                     let entry = &targets[i];
                     vlog.log(2, format!("-> {}", entry.name));
                     if let Some(p) = prog {
-                        p.begin_file(i);
+                        p.begin_file(i, &entry.name);
                     }
                     let res = if let Some(p) = prog {
                         let p = Arc::clone(p);
@@ -995,38 +995,31 @@ const GLOBAL_TEMPLATE: &str =
 
 struct Progress {
     mp: MultiProgress,
-    bars: Vec<ProgressBar>,
+    /// 完成计数行（`{done}/{total} files`；docker 式紧凑视图）。
+    counter: ProgressBar,
+    /// 活跃条（≤ MAX_WORKERS；按文件 idx 定位；begin 时插入 GLOBAL 上方）。
+    active: Mutex<Vec<Option<ProgressBar>>>,
     global: ProgressBar,
-    /// 每文件峰值字节（净落盘聚合；重试回退不回退——用户 A 方案）。
+    /// 每文件峰值字节（净落盘聚合；重试回退不回退——A 方案）。
     peaks: Mutex<Vec<u64>>,
+    done: AtomicUsize,
+    total: usize,
 }
 
 impl Progress {
     fn new(targets: &[FileEntry]) -> Self {
-        // 进度画 stderr（indicatif 默认）——stdout 只承载结果数据（摘要/JSON，机器面）；
-        // 诊断日志（resuming/降级）同流 stderr，时序可见（此前 stdout 进度与 stderr 日志抢画面）。
+        // 进度画 stderr（indicatif 默认）——stdout 只承载结果数据（摘要/JSON，机器面）。
         let mp = MultiProgress::new();
         mp.set_draw_target(indicatif::ProgressDrawTarget::stderr());
         let style = ProgressStyle::with_template(PROG_TEMPLATE)
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("█░");
+        let counter = mp.add(ProgressBar::new(0));
+        counter.set_style(
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
         let total = targets.len();
-        let bars: Vec<ProgressBar> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let pb = mp.add(ProgressBar::new(e.size));
-                pb.set_style(style.clone());
-                pb.set_message(format!(
-                    "{:<38} [{}/{}] waiting…",
-                    truncate(&e.name, 40),
-                    i + 1,
-                    total
-                ));
-                pb.enable_steady_tick(Duration::from_millis(200));
-                pb
-            })
-            .collect();
+        counter.set_message(format!("0/{total} files"));
         let gl = mp.add(ProgressBar::new(targets.iter().map(|e| e.size).sum::<u64>()));
         gl.set_style(
             ProgressStyle::with_template(GLOBAL_TEMPLATE)
@@ -1035,18 +1028,36 @@ impl Progress {
         );
         gl.set_message("".to_string());
         gl.enable_steady_tick(Duration::from_millis(200));
-        Self { mp, bars, global: gl, peaks: Mutex::new(vec![0; total]) }
+        Self {
+            mp,
+            counter,
+            active: std::sync::Mutex::new(vec![None; total]),
+            global: gl,
+            peaks: Mutex::new(vec![0; total]),
+            done: AtomicUsize::new(0),
+            total,
+        }
     }
 
-    fn begin_file(&self, idx: usize) {
-        // 长度/位置已在 new 时预置；begin 时刻标记 active（进度由 update 驱动）
-        self.bars[idx].set_message(self.bars[idx].message().replace("waiting\u{2026}", "").to_string());
+    fn begin_file(&self, idx: usize, name: &str) {
+        // active 行：插入 GLOBAL 上方（倒数第 2 行——docker 式：只显示正在下载的文件）
+        let pb = self.mp.insert_from_back(1, ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::with_template(PROG_TEMPLATE)
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("█░"),
+        );
+        pb.set_message(format!("{:<38} [{}/{}]", truncate(name, 40), idx + 1, self.total));
+        pb.enable_steady_tick(Duration::from_millis(200));
+        self.active.lock().unwrap_or_else(|e| e.into_inner())[idx] = Some(pb);
     }
 
     fn update(&self, idx: usize, bytes: u64, total: u64) {
         let new_len = total.max(bytes);
-        self.bars[idx].set_length(new_len);
-        self.bars[idx].set_position(bytes);
+        if let Some(pb) = self.active.lock().unwrap_or_else(|e| e.into_inner())[idx].as_ref() {
+            pb.set_length(new_len);
+            pb.set_position(bytes);
+        }
         if let Ok(mut peaks) = self.peaks.lock() {
             if bytes > peaks[idx] {
                 peaks[idx] = bytes;
@@ -1058,21 +1069,22 @@ impl Progress {
     }
 
     fn end_file(&self, idx: usize, ok: bool) {
-        let pb = &self.bars[idx];
+        // 完成即从活跃栈移除（列表折叠——全清单归 `model list`，契约 v2.14 方案 A）
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pb) = active[idx].as_ref() {
+                if ok {
+                    self.mp.remove(pb); // 完成即从活跃栈移除（折叠——全清单归 model list）
+                } else {
+                    pb.abandon_with_message(format!("{:<38} (failed)", truncate(&pb.message(), 40)));
+                    eprintln!("reinfer: {}/{} failed", idx + 1, self.total);
+                }
+                active[idx] = None;
+            }
+        }
         if ok {
-            pb.finish_with_message(format!(
-                "{:<38} [{}/{}]",
-                truncate(pb.message().split(' ').next().unwrap_or(""), 40),
-                idx + 1,
-                self.bars.len()
-            ));
-            self.mp.remove(pb); // 从当前位置移除（避免 insert 复制导致双行——用户实测 2026-08-28）
-            let _ = self.mp.insert(0, pb.clone()); // 完成置顶
-        } else {
-            pb.abandon_with_message(format!(
-                "{} (failed)",
-                pb.message().trim_end_matches('\u{2026}')
-            ));
+            let d = self.done.fetch_add(1, Ordering::SeqCst) + 1;
+            self.counter.set_message(format!("{d}/{} files done", self.total));
         }
     }
 

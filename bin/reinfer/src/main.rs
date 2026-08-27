@@ -999,8 +999,10 @@ struct Progress {
 
 impl Progress {
     fn new(targets: &[FileEntry]) -> Self {
+        // 进度画 stderr（indicatif 默认）——stdout 只承载结果数据（摘要/JSON，机器面）；
+        // 诊断日志（resuming/降级）同流 stderr，时序可见（此前 stdout 进度与 stderr 日志抢画面）。
         let mp = MultiProgress::new();
-        mp.set_draw_target(indicatif::ProgressDrawTarget::stdout());
+        mp.set_draw_target(indicatif::ProgressDrawTarget::stderr());
         let style = ProgressStyle::with_template(PROG_TEMPLATE)
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("█░");

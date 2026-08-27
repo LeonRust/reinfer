@@ -29,6 +29,16 @@
 pub struct FileEntry { pub name: String, pub size: u64, pub sha256: String, pub is_lfs: bool }
 pub fn list_files(owner_model: &str) -> Result<Vec<FileEntry>, LaunchError>;
 pub fn download_file(owner_model: &str, entry: &FileEntry, to_dir: &Path) -> Result<PathBuf, LaunchError>;
+// ---- r2：运行时 resolver ----
+pub struct ModelSpec { repo: String, quant: Option<String>, file: Option<String>, branch: String }  // with_quant/with_file/with_branch
+pub enum ModelSource { Modelscope, Huggingface, Auto(fallback) }
+pub enum Verify { Sha256, Size, None }
+pub struct ModelResolver { source: ModelSource, dir: PathBuf, verify: Verify, autodownload: bool }
+impl ModelResolver {
+    pub fn from_env() -> Result<Self, LaunchError>;                       // 全部 REINFER_MODEL_*（见 D6.1）
+    pub fn ensure(&self, spec: &ModelSpec) -> Result<PathBuf, LaunchError>;   // 命中/下载（按 verify）/off-错误
+    pub fn ensure_to(&self, spec: &ModelSpec, dir: &Path) -> Result<PathBuf, LaunchError>;
+}
 // bin
 //   reinfer model list <owner/model>
 //   reinfer model get  <owner/model> --quant <qtag> [--to <dir>]  (缺省 --to ~/models/reinfer)
@@ -38,6 +48,21 @@ pub fn download_file(owner_model: &str, entry: &FileEntry, to_dir: &Path) -> Res
 ```
 
 错误面：网络/超时/解析/校验 → 重试一次 → `Fatal`（stderr 含详情与代理提示）；ENOSPC → `Oom`；目标已存在且 sha256 匹配 → 跳过（幂等，打印 hit）。
+
+- **D6 r2 策略面与双源**：
+  - `ModelResolver::from_env()` 读全部 `REINFER_MODEL_*` + 标准代理 env（解析失败 → `Fatal` 带变量名）；
+  - 双源统一入口：`ensure` = 本地命中（按 VERIFY 深度）→ source 策略下载（ModelScope：302/CDN + Sha256；HuggingFace：`resolve/` + `X-Linked-Etag`+size）→ 原子落盘 + manifest → 路径；`AUTODOWNLOAD=off` → 缺模型即错误；
+  - `ModelSpec`（repo / quant | file / 分支）：`--quant` 匹配、`with_file` 精确、HF 分支缺省 `main`；
+  - 校验强度矩阵：local sha256=最强；ModelScope=官方 Sha256；HuggingFace=ETag+size；`size` 档=仅大小（信任离线缓存加速）；`none` 仅内网。
+- **D6.1 环境变量契约（r2）**：
+
+| 变量 | 取值 | 缺省 | 语义 |
+|---|---|---|---|
+| `REINFER_MODEL_SOURCE` | `modelscope`/`huggingface`/`auto` | `auto` | `auto`=MS 优先，404/缺文件 → HF |
+| `REINFER_MODEL_DIR` | 路径 | `~/models/reinfer/` | 下载/查找根 |
+| `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | 见 D6 矩阵 |
+| `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | off=绝不联网（缺模型报错） |
+| 代理 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | 标准 | 出口（不硬编码用户代理 IP） |
 
 ## Risk Assessment
 

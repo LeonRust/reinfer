@@ -27,6 +27,8 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 1. 作为引擎作者：`reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf --to ~/models/reinfer/` —— 一个 Rust 二进制完成模型获取（无 pip、无 Python）。
 2. 作为维护者：下载结果带 sha256 校验与 manifest 留痕（换机复制/基准确认）。
 3. 作为 CI/复现者：无代理直连、有代理也通（标准 env）；校验失败宁可失败不静默。
+4. 作为引擎作者：运行时 `ModelResolver.ensure()` 缺模型自动下载——引擎不假设机器预置模型。
+5. 作为离线/管控环境：`REINFER_MODEL_AUTODOWNLOAD=off` 保证引擎绝不联网。
 
 ## Acceptance Criteria
 
@@ -36,11 +38,23 @@ ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 
 - [ ] 网络/超时错误分类为可重试（一次）后 `Fatal`；磁盘满 → `Oom`
 - [ ] 端到端：真机下载 0.5B q8_0（675,710,816 B）校验通过（一次性人工验证，非日常 CI）
 - [ ] README/CLAUDE 增"模型获取"段；feature-list 状态更新
+- [ ] r2：`ModelResolver::from_env` 解析全部 `REINFER_MODEL_*`（缺省值语义对齐契约表）；`ensure()` 本地命中/自动下载/off-报错三态可测
+- [ ] r2：双源——ModelScope 404 → HF 回退（stub 测）；HF 路径 ETag+size 校验；VERIFY=none 只查存在性
+- [ ] r2：`AUTODOWNLOAD=off` → 缺模型返回明确错误（无网络动作）
+
+## r2（2026-08-27 探讨增补）——运行时自动下载 + 双源 + 环境变量策略面
+
+- **运行时代码路径**：`ModelResolver::from_env()?.ensure(&ModelSpec)` —— L3 GGUF 加载器检测本地无模型 → 按策略自动下载 → 返回路径（离线可关）。CLI 与运行时走同一套下载机制（仅入口不同）。
+- **双源**：默认 ModelScope（铁律主体）；`auto` 语义 = ModelScope 无此模型/文件 → **HuggingFace 回退**（用户 2026-08-27 明确放开——修订"一律 ModelScope"为"ModelScope 优先 + 可回退"）。
+- **环境变量面**（`REINFER_MODEL_*`，语义见 plan D6 表）：`SOURCE`(`modelscope|huggingface|auto`)/`DIR`/`VERIFY`(`sha256|size|none`)/`AUTODOWNLOAD`(`on|off`)。
+- **校验强度差异**：ModelScope 有官方 Sha256；HuggingFace 无 sha 字段——`VERIFY=sha256` 对 HF 源降级为 ETag+size（docs 声明）。
+- 契约前提不变：网络出口经标准 `HTTP(S)_PROXY` 等 env；端到端在用户机验证。
 
 ## Non-Goals
 
 - 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）
 - 私有/付费仓库（认证、SDK 式 token）与 `IsLFS=true` 的 git-lfs 拉取
+- HuggingFace 侧 sha256 等价强校验（官方 API 无该字段——ETag+size 为上限）
 - Revision 非 master（SNAPSHOT 语义将来扩展）
 - 下载速度/并发镜像（对象存储多 CDN，v1 单 URL）
 

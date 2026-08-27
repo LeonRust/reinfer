@@ -22,9 +22,19 @@
 - `reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf`
 - Verification: 675,710,816 B；sha256 == `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e`；manifest 留痕；记录 notes（含代理 env 示例）
 
+## T6: 运行时 resolver + env 策略面（r2）
+
+- `ModelResolver::from_env()`（REINFER_MODEL_SOURCE/DIR/VERIFY/AUTODOWNLOAD + 代理 env）；`ModelSpec`（quant/file/branch）；`ensure/ensure_to`：本地命中（verify 深度）→ 自动下载 → off 报错
+- Verification: env 解析单测（缺省语义矩阵）；本地命中（stub 预置文件 + VERIFY=size/sha/none 三档）；`AUTODOWNLOAD=off` → Err 且无网络调用（stub 断言）
+
+## T7: HuggingFace 源（r2）
+
+- `HfApi`：`api/models/{repo}` siblings（file/size）+ `resolve/{branch}/{file}`（302 跟随）+ `X-Linked-Etag` 校验；无 sha256 字段 → D6 强度矩阵降级
+- Verification: stub（siblings + 302 + etag 坏值 → 校验失败重试一次）；`source=auto` 的 MS-404 → HF 回退路径（stub 双服务）
+
 ## T5: 文档同步
 
-- README（模型获取段）、CLAUDE.md（跨库纪律：模型一律 ModelScope + 示例命令）、feature-list（模型获取行）
+- README（模型获取段：CLI + 运行时 + env 表 + 代理示例）、CLAUDE.md（跨库纪律修订：ModelScope 优先/auto 回退 HF + 示例命令）、feature-list（模型获取行）
 - Verification: README 命令可复制；feature-list 新行锚 013
 
 ---

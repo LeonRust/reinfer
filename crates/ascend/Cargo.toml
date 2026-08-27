@@ -14,5 +14,13 @@ cann = { workspace = true }   # 经 [patch.crates-io] 本地桥接；无 ffi 默
 # 目标机（NPU + CANN SDK）构建开关：本地开发机无 CANN，禁止开启。
 ffi = ["cann/ffi"]
 
+[[example]]
+name = "device_info"
+required-features = ["ffi"]
+
+[[example]]
+name = "basic_ops"
+required-features = ["ffi"]
+
 [lints]
 workspace = true

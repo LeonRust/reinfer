@@ -49,6 +49,24 @@ cargo test -p reinfer-ascend --features ffi --lib
 Expectation: 3 passed (error.rs classification: 207001→Oom, 507000/507033→Driver,
 unclassified→Fatal).
 
+## C2. Manual examples (L1 demo, optional)
+
+Same env as above; results are printed for human inspection, no assertions:
+
+```bash
+cargo run -p reinfer-ascend --features ffi --example device_info
+cargo run -p reinfer-ascend --features ffi --example basic_ops
+```
+
+- `device_info`: device count + SoC name per device (DeviceProps gap until 011 T2).
+- `basic_ops`: sections [1]-[5] — device, stream/event (record+sync), 1 MiB
+  deterministic checksum roundtrip both sync and async, 100× alloc/free, error
+  injection (1 TiB over-alloc → Oom; bad dev index → non-Oom).
+
+Manual checkpoints: checksum equality lines (src == out both chains), all
+"100 次 alloc/free 全部成功", error variants match expected classification
+(record actual variants back as probes P3/P4 if different).
+
 ## D. Case matrix (mirror vs crates/cuda/tests/smoke.rs)
 
 | Test | CUDA counterpart | Assertions | Notes / differing |

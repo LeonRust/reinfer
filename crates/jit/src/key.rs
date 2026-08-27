@@ -14,13 +14,19 @@
 //! 构建期漂移校验（见 `compile.rs`）。
 
 use crate::types::{HeaderFile, KernelSource, ToolchainId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// 编译产物缓存键（hex 用于文件名与显示；前 2 字符为目录分片）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JitKey([u8; 32]);
 
 impl JitKey {
+    /// 由原始字节重建（meta 回读/测试）。
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// 由确定性输入计算（全内存操作，无子进程）。
     pub fn new(src: &KernelSource, tc: &ToolchainId) -> Self {
         let mut b: Vec<u8> = Vec::new();

@@ -3,4 +3,7 @@
 
 pub mod device;
 
+pub mod dtype;
+
 pub use device::DeviceId;
+pub use dtype::DType;

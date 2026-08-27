@@ -10,10 +10,11 @@ pub mod error;
 pub mod key;
 pub mod lock;
 pub mod meta;
+pub mod toolchain;
 pub mod types;
 
 pub use cache::JitCache;
-
 pub use key::JitKey;
 pub use meta::JLibMeta;
+pub use toolchain::{check_arch_supported, probe_toolchain, resolve_nvcc};
 pub use types::{HeaderFile, KernelSource, ToolchainId};

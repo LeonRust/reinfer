@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 reinfer-core = { workspace = true }
-reinfer-cuda = { workspace = true }
+reinfer-cuda = { workspace = true, optional = true }   # 昇腾/纯 CPU 机不拉 cudarc（无 CUDA 工具链可构建）
 reinfer-jit = { workspace = true }        # doctor：nvcc 工具链探测（toolchain.rs 复用）
 reinfer-models = { workspace = true }
 reinfer-ascend = { workspace = true, optional = true }
@@ -18,7 +18,7 @@ libc = "0.2"                                      # TTY 进度模式 Ctrl-C：�
 
 [features]
 default = []
-cuda = ["reinfer-cuda/cuda"]
+cuda = ["dep:reinfer-cuda", "reinfer-cuda/cuda"]
 ascend = ["dep:reinfer-ascend", "reinfer-ascend/ascend"]
 
 [lints]

@@ -4,6 +4,7 @@
 **/*.tune.json
 .env
 .env.*
+!.env.example
 profiler/
 .idea/
 .vscode/

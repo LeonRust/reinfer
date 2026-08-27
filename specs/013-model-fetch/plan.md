@@ -64,6 +64,8 @@ impl ModelResolver {
 | `REINFER_MODEL_DIR` | 路径 | `~/models/reinfer/` | 下载/查找根 |
 | `REINFER_MODEL_VERIFY` | `sha256`/`size`/`none` | `sha256` | 见 D6 矩阵 |
 | `REINFER_MODEL_AUTODOWNLOAD` | `on`/`off` | `on` | off=绝不联网（缺模型报错） |
+| `REINFER_MODEL_REPO` | `owner/model` | （空） | CLI/env 便捷注入（ModelSpec 缺省来源；与 CLI 参数冲突时 CLI 优先）——配置可携带真名，代码零硬编码不变 |
+| `REINFER_MODEL_QUANT` / `REINFER_MODEL_FILE` | 量化段 / 精确名 | （空） | 同上；FILE 优先于 QUANT |
 | 代理 | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` | 标准 | 出口（不硬编码用户代理 IP） |
 
 ## Risk Assessment

@@ -44,5 +44,6 @@ Single source of discipline = CONSTITUTION.md §6.4 (not duplicated here). Revie
 - `specs/006-cuda-perf/` — FA3/CUTLASS vendor tier + CUDA graph (arch-tiered llama.cpp-CUDA gate)
 - `specs/007-core-inference/` — 🔒 to write (CPU full-path loop; carrier for 005 `--backend cpu` and GPU-less CI)
 - `specs/008-ci-infra/` — CI artifacts contract (jobs / runners / `#[ignore]` matrix / bench gates) — spec ready
+- `specs/011-ascend-l0-mirror/` — Ascend L0 mirror acceptance (same capability set as CUDA L1; symmetry matrix, gaps, diff notes)
 - Parity matrix — [`specs/000-project-mvp/parity.md`](../specs/000-project-mvp/parity.md)
 - `specs/009-cuda-runtime-base/` — L1: device/stream/event/buffer wrappers (003 T2 展开, per docs/design/cuda-phase-plan.md)

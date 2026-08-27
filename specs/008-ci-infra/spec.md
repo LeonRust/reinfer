@@ -1,7 +1,7 @@
 # Spec: CI infrastructure (工件与门禁载体)
 
 > Status: proposal · Owner: maintainers · Created: 2026-08-25 · Review demand: docs/design/review-2026-08-25.md §二/12（"CI 工件不存在"）
-> 引用方：specs/003（差分/parity/3×CPU 门禁）、005（一致性套件/吞吐记录）、006（perf 门禁/baseline）、004（golden 重建任务）、002（ASC 三档）
+> 引用方：specs/003（差分/parity/3×CPU 门禁）、005（一致性套件/吞吐记录）、006（perf 门禁/baseline）、004（golden 重建任务）、002（ASC 三档）、**009（L1 真机 smoke，2026-08-27 接线）**
 
 ## Problem Statement
 

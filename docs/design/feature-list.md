@@ -1,6 +1,6 @@
 # reinfer Implementation Feature List
 
-> Living document · Last updated: 2026-08-25
+> Living document · Last updated: 2026-08-27
 > Rules: constitution §6.4 (SDD) — every feature must have a spec anchor; a feature without one needs a new `specs/NNN-*` first.
 > Upstream facts as of 2026-08-25: CANN 8.5.0 symbols verified (cann-rs `docs/cann-850-catalog.md`); cann-rs L0 **implemented** (cann-sys `5c17e9e`, cann `825a792`); L1 (aclnn/GE) SDD docs landed (`88a3cf4`), code pending.
 
@@ -30,7 +30,7 @@
 
 | ID | Feature | Notes |
 |---|---|---|
-| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop) — spec ready |
+| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | ✅ `specs/003-cuda-l0` (single-request GPU loop)；L1 wrappers 展开锚 `specs/009-cuda-runtime-base` — spec ready |
 | P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | included in 003 T9; policy-side is ours (boundary §4) |
 | P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | ✅ `specs/005-scheduler-serving` |
 | P1-04 | CUDA graph bucket capture + stream overlap | ✅ `specs/006-cuda-perf` (FA3 vendor cubin optional) |

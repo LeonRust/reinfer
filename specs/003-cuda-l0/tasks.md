@@ -7,10 +7,9 @@
 - `cudarc` optional workspace dep；feature `cuda` 门控（`crates/cuda` + `bin/reinfer` 转发）；`.gitignore` 加 jit 缓存目录
 - Verification: 无 toolkit `cargo check --workspace` 绿；GPU 机 `cargo check --features cuda` 绿
 
-## T2: Device/Stream/Event/Buffer wrappers
+## T2: Device/Stream/Event/Buffer wrappers（已展开为 specs/009-cuda-runtime-base）
 
-- `CudaContext`（设备数/set per thread）、`CudaStream`、`CudaEvent`、`CudaBuffer`(Send)、`HostBuffer`(pinned)、memcpy
-- Verification: 无 GPU 单测（构造/Debug/错误映射）；GPU smoke（alloc/free/copy roundtrip）
+- 本行保留为指针：功能/验收/测试清单以 **specs/009**（T1-T6）为准，不再重复。
 
 ## T3: Error mapping (whitelist)
 

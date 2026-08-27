@@ -14,7 +14,7 @@
 
 ## 阶段与验收（阶段口径 = 编译绿 + 无GPU单测绿 + 真机 smoke/差分；L3 收尾 = 003 三层门禁）
 
-### L1 设备基座（003 T2）
+### L1 设备基座 —— 已展开为 `specs/009-cuda-runtime-base`（功能与验收以 009 spec 为准；003 T2 为指针；评审见 docs/design/review-cuda-l1-2026-08-27.md）
 功能：`CudaContext`（设备发现/算力/版本）、`Stream`、`Event`、`DeviceBuffer(Send)`、`HostBuffer`、memcpy（D2H/H2D/D2D），错误走 T3 `map_err`。
 验收：真机 smoke —— 设备列表/alloc+copy 往返/事件同步；无 GPU 单测（构造/Debug）。
 提交：`feat(cuda): add device, stream and buffer wrappers`。

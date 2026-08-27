@@ -28,7 +28,7 @@ reinfer 尚无 GPU 路径。P1 需在 NVIDIA 上证明引擎假设：**GGUF → 
 ## Acceptance Criteria
 
 - [ ] 默认构建零 CUDA 依赖（feature `cuda` 门控；无 toolkit 也能 `cargo check --workspace`）
-- [ ] `crates/cuda`：Context、Device、Stream、Event、DeviceBuffer(+Send)、HostBuffer、memcpy；`cudaError→LaunchError` 白名单（内存→Oom/context 类→Driver/其余→Fatal，fail-closed；锚=002/plan 错误映射表）
+- [ ] `crates/cuda`：L1 运行时 wrappers（设备/流/事件/缓冲/拷贝）——**功能与验收以 specs/009 为准**（本 spec 不再重复列举）；`cudaError→LaunchError` 白名单（内存→Oom/context 类→Driver/其余→Fatal，fail-closed；锚=002/plan 错误映射表）
 - [ ] JitCache v1（细节见 plan/tasks）：源码经运行时编译，缓存键含源码+头闭包+gencode/flags+nvcc 版本，原子写入；nvcc 缺失→专用错误，不静默降级；`REINFER_CUDA_ARCH` 支持无 GPU 预烘焙
 - [ ] kernel 集：RMSNorm、RoPE、masked softmax、Q8_0/F16 解量化、GQA paged decode attention、**sampler（softmax+gumbel+argmax，纯函数 RNG）**——每 kernel 有 CPU 参考 + 差分测试
 - [ ] GEMM 走厂商加速库；prefill 注意力采用分块/低内存路径（厂商 FMHA 为 006，本切片可为两段 GEMM，须在 notes 声明与 referee 的差异）

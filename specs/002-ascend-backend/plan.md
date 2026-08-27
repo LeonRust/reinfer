@@ -33,7 +33,7 @@ pub struct Stream;                                  // aclrtCreateStream / aclrt
 pub struct Event;                                   // aclrtCreateEvent / Record / Synchronize / Destroy
 
 // ---- memory (device + pinned host) ----
-pub struct DeviceBuffer { /* internal ptr + size */ }
+pub struct DeviceBuffer { /* internal ptr + size */ }   // impl Send — 决策锚: cann-rs docs/specs/0001-l0-runtime/plan.md；仅限归属 device 使用
 impl DeviceBuffer {
     pub fn alloc(size: usize) -> Result<Self, Error>;           // aclrtMalloc
     pub fn as_ptr(&self) -> *const u8;

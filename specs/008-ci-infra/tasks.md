@@ -22,9 +22,9 @@
 - 约定文档（plan D3）+ 映射表 == gpu.yml job 名；白名单例外评审留痕
 - Verification: 新 ignore 测试无映射 → check 失败；映射正确 → 通过
 
-## T5: 调用方接线（003/004/005/006/002 引用收敛）
+## T5: 调用方接线（003/004/005/006/002/009 引用收敛）
 
-- 各 spec 中"job/runner/label"表述改为引用 008（删除自造叙述）；feature-list ASC-05 状态改"✅ specs/008 定义"
+- 各 spec 中"job/runner/label"表述改为引用 008（删除自造叙述）；feature-list ASC-05 状态改"✅ specs/008 定义"；**009 的 L1 smoke 已入 D5 接线表（`smoke` 行）**
 - Verification: grep 无残留的自定义 CI 叙述；008 接线表为上（specs 引 008）
 
 ## T6: Runner 规范文档 + 缓存恢复

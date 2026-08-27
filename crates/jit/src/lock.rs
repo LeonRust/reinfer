@@ -68,6 +68,7 @@ pub(crate) fn lock_with(
     let path = lock_path(cache_dir, key)?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&path)
         .map_err(|e| fs_err(&e))?;
@@ -87,6 +88,7 @@ pub(crate) fn lock_with(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
     use super::*;
 
     fn cache_dir(tag: &str) -> PathBuf {

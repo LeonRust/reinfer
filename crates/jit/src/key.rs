@@ -49,9 +49,9 @@ impl JitKey {
         push(&mut b, tc.ccbin.0.to_string_lossy().as_bytes());
         push(&mut b, tc.ccbin.1.as_bytes());
         // 目标三元组：cargo 注入（部分工具链未设）→ 平台常量拼接兜底
-        let host = option_env!("TARGET").map(str::to_string).unwrap_or_else(|| {
-            format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
-        });
+        let host = option_env!("TARGET")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS));
         push(&mut b, host.as_bytes());
         Self(Sha256::digest(&b).into())
     }
@@ -86,6 +86,7 @@ fn push(buf: &mut Vec<u8>, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
     use super::*;
     use std::path::PathBuf;
 
@@ -125,10 +126,8 @@ mod tests {
             &src("k", "srcv2", vec![header("a.h", b"A")], vec!["-DNDEBUG".into()]),
             &toolchain(),
         );
-        let k2 = JitKey::new(
-            &base,
-            &ToolchainId { ver_line: "release 13.0".into(), ..toolchain() },
-        );
+        let k2 =
+            JitKey::new(&base, &ToolchainId { ver_line: "release 13.0".into(), ..toolchain() });
         assert_ne!(k0, k1); // 源码变
         assert_ne!(k0, k2); // 工具链变
         assert_eq!(JitKey::new(&base, &toolchain()), k0); // 稳定
@@ -136,8 +135,10 @@ mod tests {
 
     #[test]
     fn path_free_same_content_same_key() {
-        let a = src("k", "src", vec![header("/a/foo.h", b"ABC"), header("/b/bar.h", b"DEF")], vec![]);
-        let b = src("k", "src", vec![header("/x/bar.h", b"DEF"), header("/y/foo.h", b"ABC")], vec![]);
+        let a =
+            src("k", "src", vec![header("/a/foo.h", b"ABC"), header("/b/bar.h", b"DEF")], vec![]);
+        let b =
+            src("k", "src", vec![header("/x/bar.h", b"DEF"), header("/y/foo.h", b"ABC")], vec![]);
         assert_eq!(JitKey::new(&a, &toolchain()), JitKey::new(&b, &toolchain()));
     }
 

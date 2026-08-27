@@ -5,11 +5,11 @@
 //! 原子性：`.cubin` 与 meta 均同目录 temp+rename；**meta 为提交点**；
 //! `try_load` 校验产物存在、大小与 sha256 与 meta 一致，否则 miss。
 
+use crate::JitKey;
 use crate::error::fs_err;
 use crate::lock::{self, JitLockGuard};
-use crate::meta::{cubin_path, meta_path, JLibMeta, read_meta, write_meta};
+use crate::meta::{JLibMeta, cubin_path, meta_path, read_meta, write_meta};
 use crate::types::KernelSource;
-use crate::JitKey;
 use reinfer_kernels::LaunchError;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -112,7 +112,8 @@ impl JitCache {
         if let Some(hit) = self.try_load(key)? {
             return Ok(hit); // 双检：他人已构建
         }
-        let _ = self.remove(key, &guard)?; // 清理上次失败/损坏残留
+        // 清理上次失败/损坏残留（失败不阻断编译——store 将覆盖）
+        let _ = self.remove(key, &guard);
         let bytes = compile()?; // 失败 → 携带编译错误上抛（B2 附 nvcc stderr 尾）
         let meta = JLibMeta {
             key: *key,
@@ -164,11 +165,7 @@ fn clean_stale_temps(dir: &Path) -> Result<(), LaunchError> {
             if !name.starts_with('.') || !name.contains(".tmp.") {
                 continue;
             }
-            let stale = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .map(|t| t < cutoff)
-                .unwrap_or(true);
+            let stale = e.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(true);
             if stale {
                 let _ = std::fs::remove_file(e.path());
             }
@@ -179,28 +176,23 @@ fn clean_stale_temps(dir: &Path) -> Result<(), LaunchError> {
 
 /// 时间戳（秒；仅诊断）。
 pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// 从 flags 提取 gencode 段（meta 记录，诊断/跨设备核对）。
 fn extract_gencode(flags: &[String]) -> Vec<String> {
-    flags
-        .iter()
-        .filter(|f| f.starts_with("-gencode") || f.contains("arch="))
-        .cloned()
-        .collect()
+    flags.iter().filter(|f| f.starts_with("-gencode") || f.contains("arch=")).cloned().collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败；仓库惯例 expect/是否弃用
     use super::*;
     use crate::key::JitKey;
 
     fn cache(tag: &str) -> JitCache {
-        let d = std::env::temp_dir().join(format!("reinfer-jit-cache-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("reinfer-jit-cache-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         JitCache::open(Some(d)).unwrap()
     }
@@ -260,18 +252,17 @@ mod tests {
 
     #[test]
     fn stale_temp_cleaned_on_open() {
-        let d = std::env::temp_dir().join(format!(
-            "reinfer-jit-cache-stale-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("reinfer-jit-cache-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("aa")).unwrap();
         let p = d.join("aa/..hidden.tmp.999");
         std::fs::write(&p, b"junk").unwrap();
         // 回拨 mtime 至 2 小时前（trigger stale 分支）
-        filetime::set_file_mtime(&p, filetime::FileTime::from_unix_time(
-            now_secs() as i64 - 7200, 0,
-        ))
+        filetime::set_file_mtime(
+            &p,
+            filetime::FileTime::from_unix_time(now_secs() as i64 - 7200, 0),
+        )
         .unwrap();
         let c = JitCache::open(Some(d.clone())).unwrap();
         assert!(!c.dir().join("aa/..hidden.tmp.999").exists());
@@ -285,10 +276,7 @@ mod tests {
         let bytes = b"abc";
         let mut m = meta(&k, bytes);
         m.size = 999;
-        assert!(matches!(
-            c.store(&k, &guard(&c, &k), bytes, &m),
-            Err(LaunchError::Fatal)
-        ));
+        assert!(matches!(c.store(&k, &guard(&c, &k), bytes, &m), Err(LaunchError::Fatal)));
     }
 
     fn kern_source() -> crate::KernelSource {

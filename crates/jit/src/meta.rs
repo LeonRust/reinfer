@@ -71,6 +71,7 @@ pub(crate) fn write_meta(dir: &Path, key: &JitKey, meta: &JLibMeta) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
     use super::*;
 
     fn dummy_key() -> JitKey {
@@ -103,10 +104,8 @@ mod tests {
 
     #[test]
     fn missing_is_none() {
-        let dir = std::env::temp_dir().join(format!(
-            "reinfer-jit-meta-none-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reinfer-jit-meta-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = dummy_key();
@@ -116,10 +115,8 @@ mod tests {
 
     #[test]
     fn corrupt_json_is_miss() {
-        let dir = std::env::temp_dir().join(format!(
-            "reinfer-jit-meta-corrupt-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reinfer-jit-meta-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = dummy_key();
@@ -130,10 +127,8 @@ mod tests {
 
     #[test]
     fn key_mismatch_is_miss() {
-        let dir = std::env::temp_dir().join(format!(
-            "reinfer-jit-meta-mismatch-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reinfer-jit-meta-mismatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = dummy_key();

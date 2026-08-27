@@ -71,19 +71,24 @@ pub(crate) fn validate_memref(
     }
 
     // 设备归属与跨设备策略
-    if let Some(d) = dst.dev
-        && d != policy.current_dev
-    {
-        return Err(LaunchError::Fatal);
-    }
-    if let Some(s) = src.dev
-        && s != policy.current_dev
-    {
-        return Err(LaunchError::Fatal);
-    }
-    if kind == D2D && !policy.allow_peer && dst.dev != src.dev {
-        // 同设备 D2D 保持快路径；跨设备在 T4 交由 peer 探测决定
-        return Err(LaunchError::Fatal);
+    if kind == D2D && policy.allow_peer {
+        // peer 模式：归属与跨设备交由 `cudaDeviceCanAccessPeer` 能力探测（T4 copy 内），
+        // 本层只负责方向与边界——009 评审 B#8。
+    } else {
+        if let Some(d) = dst.dev
+            && d != policy.current_dev
+        {
+            return Err(LaunchError::Fatal);
+        }
+        if let Some(s) = src.dev
+            && s != policy.current_dev
+        {
+            return Err(LaunchError::Fatal);
+        }
+        if kind == D2D && !policy.allow_peer && dst.dev != src.dev {
+            // 同设备 D2D 保持快路径；跨设备在本切片拒绝（allow_peer 未开）
+            return Err(LaunchError::Fatal);
+        }
     }
     Ok(())
 }
@@ -178,16 +183,27 @@ mod tests {
             )
             .is_err()
         );
-        // allow_peer 目前只对同设备组合有实际路径（T4 引入探测后跨设备放宽）
+        // peer 模式：跨设备在 validate 层放行（能力探测在 T4 copy 内）
         assert!(
             validate_memref(
                 MemcpyKind::D2D,
                 &end(0, 16, Some(CUR)),
-                &end(0, 16, Some(CUR)),
+                &end(0, 16, Some(OTHER)),
                 1,
                 &policy(true)
             )
             .is_ok()
+        );
+        // 同设备组合在 peer 模式同样放行
+        assert!(
+            validate_memref(
+                MemcpyKind::D2D,
+                &end(0, 16, Some(CUR)),
+                &end(0, 16, Some(OTHER)),
+                1,
+                &policy(false)
+            )
+            .is_err()
         );
     }
 

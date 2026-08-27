@@ -37,6 +37,10 @@ pub mod jit;
 #[cfg(feature = "cuda")]
 pub mod jit_provider;
 
+/// diff 内核（rms_norm/rope/masked_softmax；012 D2；feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod diff;
+
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;
 #[cfg(feature = "cuda")]

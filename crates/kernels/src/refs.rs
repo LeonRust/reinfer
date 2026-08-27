@@ -35,7 +35,9 @@ pub fn rope_ref(x: &[f32], half: usize, pos: u32, eta: f32) -> Vec<f32> {
     out
 }
 
-/// 单行 masked softmax：`mask[i] == false` 的位置 → `-inf`（两侧一致）。
+/// 单行 masked softmax：`mask[i] == false` 的位置输出 **0**（数学结果
+/// 等价于输入取 `-inf` 后 `exp→0`——GPU 侧同语义）；全无效行 → 全 0。
+/// 掩码位置 D6 规则：掩码一致即匹配（无效位都输出 0，不参与容差）。
 pub fn masked_softmax_ref(x: &[f32], mask: &[bool]) -> Vec<f32> {
     assert_eq!(x.len(), mask.len());
     let mut max_v = f32::NEG_INFINITY;
@@ -44,7 +46,7 @@ pub fn masked_softmax_ref(x: &[f32], mask: &[bool]) -> Vec<f32> {
             max_v = v;
         }
     }
-    let mut out = vec![f32::NEG_INFINITY; x.len()];
+    let mut out = vec![0.0f32; x.len()];
     if max_v.is_finite() {
         let mut sum = 0.0f32;
         for (i, (&v, &m)) in x.iter().zip(mask).enumerate() {
@@ -55,8 +57,8 @@ pub fn masked_softmax_ref(x: &[f32], mask: &[bool]) -> Vec<f32> {
             }
         }
         if sum > 0.0 {
-            for v in &mut out {
-                if v.is_finite() {
+            for (v, m) in out.iter_mut().zip(mask) {
+                if *m {
                     *v /= sum;
                 }
             }
@@ -98,12 +100,12 @@ mod tests {
     }
 
     #[test]
-    fn masked_softmax_invalid_is_neg_inf() {
+    fn masked_softmax_invalid_is_zero() {
         let x = [1.0f32, 2.0, 3.0, 4.0];
         let mask = [true, true, false, false];
         let out = masked_softmax_ref(&x, &mask);
-        assert_eq!(out[2], f32::NEG_INFINITY);
-        assert_eq!(out[3], f32::NEG_INFINITY);
+        assert_eq!(out[2], 0.0);
+        assert_eq!(out[3], 0.0);
         assert!(out[0] > 0.0 && out[1] > 0.0);
         assert!((out[0] + out[1] - 1.0).abs() < 1e-6);
     }
@@ -111,6 +113,6 @@ mod tests {
     #[test]
     fn masked_softmax_all_masked_row() {
         let out = masked_softmax_ref(&[1.0, 2.0], &[false, false]);
-        assert!(out.iter().all(|v| v == &f32::NEG_INFINITY));
+        assert!(out.iter().all(|v| *v == 0.0));
     }
 }

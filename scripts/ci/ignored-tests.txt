@@ -8,5 +8,8 @@ smoke::alloc_free_1000_no_leak                      # gpu.yml: smoke / npu.yml: 
 smoke::error_injection                              # gpu.yml: smoke / npu.yml: smoke (crates/ascend 同构镜像)
 jit_smoke::vec_add_diff_and_determinism             # gpu.yml: l2-jit
 jit_smoke::jit_cache_reload_budget                  # gpu.yml: l2-jit
+jit_smoke::diff_kernels_rms_norm                    # gpu.yml: l2-jit
+jit_smoke::diff_kernels_rope                        # gpu.yml: l2-jit
+jit_smoke::diff_kernels_softmax                     # gpu.yml: l2-jit
 
 

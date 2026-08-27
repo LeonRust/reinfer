@@ -64,7 +64,6 @@ impl Drop for CtxGuard {
 pub struct KernelFn(sys::CUfunction);
 
 /// 裸 cubin 库句柄（RAII：Drop → cuLibraryUnload）。
-#[derive(Debug)]
 pub struct JLib {
     lib: sys::CUlibrary,
     /// 持有代码字节至 unload（驱动卸载前保持合法引用）。
@@ -141,6 +140,12 @@ impl KernelFn {
     }
 }
 
+impl std::fmt::Debug for JLib {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JLib") // CUlibrary 裸指针不实现 Debug
+    }
+}
+
 impl JLib {}
 
 impl Drop for JLib {
@@ -200,6 +205,41 @@ pub unsafe fn launch_vec_add(
             0,
             cu_stream,
             args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    rc(r)
+}
+
+/// 行式 launch 原语（012 D2）：单 block；`args` 必须按 C3 实测纪律
+/// （局部变量取址）打包。**不建 guard**——调用方（diff.rs 各方法）已持有
+/// 当前线程的 `CtxGuard`。
+///
+/// # Safety
+/// - kernel 有效且 args 与内核签名一致；
+/// - 调用线程的 driver current context 已由调用方建立；
+/// - stream 有效。
+pub unsafe fn launch_row(
+    kernel: KernelFn,
+    stream: &CudaStream,
+    _dev: u32,
+    block: u32,
+    args: *mut *mut c_void,
+) -> Result<(), LaunchError> {
+    let cu_stream: sys::CUstream = stream.handle() as *mut c_void as sys::CUstream;
+    // SAFETY: 同 launch_vec_add 前提（context/stream/args 由调用方保证）。
+    let r = unsafe {
+        sys::cuLaunchKernel(
+            kernel.0,
+            1,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            cu_stream,
+            args,
             std::ptr::null_mut(),
         )
     };

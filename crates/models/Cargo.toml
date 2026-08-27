@@ -1,0 +1,18 @@
+[package]
+name = "reinfer-models"
+version = "0.1.0"
+edition = "2024"
+
+publish = false
+
+[dependencies]
+reinfer-kernels = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# 轻量同步 HTTP（默认 rustls——纯 Rust TLS、无 OpenSSL 系统依赖、无 async 运行时；
+# 自动读取标准 HTTP(S)_PROXY/NO_PROXY env）——013 决策
+ureq = "2"
+
+[lints]
+workspace = true

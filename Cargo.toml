@@ -12,6 +12,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 reinfer-core      = { path = "crates/core" }
 reinfer-gguf      = { path = "crates/gguf" }
+reinfer-tokenizer = { path = "crates/tokenizer" }
 reinfer-arch      = { path = "crates/arch" }
 reinfer-memory    = { path = "crates/memory" }
 reinfer-cache     = { path = "crates/cache" }

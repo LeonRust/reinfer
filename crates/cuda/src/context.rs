@@ -79,6 +79,16 @@ mod ffi_tests {
         let lens: Vec<usize> = parts.by_ref().map(|p| p.len()).collect();
         assert_eq!(lens, vec![8, 4, 4, 4, 12]);
         assert!(info.uuid.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        // 手动验证通道：--nocapture 可见（跑测试时加 -- --nocapture）
+        println!(
+            "[manual] device[{}] {} cc={}.{} mem={:.2} GiB uuid={}",
+            info.index,
+            info.name,
+            info.major,
+            info.minor,
+            info.total_mem as f64 / 1024.0 / 1024.0 / 1024.0,
+            info.uuid
+        );
         assert_eq!(CudaContext::current_device().expect("current_device"), DeviceId::new(0));
     }
 

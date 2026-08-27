@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿）；CLI 整体方案仍在与用户继续探讨；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
+> v2.3：doctor 章节定稿）；CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
 ## 1. 命令面

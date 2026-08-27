@@ -1,0 +1,52 @@
+# Spec: Model fetch — pure-Rust ModelScope downloader (reinfer model get)
+
+> Status: proposal · Owner: maintainers · Created: 2026-08-27
+> Parent/锚：phase-plan L3 前置（001/004 数据管道共用）· 铁律"模型一律 ModelScope 下载"
+> 契约实测基线：2026-08-27 经代理探测 ModelScope 公开 REST（见本文件"实测契约"）
+
+## Problem Statement
+
+模型获取必须满足：① 只从 ModelScope（魔搭）下载（铁律）；② **不引入 Python/外部 CLI**
+（项目 rust 优先——modelscope 官方 CLI 依赖 pip，明确排除）；③ 融入"单二进制"形态。
+ModelScope 公开仓库是纯 REST：官方 SDK/CLI 只是 HTTP 封装，故纯 Rust 客户端可行，
+落为 `reinfer model get/list` 子命令。
+
+## 实测契约（2026-08-27，代理 http://192.168.0.1:7890 实测 Qwen/Qwen2.5-0.5B-Instruct-GGUF）
+
+| 项 | 契约 |
+|---|---|
+| 文件清单 | `GET https://modelscope.cn/api/v1/models/{owner}/{model}/repo/files?Revision=master` → JSON `{Code:200, Data:{Files:[{Name, Path, Size, Sha256, IsLFS, Revision}]}}`；**Sha256 字段可直接用于校验** |
+| 下载入口 | `GET https://modelscope.cn/api/v1/models/{owner}/{model}/repo?Revision=master&FilePath={Path}`（Revision 可选）→ **302** 到 `https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/{sha[..2]}/{sha[2..4]}/{sha}?filename=...&auth_key=...`（瞬时签名）——**跟随重定向即可**（不自行拼 CDN URL；auth_key 有时效） |
+| LFS | 目标 GGUF `IsLFS=false`（真实 blob，直下即得）——契约注明；若未来 IsLFS=true → 列入 Non-Goal（git-lfs 域） |
+| 校验 | 下载文件 sha2-256 必须等于 files API 的 `Sha256`；否则删除重试一次 → 仍失败 `Fatal` |
+| 已知基准值（端到端测试锚点） | `qwen2.5-0.5b-instruct-q8_0.gguf`：size=675710816，sha256=`ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e` |
+| 代理 | 尊重标准 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 环境变量（与 git/curl 一致；用户机示例 `http://192.168.0.1:7890`）——HTTP 层不自行追加代理参数 |
+
+## User Stories
+
+1. 作为引擎作者：`reinfer model get Qwen/Qwen2.5-0.5B-Instruct-GGUF --file qwen2.5-0.5b-instruct-q8_0.gguf --to ~/models/reinfer/` —— 一个 Rust 二进制完成模型获取（无 pip、无 Python）。
+2. 作为维护者：下载结果带 sha256 校验与 manifest 留痕（换机复制/基准确认）。
+3. 作为 CI/复现者：无代理直连、有代理也通（标准 env）；校验失败宁可失败不静默。
+
+## Acceptance Criteria
+
+- [ ] `reinfer model list <repo>`：解析 files API → 打印 GGUF 文件（名/大小/sha256 前 16 位）
+- [ ] `reinfer model get <repo> --file <name> [--to <dir>]`：下载+sha256 校验+原子落盘+manifest 追加
+- [ ] 校验失败 → 重试一次 → `Fatal`（不静默、不留半成品 temp）
+- [ ] 网络/超时错误分类为可重试（一次）后 `Fatal`；磁盘满 → `Oom`
+- [ ] 端到端：真机下载 0.5B q8_0（675,710,816 B）校验通过（一次性人工验证，非日常 CI）
+- [ ] README/CLAUDE 增"模型获取"段；feature-list 状态更新
+
+## Non-Goals
+
+- 断点续传/分片（重试 + 原子写已覆盖小规模故障；超 1GB 文件后续可加 `Range`）
+- 私有/付费仓库（认证、SDK 式 token）与 `IsLFS=true` 的 git-lfs 拉取
+- Revision 非 master（SNAPSHOT 语义将来扩展）
+- 下载速度/并发镜像（对象存储多 CDN，v1 单 URL）
+
+## Constraints
+
+- 纯 Rust：HTTP 客户端选轻量同步 `ureq`（默认 rustls，无 OpenSSL 系统依赖、无 tokio）；`sha2`/`serde_json` workspace 已有
+- 原子落盘纪律沿用 jit：同目录 temp + rename；manifest 与 jit meta 一样"提交点"式
+- 单二进制：解析仍用 std（不引入 clap 等新命令依赖；参数形态见 plan）
+- 网络入口在用户机（本沙箱访问不了 modelscope；契约由代理实测钉死，端到端由用户机验证）

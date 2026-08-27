@@ -529,6 +529,10 @@ fn cmd_download(a: DownloadArgs, vlog: &Verbosity) -> i32 {
             return 1;
         }
     };
+    // 防御性去重（按名）：files API 偶发重复条目（APIdrift/列表两次）→ 进度双行、
+    // 重复下载；专业下载器均做 repo 条目去重（2026-08-28）。
+    entries.sort_by(|x, y| x.name.cmp(&y.name));
+    entries.dedup_by(|x, y| x.name == y.name);
     let targets = match pick_targets(&a, entries) {
         Ok(t) => t,
         Err(msg) => {

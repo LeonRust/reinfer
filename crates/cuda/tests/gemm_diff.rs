@@ -48,7 +48,7 @@ mod gpu {
         f32::from_bits(raw)
     }
 
-    fn upl(dev: u32, host: &[u8]) -> DeviceBuffer {
+    fn upl(_dev: u32, host: &[u8]) -> DeviceBuffer {
         let hb = HostBuffer::alloc(host.len()).unwrap();
         unsafe {
             std::ptr::copy_nonoverlapping(host.as_ptr(), hb.as_ptr() as *mut u8, host.len());
@@ -58,7 +58,7 @@ mod gpu {
         db
     }
 
-    fn d2h(dev: u32, bytes: usize) -> (DeviceBuffer, HostBuffer) {
+    fn d2h(_dev: u32, bytes: usize) -> (DeviceBuffer, HostBuffer) {
         let db = DeviceBuffer::alloc(DeviceId::new(0), bytes).unwrap();
         let hb = HostBuffer::alloc(bytes).unwrap();
         (db, hb)

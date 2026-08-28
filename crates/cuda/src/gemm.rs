@@ -18,7 +18,7 @@ use std::os::raw::c_int;
 
 /// 单个 GEMM 操作数（列主序 ld 语义与 cuBLAS 一致；行主序调用方自行
 /// 转置参数）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GpuMat {
     /// 设备指针（raw——所有权在调用方 DeviceBuffer）。
     pub ptr: *mut c_void,
@@ -33,6 +33,12 @@ pub struct GpuMat {
 pub struct Gemm {
     handle: blas::cublasHandle_t,
     dev: u32,
+}
+
+impl std::fmt::Debug for Gemm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gemm").field("dev", &self.dev).finish()
+    }
 }
 
 impl Gemm {
@@ -199,7 +205,7 @@ fn f16_bits(f: f32) -> u32 {
     let exp = ((bits >> 23) & 0xff) as i32;
     let man = bits & 0x7f_ffff;
     if exp == 0xff {
-        return sign | 0x7c00 | ((man >> 13) as u32 & 0x3ff); // inf/nan 截断
+        return sign | 0x7c00 | ((man >> 13) & 0x3ff); // inf/nan 截断
     }
     let half_exp = exp - 127 + 15;
     if half_exp <= 0 {
@@ -208,12 +214,12 @@ fn f16_bits(f: f32) -> u32 {
             return sign;
         }
         let subm = (man | 0x80_0000) >> (1 - half_exp + 13);
-        return sign | (subm as u32);
+        return sign | subm;
     }
     if half_exp >= 31 {
         return sign | 0x7c00;
     }
-    sign | ((half_exp as u32) << 10) | ((man >> 13) as u32)
+    sign | ((half_exp as u32) << 10) | (man >> 13)
 }
 
 /// cublasStatus → LaunchError（白名单：ALLOC_FAILED → Oom；其余 Fatal）。

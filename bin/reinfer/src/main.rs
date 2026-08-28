@@ -1012,9 +1012,6 @@ impl Progress {
         // 进度画 stderr（indicatif 默认）——stdout 只承载结果数据（摘要/JSON，机器面）。
         let mp = MultiProgress::new();
         mp.set_draw_target(indicatif::ProgressDrawTarget::stderr());
-        let style = ProgressStyle::with_template(PROG_TEMPLATE)
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("█░");
         let counter = mp.add(ProgressBar::new(0));
         counter.set_style(
             ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),

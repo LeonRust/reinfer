@@ -286,7 +286,7 @@ fn fetch_to_temp(
         // Content-Range: bytes {start}-{end}/{total}——按 curl/wget/hf 三家共识核对：
         // start != have（服务器对 Range 的理解偏移）→ hf 型截断重下（不被"假续传"污染）；
         // end+1 == total 且 total == have → 已完整（中断于 rename 前）→ 校验+rename。
-        let cr = resp.header("Content-Range").and_then(|v| parse_content_range(v));
+        let cr = resp.header("Content-Range").and_then(parse_content_range);
         match cr {
             // 起点不符（服务器 Range 理解偏移——curl/wget 均拒）→ hf 型截断重下
             Some((start, _end, _total)) if start != have => {

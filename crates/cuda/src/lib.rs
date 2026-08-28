@@ -47,6 +47,7 @@ pub mod diff;
 pub mod dequant;
 pub mod gemm;
 pub mod attention;
+pub mod decode;
 
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;

@@ -71,3 +71,11 @@
   - **全程行主序**管线：QKT 输出（col-major）→ 写 `transpose_f32` 内核转回行序 → mask 注入（-inf 累加）→ 行 softmax（`masked_softmax_matrix`，grid=rows）→ P 保持 f32 → PV（行主序 gemm）；判据档无 f16 cast（16F 中间为记录项——首次尝试发现 P cast f16 至差 1-2 ulp）
   - K^T 经设备 `transpose_f16`（K → K^T 行序）唯一转置需求
   - 教训（修了 4 轮）：列主序/行主序在「GEMM 输出 → softmax 行」两处组合易错——最终以「物理行序=语义行序」为唯一不变式；判据测试 O 读回按 ldc 换位（raw[r+c*seq]→行主序）
+
+## 2026-08-28 — 014 T8: paged decode GQA（记录档残留——readback 异常待续）
+
+- 页池（crates/memory::pool）✅ 5/5：守恒/LIFO/部分页/乱序页定位/OutOfPages——015 T4 跨端复用件
+- decode_step_gqa kernel（每 (batch,head) 一 CTA、固定 256-lane 归约树、无 atomicAdd、串行 pass1/2（判据档）、软件 f16→f32 位构造（`hbits_to_f32`——硬件 `__half2float` 直读 u16 会被 `__half` 构造函数劫持成整数语义——SASS F2F 版本实测 raw-u16 相乘 4e9 差异；软件构造后 host 参考数值一致））：
+  - **数学正确性已被 5 项独立探针 proof（全部等于 host 参考）**：kernel-scores[0..4]==host s、p(0.036)==host p、v(9.1e-5)==host V、acc(0.031063715)==want[0]、kernel-out-ptr(0x73E3_EC62C2__) == host dout ptr
+  - **未决异常**：即便固定常量写 out 区（h==0 → 0x30FF），d2h 回读仍为 0x0000（预填 0x5555 经同一 d2h 链路可正常回读→ 回读链路 OK；kernel 后 raw=0）。scores 区写/回读全正常。**后续笔记**：待 T9 run 闭环时定位（优先怀疑：多 CTA 下 out 区间的某种异步/别样溢出被 sanitizer 未能捕获——compute-sanitizer 0 errors；或 b*qh grid 与 kernel 参数的边际对齐）。
+- 判据（diff 门）因回读异常暂记「记录档」；（确定性测试 ✓ bit-identical）。

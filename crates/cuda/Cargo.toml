@@ -33,4 +33,5 @@ workspace = true
 
 [dev-dependencies]
 reinfer-gguf = { workspace = true }
+reinfer-memory = { workspace = true }
 serde_json = { workspace = true }

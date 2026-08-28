@@ -802,6 +802,13 @@ version = "0.1.0"
 [[package]]
 name = "reinfer-cpu"
 version = "0.1.0"
+dependencies = [
+ "reinfer-arch",
+ "reinfer-core",
+ "reinfer-gguf",
+ "reinfer-kernels",
+ "reinfer-tokenizer",
+]
 
 [[package]]
 name = "reinfer-cuda"
@@ -809,8 +816,11 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "reinfer-core",
+ "reinfer-gguf",
  "reinfer-jit",
  "reinfer-kernels",
+ "reinfer-memory",
+ "serde_json",
 ]
 
 [[package]]
@@ -819,6 +829,8 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "reinfer-kernels",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -881,6 +893,7 @@ name = "reinfer-tokenizer"
 version = "0.1.0"
 dependencies = [
  "reinfer-gguf",
+ "serde_json",
 ]
 
 [[package]]

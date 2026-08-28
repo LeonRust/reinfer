@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 publish = false
+
 [dependencies]
+reinfer-core = { workspace = true }
+reinfer-tokenizer = { workspace = true }
+reinfer-gguf = { workspace = true }
+reinfer-arch = { workspace = true }
+reinfer-kernels = { workspace = true }
 
 [lints]
 workspace = true

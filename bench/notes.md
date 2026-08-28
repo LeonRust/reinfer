@@ -79,3 +79,9 @@
   - **数学正确性已被 5 项独立探针 proof（全部等于 host 参考）**：kernel-scores[0..4]==host s、p(0.036)==host p、v(9.1e-5)==host V、acc(0.031063715)==want[0]、kernel-out-ptr(0x73E3_EC62C2__) == host dout ptr
   - **未决异常**：即便固定常量写 out 区（h==0 → 0x30FF），d2h 回读仍为 0x0000（预填 0x5555 经同一 d2h 链路可正常回读→ 回读链路 OK；kernel 后 raw=0）。scores 区写/回读全正常。**后续笔记**：待 T9 run 闭环时定位（优先怀疑：多 CTA 下 out 区间的某种异步/别样溢出被 sanitizer 未能捕获——compute-sanitizer 0 errors；或 b*qh grid 与 kernel 参数的边际对齐）。
 - 判据（diff 门）因回读异常暂记「记录档」；（确定性测试 ✓ bit-identical）。
+
+## 2026-08-28 — T9 CPU runner（进行中：数值 NaN 追查点）
+
+- crates/cpu 执行器已建：Model::load（Q8_0 blob 全量入内存 + row_bytes 行级访问（embed/logits：Q8_0 行=（d/32）×34）+ 层循环（RMSNorm/RoPE/GQA attention（kv_head=q_head/ratio 分组）/SwiGLU/残差）+ generate（temp=0 argmax 首个最大、EOS 停、`-n` 硬限、NaNLogits 显式错误、OOV 错误）——clippy 0 warnings
+- **数值 NaN 追查记录**：0.5B "Hello" 一步生成 → **NaNLogits 防呆触发（正确行为）**。llama.cpp（f280b2698）同模型同 prompt 输出正常 → 文件无 NaN。探针链定位：attn 输出 head 0-9 正常、**head 10+ 输出全 0**（softmax sum 0——scores NaN/全部 -inf 推理），残留因子列表：kv cache kh=1 段位置计算或 head 10 q/k 数据路径；**未决（下轮续查）**。注：CPU 计算已真实执行（11-28s 一轮），前端组件无缺失——纯数值范围问题。
+- 下一步（下轮）：head10 剖面（q/k 段 + kv_cache 写入 vs 读取位置一致）、随后 bin run 接线。

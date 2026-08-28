@@ -6,11 +6,54 @@
 //! 代码零硬编码不变）。
 
 use crate::api::{self, FileEntry};
-use crate::download::{Verify, download_file, local_hit, target_path};
+use crate::download::{MANIFEST, ManifestEntry, Verify, download_file, local_hit, target_path};
 use crate::hf::{hf_download_file, hf_list_files};
 use reinfer_kernels::LaunchError;
 use std::path::{Path, PathBuf};
 
+/// **旧扁平布局自动迁移**（2026-08-28；旧版 `root/{file}` + 根 `manifest.json` → 新版
+/// `root/{repo}/{file}` + per-repo manifest）。幂等：无旧根 manifest = 无操作。
+/// 旧 manifest 备份为 `.manifest.json.bak-{pid}`（不删，人工可回退）。
+pub fn migrate_legacy_flat(root: &Path) {
+    let old = root.join(MANIFEST);
+    let entries = crate::download::read_manifest(root);
+    if entries.is_empty() || !old.exists() {
+        return; // 已是新布局/无旧清单
+    }
+    let mut dst: std::collections::BTreeMap<String, Vec<ManifestEntry>> = Default::default();
+    for e in &entries {
+        let src = root.join(&e.name);
+        if src.is_file() {
+            let dir = root.join(&e.repo);
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let dst_path = dir.join(&e.name);
+                if !dst_path.exists() {
+                    let _ = std::fs::rename(&src, &dst_path);
+                } else {
+                    let _ = std::fs::remove_file(&src); // 新旧同目标 → 弃旧（新已就位）
+                }
+            }
+        }
+        dst.entry(e.repo.clone()).or_default().push(e.clone());
+    }
+    // 拆写 per-repo manifest
+    for (repo, items) in dst {
+        let dir = root.join(&repo);
+        let mut all = crate::download::read_manifest(&dir);
+        all.retain(|e| !items.iter().any(|i| i.name == e.name));
+        all.extend(items);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&all) {
+            let tmp = dir.join(format!(".{MANIFEST}.tmp-{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(tmp, dir.join(MANIFEST));
+            }
+        }
+    }
+    // 旧清单备份（保留人工可回退）
+    let _ = std::fs::rename(&old, root.join(format!(".{MANIFEST}.bak-{}", std::process::id())));
+}
+
+/// 用户主目录 env（平台惯例：Windows=USERPROFILE，Linux/macOS=HOME）。
 /// 用户主目录 env（平台惯例：Windows=USERPROFILE，Linux/macOS=HOME）。
 fn home_var() -> &'static str {
     if cfg!(windows) { "USERPROFILE" } else { "HOME" }
@@ -219,6 +262,8 @@ impl ModelResolver {
     }
 
     fn ensure_in(&self, spec: &ModelSpec, dir: &Path) -> Result<PathBuf, LaunchError> {
+        // 旧扁平布局自动迁移（升级前下载过的机器首跑即归位，无需重下）
+        migrate_legacy_flat(dir);
         // off 语义：只本地 glob（绝不联网）；unresolvable → 明确错误
         let name = match self.resolve_local_name(spec, dir)? {
             Some(n) => n,
@@ -441,6 +486,36 @@ mod tests {
         assert_eq!(ModelSource::parse("modelscope"), Some(ModelSource::Modelscope));
         assert_eq!(ModelSource::parse("huggingface"), Some(ModelSource::Huggingface));
         assert_eq!(ModelSource::parse("bogus"), None);
+    }
+
+    /// 旧扁平布局：根 manifest + 根下文件 → 迁移到 root/{repo}/（幂等、旧清单备份）。
+    #[test]
+    fn migrate_legacy_flat_layout() {
+        let root = std::env::temp_dir().join(format!("reinfer-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("m.gguf"), b"x").unwrap();
+        std::fs::write(root.join("t.json"), b"y").unwrap();
+        let old: Vec<serde_json::Value> = vec![
+            serde_json::json!({"name":"m.gguf","size":1,"sha256":null,"repo":"a/b","branch":"master","fetched_at":0}),
+            serde_json::json!({"name":"t.json","size":1,"sha256":null,"repo":"a/b","branch":"master","fetched_at":0}),
+        ];
+        std::fs::write(root.join("manifest.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        migrate_legacy_flat(&root);
+        assert!(root.join("a/b/m.gguf").exists());
+        assert!(root.join("a/b/t.json").exists());
+        assert!(!root.join("m.gguf").exists(), "旧根文件须迁移");
+        let man = crate::download::read_manifest(&root.join("a/b"));
+        assert_eq!(man.len(), 2);
+        // 旧清单备份 + 幂等
+        let backups: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".manifest.json.bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        migrate_legacy_flat(&root); // 再跑无操作不炸
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

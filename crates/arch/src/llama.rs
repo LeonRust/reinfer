@@ -171,7 +171,18 @@ pub fn from_gguf_meta(meta: &ModelMeta) -> Result<LlamaConfig, ArchError> {
     let n_layer = required_u32(meta, &key(architecture, "block_count"))? as usize;
     let hidden_size = required_u32(meta, &key(architecture, "embedding_length"))? as usize;
     let ffn_hidden = required_u32(meta, &key(architecture, "feed_forward_length"))? as usize;
-    let vocab_size = required_u32(meta, &key(architecture, "vocab_size"))? as usize;
+    // vocab_size 解析链（014 T1 增量——Qwen 官方 GGUF 省略 {arch}.vocab_size）：
+    // {arch}.vocab_size → tokenizer.ggml.tokens 数组长度 → MissingKey
+    // （llama.cpp 同款链路；真实档案无该键，见 specs/014 T1）
+    let vocab_size = match meta.meta_u32(&key(architecture, "vocab_size"))? {
+        Some(v) => v as usize,
+        None => meta
+            .meta_array_str("tokenizer.ggml.tokens")?
+            .map(|t| t.len())
+            .ok_or_else(|| ArchError::MissingKey {
+                key: key(architecture, "vocab_size"),
+            })?,
+    };
 
     let q_heads = required_u32(meta, &key(architecture, "attention.head_count"))? as usize;
     if q_heads == 0 {
@@ -371,7 +382,23 @@ mod tests {
 
     /// 用例①：缺 `{arch}.vocab_size` → 错误消息含键名。
     #[test]
-    fn missing_vocab_size_errors_with_key_name() {
+    fn missing_vocab_size_derives_from_tokens_array() {
+        // 014 T1：Qwen 官方 GGUF 省略 {arch}.vocab_size——须从 tokenizer.ggml.tokens
+        // 数组长度推断（llama.cpp 同款链路）。
+        let mut kvs: Vec<(String, MetaValue)> =
+            qwen2_kvs().into_iter().filter(|(k, _)| k != "qwen2.vocab_size").collect();
+        kvs.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::Array(reinfer_gguf::ArrayValue::Str(vec![
+                "a".into(), "b".into(), "c".into(),
+            ])),
+        ));
+        let cfg = from_gguf_meta(&meta(kvs)).unwrap();
+        assert_eq!(cfg.vocab_size, 3);
+    }
+
+    #[test]
+    fn missing_vocab_size_and_tokens_errors_with_key_name() {
         let kvs: Vec<(String, MetaValue)> =
             qwen2_kvs().into_iter().filter(|(k, _)| k != "qwen2.vocab_size").collect();
         let err = from_gguf_meta(&meta(kvs)).unwrap_err();

@@ -250,6 +250,13 @@ fn fetch_to_temp(
     }
     let mut have: u64 = file.metadata().map(|m| m.len()).unwrap_or(0);
 
+    // hf 型完成捷径：残件 == 期望大小 → 零请求直接校验+rename（对齐
+    // huggingface_hub `resume_size == expected_size` 分支；不依赖服务器）。
+    if have > 0 && entry.size > 0 && have == entry.size {
+        eprintln!("reinfer-models: {name}: part already complete - verifying");
+        return verify_and_rename(&mut file, &tmp, to_dir, name, verify, entry, progress);
+    }
+
     // ---- GET（Range 或全量）：单一请求同时实现"探测+续传"（wget -c 系）。 ----
     // 注意：MS resolve 端点不支持 HEAD（404——2026-08-27 实测），故不做 HEAD 预检；
     // 支持与否由响应状态号决定：206=支持续传；200=从头。
@@ -276,25 +283,32 @@ fn fetch_to_temp(
     }
     let is_206 = resp.status() == 206;
     if is_206 && have > 0 {
-        // Content-Range: bytes {have}-{end}/{total}——end+1==total 时残件已完整（上次中断于 rename 前）
-        let cr_total = resp
-            .header("Content-Range")
-            .and_then(|v| v.rsplit('/').next())
-            .and_then(|t| t.parse::<u64>().ok());
-        match cr_total {
-            Some(t) if t == have => {
-                eprintln!("reinfer-models: {name}: part already complete - verifying");
-                return verify_and_rename(
-                    &mut file, &tmp, to_dir, name, verify, entry, progress,
+        // Content-Range: bytes {start}-{end}/{total}——按 curl/wget/hf 三家共识核对：
+        // start != have（服务器对 Range 的理解偏移）→ hf 型截断重下（不被"假续传"污染）；
+        // end+1 == total 且 total == have → 已完整（中断于 rename 前）→ 校验+rename。
+        let cr = resp.header("Content-Range").and_then(|v| parse_content_range(v));
+        match cr {
+            // 起点不符（服务器 Range 理解偏移——curl/wget 均拒）→ hf 型截断重下
+            Some((start, _end, _total)) if start != have => {
+                eprintln!(
+                    "reinfer-models: {name}: Content-Range start {start} != resume {have} - restarting"
                 );
-            }
-            Some(t) if t < have => {
-                // 服务器内容变小 → 截断从头
-                eprintln!("reinfer-models: {name}: server content shrunk - restarting");
                 let _ = file.set_len(0);
                 have = 0;
             }
-            _ => {
+            // total == have（已完整：中断于 rename 前）
+            Some((_start, _end, total)) if total == have => {
+                eprintln!("reinfer-models: {name}: part already complete - verifying");
+                return verify_and_rename(&mut file, &tmp, to_dir, name, verify, entry, progress);
+            }
+            // 206 但无 Content-Range（异常）→ 截断重下
+            None => {
+                eprintln!("reinfer-models: {name}: 206 without Content-Range - restarting");
+                let _ = file.set_len(0);
+                have = 0;
+            }
+            // 正常续传
+            Some(_) => {
                 eprintln!(
                     "reinfer-models: resuming {name} at {} of {}",
                     human_dec(have),
@@ -303,6 +317,7 @@ fn fetch_to_temp(
             }
         }
     }
+    // 200（服务器忽略 Range——curl 报 RANGE_ERROR/hf 截断重下）：走下方 write_from 分支。
     let write_from = if have > 0 && !is_206 {
         // 服务器不支持 Range（或重定向丢 Range）→ 从头（截断 + 归位）
         eprintln!("reinfer-models: {name}: server did not honor Range - restarting download");
@@ -417,6 +432,17 @@ fn verify_and_rename(
     Ok(path)
 }
 
+/// 解析 `Content-Range: bytes {start}-{end}/{total}`（三段；total 可为 `*`）。
+fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim();
+    let body = v.strip_prefix("bytes ")?;
+    let (range, total) = body.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
+    let total = total.trim().parse().ok()?; // `*` 或异常 → None（caller 按降级处理）
+    Some((start, end, total))
+}
+
 /// 人类可读大小（续传日志用；与进度条 human_dec 语义对齐）。
 fn human_dec(b: u64) -> String {
     if b >= 1_000_000_000 {
@@ -449,6 +475,7 @@ mod tests {
     #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
     use super::*;
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     /// stub 响应：状态码 + 体 + 附加响应头（如 ETag）。
     type StubResp = (u16, String, Vec<(String, String)>);
@@ -747,6 +774,69 @@ mod tests {
         assert_eq!(gotb.len(), 200);
         assert_eq!(gotb[..100], part[..]);
         assert_eq!(gotb[100..], tail[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(stub);
+        j.join().unwrap();
+    }
+
+    /// 完成捷径（hf 型）：残件 == 期望大小 → 零网络请求直接校验+rename。
+    #[test]
+    fn part_complete_shortcut_no_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::clone(&hits);
+        let (stub, j) = Stub::spawn(move |_req| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            (200, "x".to_string(), vec![])
+        });
+        let dir = tmpdir("shortcut");
+        let body: Vec<u8> = b"0123456789".repeat(20); // 200 B
+        std::fs::write(dir.join(".m.gguf.reinfer-part"), &body).unwrap();
+        let entry = FileEntry {
+            name: "m.gguf".into(),
+            size: body.len() as u64,
+            sha256: Some(sha256_hex(&body)),
+            is_lfs: false,
+        };
+        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+            .unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), body);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "完成捷径不得发请求");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(stub);
+        j.join().unwrap();
+    }
+
+    /// 206 但 Content-Range 起点 != 断点（curl/wget 均拒）→ hf 型截断重下。
+    #[test]
+    fn content_range_start_mismatch_restarts() {
+        let full: Vec<u8> = b"0123456789".repeat(20); // 200 B
+        let expect = full.clone(); // 外层断言/entry 用（闭包 move 捕获 full）
+        let full2 = full.clone();
+        let (stub, j) = Stub::spawn(move |req| {
+            if req.contains("Range: bytes=100-") {
+                // 服务器"误解"：起点 50（≠断点 100）
+                (
+                    206,
+                    String::from_utf8(full2.clone()).unwrap(),
+                    vec![("Content-Range".into(), "bytes 50-199/200".into())],
+                )
+            } else {
+                (200, String::from_utf8(full.clone()).unwrap(), vec![])
+            }
+        });
+        let dir = tmpdir("crstart");
+        std::fs::write(dir.join(".m.gguf.reinfer-part"), b"0".repeat(100)).unwrap();
+        let entry = FileEntry {
+            name: "m.gguf".into(),
+            size: 200,
+            sha256: Some(sha256_hex(&expect)),
+            is_lfs: false,
+        };
+        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+            .unwrap();
+        // 截断重下成功（起点不符→set_len(0)+从头写全量）
+        assert_eq!(std::fs::read(&got).unwrap(), expect);
         let _ = std::fs::remove_dir_all(&dir);
         drop(stub);
         j.join().unwrap();

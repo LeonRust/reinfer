@@ -8,6 +8,10 @@ reinfer-core = { workspace = true }
 reinfer-cuda = { workspace = true, optional = true }   # 昇腾/纯 CPU 机不拉 cudarc（无 CUDA 工具链可构建）
 reinfer-jit = { workspace = true }        # doctor：nvcc 工具链探测（toolchain.rs 复用）
 reinfer-models = { workspace = true }
+reinfer-arch = { workspace = true }       # run：config.json → LlamaConfig
+reinfer-tokenizer = { workspace = true }  # run：tokenizer.json → BPE
+reinfer-safetensors = { workspace = true } # run：模型文件读取（权重组经 cuda engine）
+reinfer-samplers = { workspace = true }   # run：采样链（llm-samplers 薄封装）
 reinfer-ascend = { workspace = true, optional = true }
 dotenvy = { workspace = true }   # 启动读取 .env（开发测试环境；无文件静默跳过）
 clap = { version = "4", features = ["derive"] }   # CLI 解析（契约 v2.5 定稿：clap derive）
@@ -16,6 +20,11 @@ serde_json = { workspace = true }                 # --format json 输出（契�
 fs2 = { workspace = true }                        # doctor 磁盘余量（statvfs 语义；无新系统依赖）
 libc = "0.2"
 indicatif = "0.18"   # 进度条渲染（2026-08-27 用户定：成熟三方库替代自研 ANSI；语义仍按契约 §4 映射）                                      # TTY 进度模式 Ctrl-C：补 \n 后退出（契约 §4）
+minijinja = { version = "2.24.0", features = ["serde"] }
+axum = { version = "0.8.9", features = ["json", "macros"] }
+tokio = { version = "1.53.1", features = ["full"] }
+rand = "0.10.2"
+tokio-stream = "0.1.19"
 
 [features]
 default = []

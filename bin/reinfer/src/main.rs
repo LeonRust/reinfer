@@ -13,6 +13,9 @@
 //! `-q` 是 quant（quiet 仅 `--format quiet`/`--quiet` 长旗）；`--` 分隔（dash 开头文件名）。
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+
+mod pipeline;
+mod serve;
 use reinfer_models::api::FileEntry;
 use reinfer_models::download::{MANIFEST, Verify, local_hit, read_manifest, target_path};
 use reinfer_models::{LaunchError, ModelResolver, ModelSource, ModelSpec};
@@ -70,6 +73,7 @@ enum Backend {
     Auto,
     Cuda,
     Ascend,
+    Cpu,
 }
 
 impl FromStr for Backend {
@@ -79,7 +83,8 @@ impl FromStr for Backend {
             "auto" => Ok(Self::Auto),
             "cuda" => Ok(Self::Cuda),
             "ascend" => Ok(Self::Ascend),
-            other => Err(format!("unknown backend '{other}' (auto|cuda|ascend)")),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(format!("unknown backend '{other}' (auto|cuda|ascend|cpu)")),
         }
     }
 }
@@ -142,6 +147,10 @@ enum Cmd {
         #[command(subcommand)]
         sub: ModelCmd,
     },
+    /// Single-shot generate (contract v2.2/v2.15 promt run)
+    Run(RunArgs),
+    /// OpenAI-compatible HTTP service (contract v2.1/v2.5; axum)
+    Serve(serve::ServeArgs),
     /// Generate shell completion scripts (bash | zsh | fish)
     Completions(CompletionsArgs),
     /// Environment doctor (flutter/cargo doctor style)
@@ -229,6 +238,53 @@ struct CompletionsArgs {
     /// Target shell
     #[arg(value_enum)]
     shell: ShellKind,
+}
+
+/// `run` 参数（契约 v2.2 + v2.15 `--backend`）。
+#[derive(Args, Debug)]
+struct RunArgs {
+    /// Model repo (owner/model) or local model directory
+    model: String,
+
+    /// Backend (auto|cuda|ascend|cpu)
+    #[arg(long = "backend", value_name = "BACKEND", value_parser = Backend::from_str, default_value = "auto")]
+    backend: Backend,
+
+    /// Max new tokens (hard cap)
+    #[arg(short = 'n', value_name = "MAX_TOKENS", default_value_t = 256)]
+    max_tokens: u32,
+
+    /// Sampling temperature (0 = greedy; OpenAI default 1.0)
+    #[arg(short = 't', value_name = "TEMP", default_value_t = 1.0)]
+    temperature: f32,
+
+    /// Top-k truncation (default: off)
+    #[arg(long = "top-k", value_name = "K")]
+    top_k: Option<usize>,
+
+    /// Top-p nucleus sampling (default: off)
+    #[arg(long = "top-p", value_name = "P")]
+    top_p: Option<f32>,
+
+    /// Repeat penalty (>1.0 disables repetition loops; e.g. 1.1)
+    #[arg(long = "repeat-penalty", value_name = "PENALTY")]
+    repeat_penalty: Option<f32>,
+
+    /// RNG seed (deterministic chain when set)
+    #[arg(long = "seed", value_name = "SEED")]
+    seed: Option<u64>,
+
+    /// Wrap prompt with the model chat template (tokenizer_config chat_template)
+    #[arg(long = "chat")]
+    chat: bool,
+
+    /// Effective context window (defaults to model max_position_embeddings)
+    #[arg(long = "max-model-len", value_name = "N")]
+    max_model_len: Option<usize>,
+
+    /// Prompt remainder (space-joined); when absent, reads stdin
+    #[arg(trailing_var_arg = true)]
+    prompt: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -343,6 +399,19 @@ fn run(cli: Cli) -> i32 {
         Cmd::Model { sub } => match sub {
             ModelCmd::List(a) => cmd_list_local(a, &vlog),
         },
+        Cmd::Run(a) => cmd_run(a, &vlog),
+        Cmd::Serve(a) => {
+            #[cfg(feature = "cuda")]
+            {
+                serve::run_sync(a, &vlog)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = a;
+                eprintln!("reinfer: serve 需要带 `--features cuda` 编译（当前构建未启用）");
+                2
+            }
+        }
         Cmd::Completions(a) => cmd_completions(a),
         Cmd::Doctor(a) => {
             if a.is_help_form() {
@@ -368,6 +437,259 @@ fn print_leaf_help(cmd_name: &str) {
 // ---------------------------------------------------------------------------
 
 /// completions <bash|zsh|fish>：clap_complete 生成（契约 v2.4；stdout，可 source 进配置）。
+/// `run` 命令（契约 v2.2/v2.15）：单次生成（流式 stdout，stats 走 stderr）。
+///
+/// 模型解析：位置参数为本地目录（含 config.json）或 repo 名
+/// （在 `REINFER_MODEL_DIR/<repo>` 下寻找）；本地缺失 → 提示 download（不隐式联网）。
+#[allow(unused_variables, dead_code)] // no-cuda 构建：cuda 分支变量/函数未用
+fn cmd_run(a: RunArgs, vlog: &Verbosity) -> i32 {
+    let dir = resolve_model_dir(&a.model);
+    let Ok(dir) = dir else {
+        return 2;
+    };
+    let t0 = std::time::Instant::now();
+    let cfg_val: serde_json::Value = match std::fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("reinfer: config.json missing or unreadable in {dir:?}");
+            return 2;
+        }
+    };
+    let cfg = match reinfer_arch::llama::from_hf_config(&cfg_val) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("reinfer: config.json: {e}");
+            return 2;
+        }
+    };
+    let max_len = a.max_model_len.unwrap_or(cfg.ctx_len);
+    let eos = cfg.eos_id;
+
+    match a.backend {
+        Backend::Ascend => {
+            eprintln!("reinfer: backend=ascend not implemented yet (015 立项后接线)");
+            return 2;
+        }
+        Backend::Cpu => {
+            eprintln!("reinfer: backend=cpu not implemented yet (007 立项后接线; cuda first per user)");
+            return 2;
+        }
+        Backend::Cuda | Backend::Auto => {
+            #[cfg(not(feature = "cuda"))]
+            {
+                // no-cuda 构建语义：显式/探测到 cuda 都给出构建指引（不静默降级）
+                eprintln!(
+                    "reinfer: backend=cuda 需要带 `--features cuda` 编译的二进制（当前构建未启用；                     pure-cpu 机请等 007 后端）"
+                );
+                return 2;
+            }
+            #[cfg(feature = "cuda")]
+            {
+                cmd_run_cuda(a, &cfg, max_len, eos, dir, t0, vlog)
+            }
+        }
+    }
+}
+
+/// 渲染模型 chat 模板（tokenizer_config.json 的 `chat_template`；minijinja）。
+/// 返回 Ok(None) = 无模板；Err = 渲染失败（调用方回退原始 prompt）。
+#[cfg(feature = "cuda")]
+fn render_chat_template(
+    dir: &std::path::Path,
+    user_text: &str,
+) -> Result<Option<String>, String> {
+    let tcfg: serde_json::Value = std::fs::read(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let template = tcfg
+        .get("chat_template")
+        .and_then(|v| v.as_str())
+        .ok_or("no chat_template")?
+        .to_string();
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    let tmpl = env.template_from_str(&template).map_err(|e| format!("jinja parse: {e}"))?;
+    let rendered = tmpl
+        .render(minijinja::value::Value::from_serialize(&serde_json::json!({
+            "messages": [{ "role": "user", "content": user_text }],
+            "generation": false
+        })))
+        .map_err(|e| format!("jinja render: {e}"))?;
+    Ok(Some(rendered))
+}
+
+/// 模型目录解析（本地路径优先；repo 名 → `$REINFER_MODEL_DIR/<repo>`）。
+pub(crate) fn resolve_model_dir(model: &str) -> Result<std::path::PathBuf, ()> {
+    let p = std::path::Path::new(model);
+    if p.is_dir() || (p.join("config.json").is_file()) {
+        return Ok(p.to_path_buf());
+    }
+    let resolver = reinfer_models::ModelResolver::from_env().map_err(|e| {
+        eprintln!("reinfer: resolver: {e}");
+    })?;
+    let repo_dir = reinfer_models::download::repo_dir(&resolver.dir, model);
+    if repo_dir.join("config.json").is_file() {
+        return Ok(repo_dir);
+    }
+    eprintln!(
+        "reinfer: model not found locally: {model:?} (tried {repo_dir:?})
+         hint: run `reinfer download {model}` first (或设 REINFER_MODEL_DIR; 本地目录亦可直接传路径)"
+    );
+    Err(())
+}
+
+/// CUDA 后端执行（feature `cuda` 门控）。
+#[cfg(feature = "cuda")]
+fn cmd_run_cuda(
+    a: RunArgs,
+    cfg: &reinfer_arch::llama::LlamaConfig,
+    max_len: usize,
+    eos: Option<u32>,
+    dir: std::path::PathBuf,
+    t0: std::time::Instant,
+    vlog: &Verbosity,
+) -> i32 {
+    use reinfer_core::DeviceId;
+    use reinfer_cuda::engine::Engine;
+    use reinfer_cuda::{CudaContext, CudaStream};
+
+    let ctx = match CudaContext::init(DeviceId::new(0)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("reinfer: cuda init: {e}");
+            return 2;
+        }
+    };
+    let _stream = CudaStream::new(ctx.device_id()).expect("stream");
+    let arch = reinfer_cuda::arch::resolve_arch().expect("arch");
+    if vlog.at(1) {
+        eprintln!("reinfer: cuda backend arch={arch}");
+    }
+    let cache = std::env::temp_dir().join("reinfer-jit-dense");
+    let mut engine = match Engine::load(
+        ctx.device_id(),
+        &arch,
+        Some(cache),
+        &dir,
+        max_len,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("reinfer: engine load: {e}");
+            return 2;
+        }
+    };
+    eprintln!(
+        "reinfer: 模型装载完成 ({}ms, {} 层, ctx={max_len})",
+        t0.elapsed().as_millis(),
+        cfg.n_layer,
+    );
+
+    // tokenizer（HF tokenizer.json）
+    let tok_val: serde_json::Value = match std::fs::read(dir.join("tokenizer.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("reinfer: tokenizer.json missing or unreadable");
+            return 2;
+        }
+    };
+    let tcfg_val: serde_json::Value = std::fs::read(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let tokenizer = match reinfer_tokenizer::Tokenizer::from_hf_json(&tok_val, &tcfg_val) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reinfer: tokenizer: {e}");
+            return 2;
+        }
+    };
+
+    let prompt = if a.prompt.is_empty() {
+        let mut buf = String::new();
+        use std::io::Read;
+        if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+            eprintln!("reinfer: 无 prompt（stdin 也空）——提供位置参数或管道输入");
+            return 2;
+        }
+        buf
+    } else {
+        a.prompt.join(" ")
+    };
+    let mut prompt_final = prompt.clone();
+    if a.chat {
+        match render_chat_template(&dir, &prompt) {
+            Ok(Some(text)) => prompt_final = text,
+            Ok(None) => {
+                eprintln!("reinfer: no chat_template in tokenizer_config.json; using raw prompt");
+            }
+            Err(e) => {
+                eprintln!("reinfer: chat template render failed ({e}); using raw prompt");
+            }
+        }
+    }
+    let ids = match tokenizer.encode(&prompt_final, a.chat) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("reinfer: encode: {e}");
+            return 2;
+        }
+    };
+    if vlog.at(1) {
+        eprintln!("reinfer: prompt {prompt_final:?} -> {} tokens", ids.len());
+    }
+
+    // 真流式：统一走 pipeline（prefill → 采样循环 → 增量 stdout；EOS/-n 语义）
+    let params = crate::pipeline::GenParams {
+        temperature: a.temperature,
+        top_k: a.top_k,
+        top_p: a.top_p,
+        repeat_penalty: a.repeat_penalty,
+        seed: a.seed,
+    };
+    let mut n_new = 0usize;
+    let stat = match crate::pipeline::generate_stream(
+        &mut engine,
+        &tokenizer,
+        &ids,
+        &params,
+        eos,
+        a.max_tokens,
+        |delta| {
+            print!("{delta}");
+            use std::io::Write;
+            n_new += 1;
+            std::io::stdout().flush().is_ok()
+        },
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("reinfer: generate: {e}");
+            return 2;
+        }
+    };
+    let _ = println!();
+    let first_tok = stat.first_token.map(|d| d.as_millis()).unwrap_or(0);
+    let dgen = stat.elapsed;
+    let _ = &mut n_new;
+    eprintln!(
+        "reinfer: {} tokens in {:?} (≈{:.1} tok/s, first-token {}ms, model {})",
+        stat.tokens,
+        dgen,
+        stat.tokens as f64 / dgen.as_secs_f64(),
+        first_tok,
+        a.model,
+    );
+    0
+}
+
 fn cmd_completions(a: CompletionsArgs) -> i32 {
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
@@ -1148,6 +1470,7 @@ fn cmd_doctor(a: DoctorArgs, vlog: &Verbosity) -> i32 {
         }
         Backend::Cuda => cuda_block(&mut checks),
         Backend::Ascend => cann_block(&mut checks),
+        Backend::Cpu => {}
     }
     model_dir_block(&mut checks);
     env_block(&mut checks, vlog);
@@ -1160,6 +1483,7 @@ fn cmd_doctor(a: DoctorArgs, vlog: &Verbosity) -> i32 {
         Backend::Auto => "auto",
         Backend::Cuda => "cuda",
         Backend::Ascend => "ascend",
+        Backend::Cpu => "cpu",
     };
     match fmt {
         Format::Table => {
@@ -1760,8 +2084,39 @@ mod tests {
         let e = parse(&["reinfer", "frobnicate"]).unwrap_err();
         assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert_eq!(e.exit_code(), 2);
-        // 未立项命令不出现（无 ghost）：serve/run/chat/bench 均为未知
-        for ghost in ["serve", "run", "chat", "bench"] {
+        // 已立项且已实现的命令：run（契约 v2.2/v2.15）
+        let r = parse(&["reinfer", "run", "Qwen/Qwen3-0.6B", "-n", "8", "-t", "1.0", "Hello"]).unwrap();
+        match r.command {
+            Cmd::Run(x) => {
+                assert_eq!(x.model, "Qwen/Qwen3-0.6B");
+                assert_eq!(x.max_tokens, 8);
+                assert_eq!(x.temperature, 1.0);
+                assert_eq!(x.prompt, vec!["Hello"]);
+                assert_eq!(x.backend, Backend::Auto);
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            parse(&["reinfer", "run", "m", "--backend", "bogus"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        ));
+        // serve 已实现（契约 v2.1/v2.5；axum）
+        let srv = parse(&["reinfer", "serve", "Qwen/Qwen3-0.6B", "--port", "9000", "--host", "127.0.0.1", "--api-key", "k"]).unwrap();
+        match srv.command {
+            Cmd::Serve(x) => {
+                assert_eq!(x.model, "Qwen/Qwen3-0.6B");
+                assert_eq!(x.port, 9000);
+                assert_eq!(x.host, "127.0.0.1");
+                assert_eq!(x.api_key.as_deref(), Some("k"));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            parse(&["reinfer", "serve", "m", "--backend", "bogus"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        ));
+        // 未立项命令不出现（无 ghost）：chat/bench 均为未知
+        for ghost in ["chat", "bench"] {
             assert!(matches!(
                 parse(&["reinfer", ghost]).unwrap_err().kind(),
                 clap::error::ErrorKind::InvalidSubcommand

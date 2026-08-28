@@ -151,6 +151,7 @@ pub fn download_file(
     std::fs::create_dir_all(&dir).map_err(io_err)?;
     let path = target_path(root, repo, &entry.name);
     if local_hit(&path, entry, verify) {
+        eprintln!("reinfer-models: {} exists locally - verifying", entry.name); // 校验期透明（用户 2026-08-28）
         if let (Some(cb), Ok(meta)) = (progress, std::fs::metadata(&path)) {
             cb(meta.len(), meta.len());
         }

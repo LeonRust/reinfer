@@ -995,6 +995,7 @@ const GLOBAL_TEMPLATE: &str =
 
 struct Progress {
     mp: MultiProgress,
+    files: Vec<FileEntry>,
     /// 完成计数行（`{done}/{total} files`；docker 式紧凑视图）。
     counter: ProgressBar,
     /// 活跃条（≤ MAX_WORKERS；按文件 idx 定位；begin 时插入 GLOBAL 上方）。
@@ -1030,6 +1031,7 @@ impl Progress {
         gl.enable_steady_tick(Duration::from_millis(200));
         Self {
             mp,
+            files: targets.to_vec(),
             counter,
             active: std::sync::Mutex::new(vec![None; total]),
             global: gl,
@@ -1041,7 +1043,8 @@ impl Progress {
 
     fn begin_file(&self, idx: usize, name: &str) {
         // active 行：插入 GLOBAL 上方（倒数第 2 行——docker 式：只显示正在下载的文件）
-        let pb = self.mp.insert_from_back(1, ProgressBar::new(0));
+        // 长度预置真实 size：本地命中/校验期显示 0%（非 100% 假完成——用户 2026-08-28 帧）
+        let pb = self.mp.insert_from_back(1, ProgressBar::new(self.files[idx].size));
         pb.set_style(
             ProgressStyle::with_template(PROG_TEMPLATE)
                 .unwrap_or_else(|_| ProgressStyle::default_bar())

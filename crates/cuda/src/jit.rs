@@ -249,3 +249,35 @@ pub unsafe fn launch_row(
     };
     rc(r)
 }
+/// 行级 launch 原语（014 T5）：grid = `grid` blocks × `block` threads；
+/// 其余前置条件与 [`launch_row`] 相同。
+///
+/// # Safety
+/// 同 [`launch_row`]。
+pub unsafe fn launch_rows(
+    kernel: KernelFn,
+    stream: &CudaStream,
+    _dev: u32,
+    grid: u32,
+    block: u32,
+    args: *mut *mut c_void,
+) -> Result<(), LaunchError> {
+    let cu_stream: sys::CUstream = stream.handle() as *mut c_void as sys::CUstream;
+    // SAFETY: 同 launch_row 前提（context/stream/args 由调用方保证）。
+    let r = unsafe {
+        sys::cuLaunchKernel(
+            kernel.0,
+            grid,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            cu_stream,
+            args,
+            std::ptr::null_mut(),
+        )
+    };
+    rc(r)
+}

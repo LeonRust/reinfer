@@ -35,3 +35,13 @@
 - `scripts/golden/archive_check.sh`：metadata key 集 26/26 一致 + tensor 名 291/291 一致 + 字节尺寸推导全一致（Q8_0/F16）
 - arch 全链：`qwen2 ctx=32768 layers=24 hidden=896 q/kv=14/2 rope_dim=64`（与 referee dump 数值一致）
 - **增量发现**：该官方 GGUF 省略 `qwen2.vocab_size`——词表大小须自 `tokenizer.ggml.tokens` 推断（llama.cpp 同款链路）→ `LlamaConfig` 解析链已补（crеs/arch`from_gguf_meta`；双单测）。
+
+## 2026-08-28 — 014 T5: Q8_0 dequant kernel 真机（RTX 5090 Laptop, cc 12.0）
+
+- 命令：`REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc CUDA_VISIBLE_DEVICES=0 cargo test -p reinfer-cuda --features cuda --test dequant_diff -- --ignored --test-threads=1`
+- 结果：2/2 通过
+  - 随机 65536 块（scale 指数域 0..=30：±0/次正规/普通）GPU vs `codes::dequantize_q8_0` **位精确（0 ulp）**
+  - referee 金块（64 块）：有限值位精确；**NaN/Inf 传播值 GPU 硬件 quiet 化（0x7fffffff vs CPU SSE 保留首个 NaN payload）**——llama.cpp GPU 路径同患；判据对象=有限值域（量化 d 真实值域），NaN 传播不立判据
+  - 确定性：两次 launch 逐位一致
+- **内核实现要点**：scale 用**软件位构造**转换（`half_bits_to_f32`：subnormal 归一化/NaN payload 保留/Inf 直通）——硬件 `__half2float` 会 quiet 化 NaN，破坏 0-ulp；单乘语义（无 FMA 化写法）
+- **存档异常记录（重要）**：官方 0.5B GGUF（sha ca59ca7f…=manifest/anchor 完全匹配）token_embd.weight 第 20 个 34B 块 scale 字节 = `46 7f`（LE u16=0x7F46 = fp16 NaN 展开）——llama-gguf API 与读取器均读出相同字节；llama-bench 可加载运行（测速不校验语义）。首个 NaN 块在词嵌入向量头部区域——如后需复现输出请以该文件为准；本记录仅作档案事实，不构成判据影响（T5 有限值域判据已闭环）。

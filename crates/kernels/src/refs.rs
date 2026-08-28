@@ -116,3 +116,26 @@ mod tests {
         assert!(out.iter().all(|v| *v == 0.0));
     }
 }
+
+
+/// fp32 累加 naive 矩阵乘（014 T6 单源 CPU 参考）。
+///
+/// 行主序：`C[m×n] = A[m×k] · B[k×n]`；累加顺序 i→j→t 递增（确定性）；
+/// 无 SIMD、无向量化依赖（编译档不开 fast-math 语义）。
+pub fn matmul_ref(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(a.len(), m * k, "matmul_ref: A requires m×k elements");
+    assert_eq!(b.len(), k * n, "matmul_ref: B requires k×n elements");
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for t in 0..k {
+            let av = a[i * k + t];
+            if av == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                c[i * n + j] += av * b[t * n + j];
+            }
+        }
+    }
+    c
+}

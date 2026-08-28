@@ -45,3 +45,18 @@
   - 确定性：两次 launch 逐位一致
 - **内核实现要点**：scale 用**软件位构造**转换（`half_bits_to_f32`：subnormal 归一化/NaN payload 保留/Inf 直通）——硬件 `__half2float` 会 quiet 化 NaN，破坏 0-ulp；单乘语义（无 FMA 化写法）
 - **存档异常记录（重要）**：官方 0.5B GGUF（sha ca59ca7f…=manifest/anchor 完全匹配）token_embd.weight 第 20 个 34B 块 scale 字节 = `46 7f`（LE u16=0x7F46 = fp16 NaN 展开）——llama-gguf API 与读取器均读出相同字节；llama-bench 可加载运行（测速不校验语义）。首个 NaN 块在词嵌入向量头部区域——如后需复现输出请以该文件为准；本记录仅作档案事实，不构成判据影响（T5 有限值域判据已闭环）。
+
+## 2026-08-28 — 014 T6: cuBLAS GEMM 真机（RTX 5090 Laptop, cc 12.0）
+
+- 命令：`CUDA_VISIBLE_DEVICES=0 cargo test -p reinfer-cuda --features cuda --test gemm_diff -- --ignored --test-threads=1 --nocapture`
+- 结果：2/2
+  - **门禁档 CUBLAS_COMPUTE_32F**（gemm_f32acc）：f16-in/f32-out 与 f32-in/f32-out 全部通过
+    rtol 1e-4 + atol 1e-6；形状：32³/64×48×96/128³·256/64×32×896/32×64×1536/256³·512 + K∈{1,16,4096} 边界——最差 rel 5.7e-7（f32 档）/1.1e-7（f16 档）
+  - **记录档 CUBLAS_COMPUTE_16F**（gemm_f16_16acc）：max rel 1.49e-2（≤1e-1 声明；真实 K=896）
+- 实现要点：
+  - 直调 cublasGemmEx（cudarc 0.19 cublas feature = T6 接线；safe 层无 compute-type）
+  - compute enum：CUBLAS_COMPUTE_32F=68 / 16F=64；16F-acc 时 A/B/C 均须 16F（32F C 非法——实测）
+  - **行主序→列主序映射**：A^T([k,m], ld=k) + B^T([n,k], ld=n) + OP_T/OP_T；输出 col-major → `want[r*n+c]=raw[r+c*m]`
+  - 标量 alpha/beta：32F 传 f32 bits；16F 传 half bits
+  - handle 每次调用前 SetStream（禁 default stream 0）
+- runner-info 回填：`cublas` 版本 = cudarc 0.19.9 w/ cublas feature（libcublas 12.9.x via build-system）

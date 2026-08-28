@@ -605,7 +605,7 @@ mod tests {
             autodownload: true,
         };
         let p = r.ensure(&ModelSpec::new("stub/models").with_quant("q8_0")).unwrap();
-        assert_eq!(p, dir.join("m-q8_0.gguf"));
+        assert_eq!(p, dir.join("stub/models/m-q8_0.gguf")); // repo 组织
         assert_eq!(std::fs::read(&p).unwrap(), b"data");
         assert!(counter.load(Ordering::SeqCst) >= 1, "HF HEAD must have run");
         // 二次 ensure：本地命中（不触网也可过——glob 层）

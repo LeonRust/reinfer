@@ -44,7 +44,9 @@ pub fn hf_download_file(
     to_dir: &Path,
     verify: Verify,
 ) -> Result<PathBuf, LaunchError> {
-    std::fs::create_dir_all(to_dir).map_err(crate::download::io_err)?;
+    // repo 布局（与 MS 路径一致）：落地 root/{repo}/（HF 回退也不 flat——2026-08-28 修复）
+    let dir = crate::download::repo_dir(to_dir, repo);
+    std::fs::create_dir_all(&dir).map_err(crate::download::io_err)?;
     let url = api::hf_download_url(repo, path, branch);
     let head = hf_head(repo, path, branch)?;
     let entry = FileEntry {
@@ -56,7 +58,7 @@ pub fn hf_download_file(
     crate::download::download_with_url(
         &url,
         &entry,
-        to_dir,
+        &dir,
         verify,
         repo,
         branch,

@@ -60,3 +60,14 @@
   - 标量 alpha/beta：32F 传 f32 bits；16F 传 half bits
   - handle 每次调用前 SetStream（禁 default stream 0）
 - runner-info 回填：`cublas` 版本 = cudarc 0.19.9 w/ cublas feature（libcublas 12.9.x via build-system）
+
+## 2026-08-28 — 014 T7: Prefill attention 真机（RTX 5090, cc 12.0）
+
+- 命令：`REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc CUDA_VISIBLE_DEVICES=0 cargo test -p reinfer-cuda --features cuda --test attn_diff -- --ignored --test-threads=1`
+- 结果：2/2
+  - **判据档（32F + fp32 中间，全 f32 路径）**：seq=1k、d=64 随机（f16 表示值域）vs `prefill_attn_ref`——worst rel **2.45e-6**（≈0.005 fp16 ulp；判据 ≤1 ulp + atol 1e-6 富余通过）；causal mask 生效（行 0 P=[1,0..]）；P 行和 1000/1000 ≈1
+  - **r2 NaN 反例（语义档）**：unmasked NaN 注入 → 与 CPU 参考一致（max-softmax 对 NaN 行 → 全 0（与「全无效行」同路径）——含 1 fp16 ulp 容差）；bit 级 NaN 一致性受 GPU 硬件 quiet 化（T5 note）
+- 实现/工程要点：
+  - **全程行主序**管线：QKT 输出（col-major）→ 写 `transpose_f32` 内核转回行序 → mask 注入（-inf 累加）→ 行 softmax（`masked_softmax_matrix`，grid=rows）→ P 保持 f32 → PV（行主序 gemm）；判据档无 f16 cast（16F 中间为记录项——首次尝试发现 P cast f16 至差 1-2 ulp）
+  - K^T 经设备 `transpose_f16`（K → K^T 行序）唯一转置需求
+  - 教训（修了 4 轮）：列主序/行主序在「GEMM 输出 → softmax 行」两处组合易错——最终以「物理行序=语义行序」为唯一不变式；判据测试 O 读回按 ldc 换位（raw[r+c*seq]→行主序）

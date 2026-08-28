@@ -249,6 +249,41 @@ pub unsafe fn launch_row(
     };
     rc(r)
 }
+/// 2D grid 行级 launch（014 T7 transpose）：grid = (gx, gy)。
+///
+/// # Safety
+/// 同 [`launch_row`]。
+#[allow(clippy::too_many_arguments)] // 内核 launch 参数矩阵（C3 纪律显式化）
+pub unsafe fn launch_grid(
+    kernel: KernelFn,
+    stream: &CudaStream,
+    _dev: u32,
+    gx: u32,
+    gy: u32,
+    bx: u32,
+    by: u32,
+    args: *mut *mut c_void,
+) -> Result<(), LaunchError> {
+    let cu_stream: sys::CUstream = stream.handle() as *mut c_void as sys::CUstream;
+    // SAFETY: 同 launch_row 前提。
+    let r = unsafe {
+        sys::cuLaunchKernel(
+            kernel.0,
+            gx,
+            gy,
+            1,
+            bx,
+            by,
+            1,
+            0,
+            cu_stream,
+            args,
+            std::ptr::null_mut(),
+        )
+    };
+    rc(r)
+}
+
 /// 行级 launch 原语（014 T5）：grid = `grid` blocks × `block` threads；
 /// 其余前置条件与 [`launch_row`] 相同。
 ///

@@ -46,6 +46,7 @@ pub mod jit_provider;
 pub mod diff;
 pub mod dequant;
 pub mod gemm;
+pub mod attention;
 
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;

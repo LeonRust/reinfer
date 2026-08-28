@@ -48,6 +48,8 @@ pub mod dequant;
 pub mod gemm;
 pub mod attention;
 pub mod decode;
+pub mod engine;
+mod send_sync;
 
 #[cfg(feature = "cuda")]
 pub use event::CudaEvent;

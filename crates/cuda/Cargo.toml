@@ -9,6 +9,9 @@ publish = false
 reinfer-core = { workspace = true }
 reinfer-kernels = { workspace = true }
 reinfer-jit = { workspace = true }
+reinfer-arch = { workspace = true }
+reinfer-safetensors = { workspace = true }
+serde_json = { workspace = true }
 cudarc = { workspace = true, optional = true }
 
 [features]
@@ -34,4 +37,5 @@ workspace = true
 [dev-dependencies]
 reinfer-gguf = { workspace = true }
 reinfer-memory = { workspace = true }
+reinfer-tokenizer = { workspace = true }
 serde_json = { workspace = true }

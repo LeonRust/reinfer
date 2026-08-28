@@ -8,11 +8,12 @@ use reinfer_core::DeviceId;
 
 use crate::error::{LaunchError, from_runtime_error};
 
-/// 计算流（创建即持有；句柄仅 crate 内部使用）。
+/// 计算流（引用计数——引擎与子模块共享物理流以保序；句柄仅 crate 内部使用）。
 #[derive(Debug)]
 pub struct CudaStream {
     dev: DeviceId,
     raw: sys::cudaStream_t,
+    shared: std::sync::Arc<()>,
 }
 
 impl CudaStream {
@@ -20,7 +21,7 @@ impl CudaStream {
     pub fn new(dev: DeviceId) -> Result<Self, LaunchError> {
         let mut raw = core::ptr::null_mut();
         unsafe { sys::cudaStreamCreate(&mut raw) }.result().map_err(from_runtime_error)?;
-        Ok(Self { dev, raw })
+        Ok(Self { dev, raw, shared: std::sync::Arc::new(()) })
     }
 
     /// 阻塞等待本流上的全部工作完成。
@@ -40,10 +41,18 @@ impl CudaStream {
     }
 }
 
+impl Clone for CudaStream {
+    fn clone(&self) -> Self {
+        Self { dev: self.dev, raw: self.raw, shared: std::sync::Arc::clone(&self.shared) }
+    }
+}
+
 impl Drop for CudaStream {
     fn drop(&mut self) {
-        // 显式忽略错误：销毁发生在用户可见结果之后
-        let _ = unsafe { sys::cudaStreamDestroy(self.raw) }.result();
+        // 显式忽略错误：销毁发生在用户可见结果之后；仅最后一个引用销毁句柄。
+        if std::sync::Arc::strong_count(&self.shared) <= 1 {
+            let _ = unsafe { sys::cudaStreamDestroy(self.raw) }.result();
+        }
     }
 }
 

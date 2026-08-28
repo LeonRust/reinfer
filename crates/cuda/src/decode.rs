@@ -22,6 +22,8 @@ use std::path::PathBuf;
 /// decode_step_gqa 装载单元。
 #[derive(Debug)]
 pub struct DecodeKernels {
+    /// 加载的 cubin（保活——kernel fn 为模块内符号）。
+    #[allow(dead_code)]
     lib: JLib,
     decode: KernelFn,
     stream: CudaStream,
@@ -113,9 +115,13 @@ impl DecodeKernels {
 }
 
 /// 设备 KV store（K/V 区；页数×块长与 `crates::memory::PagePool` 契约一致）。
+#[derive(Debug)]
 pub struct KvStore {
+    /// 设备存储（K 区 + V 区连续）。
     pub data: DeviceBuffer,
+    /// 页总数。
     pub total_pages: usize,
+    /// 每页 token 数。
     pub block_len: usize,
 }
 

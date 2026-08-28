@@ -28,7 +28,7 @@ extern "C" __global__ void rope_row(const float* __restrict__ x,
                                     int half, int pos, float eta) {
     int p = threadIdx.x;
     if (p < half) {
-        float theta = (float)pos * powf(eta, -2.f * (float)p / (float)half);
+        float theta = (float)pos * powf(eta, -2.f * (float)p / (2.f * (float)half));
         float c = cosf(theta), s = sinf(theta);
         float a = x[p], b = x[p + half];
         out[p] = a * c - b * s;

@@ -88,7 +88,8 @@ pub fn check_arch_supported(arch: &str, ver: (u32, u32)) -> Result<(), LaunchErr
     if let Some((mn, mnr)) = min
         && ver < (mn, mnr)
     {
-        eprintln!("reinfer-jit: {} ({arch} needs {mn}.{mnr})", messages::NVCC_TOO_OLD);
+        // 静默淘汰（探测扫描噪音）：候选都不行时由
+        // probe_toolchain_for_arch 的失败分支提示 REINFER_CUDA_NVCC。
         return Err(LaunchError::Fatal);
     }
     Ok(())

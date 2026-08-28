@@ -15,7 +15,9 @@
 /// 页块长度（可选 16/32）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockLen {
+    /// 16 token/页。
     B16,
+    /// 32 token/页。
     B32,
 }
 
@@ -39,6 +41,7 @@ pub struct PageTable {
 }
 
 impl PageTable {
+    /// 物理页号视图（按逻辑页顺序）。
     pub fn pages(&self) -> &[usize] {
         &self.pages
     }

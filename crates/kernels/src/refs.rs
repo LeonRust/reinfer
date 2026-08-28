@@ -18,14 +18,15 @@ pub fn rms_norm_ref(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 }
 
 /// 单头单位置 RoPE（Neox 半旋转）：
-/// `p = i ∈ [0, half)`，`θ_p = pos * eta^(-2p/half)`；
+/// `p = i ∈ [0, half)`，`θ_p = pos * eta^(-2p/(2·half))`——频率分母为
+/// **全维**（2·half；ggml NEOX 的 `theta_scale = base^(-2/n_dims)`）；
 /// `x'[p] = x[p]·cosθ - x[p+half]·sinθ`；`x'[p+half] = x[p]·sinθ + x[p+half]·cosθ`。
 /// 要求 `x.len() == 2*half`。
 pub fn rope_ref(x: &[f32], half: usize, pos: u32, eta: f32) -> Vec<f32> {
     assert_eq!(x.len(), 2 * half);
     let mut out = x.to_vec();
     for p in 0..half {
-        let exp = -(2.0 * p as f32) / half as f32;
+        let exp = -(2.0 * p as f32) / (2.0 * half as f32);
         let theta = pos as f32 * eta.powf(exp);
         let (c, s) = (theta.cos(), theta.sin());
         let (a, b) = (x[p], x[p + half]);

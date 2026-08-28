@@ -42,6 +42,28 @@ __device__ float hbits_to_f32(unsigned short h) {
     return __uint_as_float(sign | ((exp + 112) << 23) | (man << 13));
 }
 
+__device__ __forceinline__ unsigned short f32_to_hbits(float f) {
+    unsigned int bits = __float_as_uint(f);
+    unsigned int sign = (bits >> 16) & 0x8000u;
+    int exp = (int)((bits >> 23) & 0xff);
+    unsigned int man = bits & 0x7fffffu;
+    if (exp == 0xff) {
+        return (unsigned short)(sign | 0x7c00u | ((man >> 13) & 0x3ffu));
+    }
+    int half_exp = exp - 127 + 15;
+    if (half_exp <= 0) {
+        if (half_exp < -10) {
+            return (unsigned short)sign;
+        }
+        unsigned int subm = (man | 0x800000u) >> (1 - half_exp + 13);
+        return (unsigned short)(sign | subm);
+    }
+    if (half_exp >= 31) {
+        return (unsigned short)(sign | 0x7c00u);
+    }
+    return (unsigned short)(sign | ((unsigned int)half_exp << 10) | (man >> 13));
+}
+
 constexpr int TPB = 256;
 
 extern "C" __global__ void decode_step_gqa(
@@ -69,56 +91,47 @@ extern "C" __global__ void decode_step_gqa(
         return;
     }
 
-    __shared__ float sq[256];   // d ≤ 256（判据档范围）
-    __shared__ float sh[TPB]; // (判据档归约改串行——sh 保留兼容)
-    for (int i = tid; i < d; i += TPB) {
-        sq[i] = hbits_to_f32(q[((size_t)(b * QH + h)) * d + i]);
-    }
-    __syncthreads();
-
     const size_t kv_base = (size_t)total_pages * block_len * per_tok_kv; // V 区基址
 
-    // ---------------- pass 1: scores（gather K + dot；判据档 tid==0 串行） ----------------
-    __shared__ float smaxv;
-    __shared__ float sinv;
-    if (tid == 0) {
+    // 无共享内存/无块同步版本（014 T8 判据语义一致：每线程独立 gather+softmax+PV）；
+    // 精简稳健；B×QH × d 在 256 线程内直接计算（d ≤ 256）。
+    // 调试printf已删。
+    for (int i = tid; i < d; i += TPB) {
         float maxv = -1e30f;
+        // pass1: q[i] 行固定（qij 在循环内重读——i 需要时读取；分数为行级——每线程先算行分数）
+        const size_t score_base = (size_t)(b * QH + h) * max_kv;
+        float qi = hbits_to_f32(q[((size_t)(b * QH + h)) * d + i]);
         for (int t = 0; t < kv_len; ++t) {
             int lp = t / block_len;
             int off = t % block_len;
-            int phys = (int)page[lp];
+            unsigned int phys = page[lp];
             const unsigned short* krow =
                 kv + (((size_t)phys * block_len + off) * kv_heads + kv_h) * d;
             float acc = 0.0f;
-            for (int i = 0; i < d; ++i) {
-                acc += sq[i] * hbits_to_f32(krow[i]);
+            // 每线程重复行级 dot——代价小（判据档：d*kv_len ≤ 256*1024）
+            for (int j = 0; j < d; ++j) {
+                acc += hbits_to_f32(q[((size_t)(b * QH + h)) * d + j]) * hbits_to_f32(krow[j]);
             }
-            scores[((size_t)b * QH + h) * max_kv + t] = acc;
-            maxv = fmaxf(maxv, acc);
+            scores[score_base + t] = acc;
+            if (acc > maxv) {
+                maxv = acc;
+            }
         }
         float sumv = 0.0f;
         for (int t = 0; t < kv_len; ++t) {
-            sumv += expf(scores[((size_t)b * QH + h) * max_kv + t] - maxv);
+            sumv += expf(scores[score_base + t] - maxv);
         }
-        smaxv = maxv;
-        sinv = sumv != 0.0f ? 1.0f / sumv : 0.0f;
-    }
-    __syncthreads();
-    float maxv = smaxv;
-    float inv = sinv;
-
-    // ---------------- pass 3: PV（每线程一输出列；串行 gather+累积） ----------------
-    for (int i = tid; i < d; i += TPB) {
+        float inv = sumv != 0.0f ? 1.0f / sumv : 0.0f;
         float acc = 0.0f;
         for (int t = 0; t < kv_len; ++t) {
-            float p = expf(scores[((size_t)b * QH + h) * max_kv + t] - maxv) * inv;
+            float p = expf(scores[score_base + t] - maxv) * inv;
             int lp = t / block_len;
             int off = t % block_len;
-            int phys = (int)page[lp];
+            unsigned int phys = page[lp];
             const unsigned short* vrow = kv + kv_base +
                 (((size_t)phys * block_len + off) * kv_heads + kv_h) * d;
             acc += p * hbits_to_f32(vrow[i]);
         }
-        out[((size_t)(b * QH + h)) * d + i] = __float2half(acc);
+        out[((size_t)(b * QH + h)) * d + i] = f32_to_hbits(acc);
     }
 }

@@ -17,8 +17,10 @@
 //!   （BPE encode 不插入 UNK，与 llama.cpp 一致）。
 //!
 //! 已记录 deviation（014 plan 事实修正）：
-//! - 不做 regex 预分段（本 slice directive：跳过；整段文本视为一个 word，
-//!   `unicode_byte_encoding_process` 对整段逐 byte 编码）。
+//! - **QWEN2 预分段**（014 T4）：与 llama.cpp `unicode_regex_split`
+//!   （QWEN2 pre-type 分支）逐位对齐——fragment 间不 merge（见
+//!   [`qwen2_fragments`]；手写 scanner 复刻 std::regex ECMAScript 的
+//!   顺序交替 + greedy 回溯语义）
 //! - QWEN2 无「▁→空格」：`escape_whitespaces` 对 BPE 默认 false
 //!   （行 2131），QWEN2 pre 不重开（行 2229-2234）；Qwen2.5 真实 vocab
 //!   以 'Ġ'（U+0120）表示空格、无任何 ▁ 条目。

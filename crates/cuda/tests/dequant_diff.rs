@@ -1,4 +1,6 @@
 //! 014 T5: Q8_0 dequant kernel真机 diff（位精确 0 ulp）。
+#![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
+
 //!
 //! 运行（任意 N 卡；`--test-threads=1` 强制）：
 //! ```text
@@ -64,7 +66,7 @@ mod gpu {
     fn upload_cpu_ref(blob: &[u8]) -> Vec<f32> {
         let expect = vec![0.0f32; OUT];
         let mut out = expect;
-        for (b, chunk) in blob.chunks_exact(BLK).enumerate() {
+        for (b, chunk) in blob.as_chunks::<BLK>().0.iter().enumerate() {
             dequantize_q8_0(chunk, &mut out[b * 32..b * 32 + 32]).expect("cpu ref");
         }
         out

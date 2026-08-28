@@ -24,19 +24,19 @@
 | P0-04 | Arch config loader (Llama metadata → typed config; Qwen2 parse) | `crates/arch` | 001/plan §Modules | parse tests | ✅ ready |
 | P0-08 | Model fetch: pure-Rust ModelScope/HF client (`reinfer model list/get` + runtime `ModelResolver` env policy: SOURCE/DIR/VERIFY/AUTODOWNLOAD, ModelScope-first, HF fallback) | `crates/models`, `bin/reinfer` | ✅ specs/013-model-fetch | stub network tests + end-to-end (q8_0 675710816 B, sha256 matches repo value; manifest left) | ✅ done (f35205b + T3 CLI) |
 | P0-05 | GGUF tokenizer (SPM/BPE encode + increment-decode from GGUF tokenizer models) | `crates/tokenizer` | ✅ `specs/004-tokenizer` | golden vs llama.cpp tokens | ✅ spec ready |
-| P0-06 | CPU inference loop: RMSNorm/RoPE/softmax/MHA naive + contiguous KV (GQA), streamed decode | `crates/cpu`, `crates/arch` | 🔒 spec **007-core-inference** (CPU 全链路，为 005 `--backend cpu` 与无 GPU CI 提供载体) | 000/spec parity criteria | 🔒 spec first |
-| P0-07 | `info` + `cli` subcommands + differential harness vs llama.cpp | `bin/reinfer`, `bench/` | 001/tasks T5–T6; 000 | PNG: token 100% on 20 prompts; ≥60% llama.cpp decode | ↔ after P0-05/06 |
+| P0-06 | CPU inference loop: RMSNorm/RoPE/softmax/MHA naive + contiguous KV (GQA), streamed decode | `crates/cpu`, `crates/arch` | ✅ specs/007-core-inference（2026-08-28 r2 四代理评审）——「无加速卡也能推理」兜底端 + 无卡 CI 载体 | 000/spec parity criteria + 007 r2 判据（F16 token 100% / Q8_0 ≥99.9% 硬；吞吐记录不设档） | ✅ spec r2 提案（待实施） |
+| P0-07 | `info` + `run` subcommands + differential harness vs llama.cpp | `bin/reinfer`, `bench/` | 001/tasks T5–T6; 000 | **r2 修订（007 评审：naive 单线程 ≥60% 结构不可达——带宽分析 8-25× 差距）**：F16 token 100% + Q8_0 ≥99.9%（20 prompts）硬；吞吐记录（notes 四元组，无 % 档） | ↔ after P0-05/06（007 r2 已定） |
 
 ## Track 3 — P1+ (design report §7) — specs needed before code
 
 | ID | Feature | Notes |
 |---|---|---|
-| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | **L1 ✅**（009，真机验证 device/stream/event/buffer/copy/error 白名单）；**L2 ✅**（012：JitCache v1 + vec_add/rms_norm/rope/masked_softmax + sampler host 管线 + KernelProvider 选择链；真机 6/6 smoke、命中 2.7ms、跨进程单次编译；设备/工具链自适应——见 notes-jit-l2-2026-08-27.md）；**剩余**：003 T8-T12（dequant/cuBLAS/attention/engine 闭环）+ 004 tokenizer（phase-plan L3），模型一律 ModelScope |
+| P1-01 | CUDA backend (cudarc + JitCache + kernels + cuBLAS) | **L1 ✅**（009）；**L2 ✅**（012：真机 6/6 smoke、命中 2.7ms；见 notes-jit-l2-2026-08-27.md）；**剩余 = specs/014（r2，2026-08-28 四代理评审修订）T0-T11**：dequant/GEMM/attention/run 闭环 + parity 四层 + 3×（1.5B Q8_0）；llama.cpp referee = 014 T0（CPU 档）；实施顺序 **014 → 015 → 007**（用户 2026-08-28 定） |
 | P1-02 | Paged KV pool (refcount + free list) in `crates/memory` | included in 003 T9; policy-side is ours (boundary §4) |
 | P1-03 | Scheduler: continuous batching, chunked prefill, token-budget admission, `req_id` determinism | ✅ `specs/005-scheduler-serving` |
 | P1-04 | CUDA graph bucket capture + stream overlap | ✅ `specs/006-cuda-perf` (FA3 vendor cubin optional) |
 | P1-05 | OpenAI-compatible HTTP server (axum) + sampler chain (greedy/top-p/top-k) | ✅ specs/005 (P1-03 same spec) |
-| P2-01 | Ascend full: Vendor-tier aclnn ops (L1, via cann safe wrappers), GE graph (aclgrph*) session pattern, AscendC pipeline (`crates/jit`), HCCL | depends cann-rs 0002 code; graph note: 8.5 = GE engine `aclgrph*`, not legacy `aclrtGraph*` |
+| P2-01 | Ascend full: Vendor-tier aclnn ops (L1, via cann safe wrappers), GE graph (aclgrph*) session pattern, AscendC pipeline (`crates/jit`), HCCL | depends cann-rs 0002 code; graph note: 8.5 = GE engine `aclgrph*`, not legacy `aclrtGraph*`；**进度：L1 代码在仓（0002 proposal，未真机验证）——015（r2 提案）是「昇腾第一次跑出 token」的最小闭环（依赖 014 M4/M5 + 0002 aclnn 面），实施列 014 之后 |
 | P3-01 | RadixCache · speculative decode · llguidance grammar · TP/PP/CP | semantics from design report §2 |
 | P4-01 | MoE/MLA/FP8 · autotune TuneDb · KV offload · PD separation (lightllm protocol) · plugins | |
 
@@ -44,5 +44,5 @@
 
 1. **ASC-01/02/03** — quick win: version/device diagnostics closed loop (cann-rs L0 already verified + implemented)
 2. **P0-01/02/03/04** — pure-Rust data path (001 tasks T1–T4); no GPU, no upstream deps
-3. **Write specs 007-core-inference (CPU 全链路) + 008-ci-infra (CI 工件)** — 005 的 `--backend cpu` 一致性套件依赖前者，全部 GPU 硬门禁依赖后者；then P0-07 → P0 gate: llama.cpp token parity + 60% decode (CPU 档)
-4. 下一步并行：specs/005（serving，已修订）+ 006（vendor/graph，已修订）实施；Ascend 轨道按 002 契约随 cann-rs L1/L2 节奏推进
+3. ~~Write specs 007-core-inference …~~ ✅ 007 r2 已写（2026-08-28 四代理评审）；P0 gate 修订 = F16 token 100% + Q8_0 ≥99.9% + 吞吐记录（「60% decode」经带宽分析不可达，已撤销）
+4. **运行模型实施顺序（用户 2026-08-28 定）**：① **014**（CUDA L3：referee T0 → 数据管道 → 真机内核 → run 闭环 → parity/3×）② **015**（Ascend L3：依赖 014 M4/M5 + cann-rs 0002 aclnn 面 + T0（cann-rs 真机 smoke）→ 权重组装 → α 实测定档 → 层循环 → run 闭环 → 记录档报告）③ **007**（CPU：兜底端，T1 可与 014 并行，T2-T4 依赖 014 T0/T10）；specs/005（serving）+ 006（vendor/graph）实施不受阻（后续并行）

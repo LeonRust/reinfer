@@ -1,16 +1,16 @@
 # Plan: CUDA L3 — single-request full loop
 
-> Derived from specs/014-cuda-l3-single-request/spec.md · r1（四代理评审修订）
+> Derived from specs/014-cuda-l3-single-request/spec.md · r2（2026-08-28 四代理评审修订）
 
 ## Architecture Decisions
 
 - **D1 归属与顺序**：数据管道 `crates/gguf`（reader+codes，**001 已交付/承接面见差异注记**）、`crates/arch`、`crates/tokenizer`（**新建 crate**，004）、`crates/models`（013 resolver，L3 消费）；数值核 `crates/cuda` + `crates/kernels`（参考/选择链）；**cuBLAS 挂 `ProviderTier::Vendor`**（workspace F10 注释"L2/L3 再开 cublas feature"落点）；最小 Runner 在 **bin/cli**（engine crate 正式建归 005/A-M4）；MemOps/页池 `crates/memory`（003 T11）。
-- **D2 数值一致性链**（r1 判据化）：CPU 参考（新增 `dequant_ref`（单乘语义）、`matmul_ref`（fp32 累加）、`prefill_attn_ref`（012 ref 语义 + fp32 matmul））；差分判据矩阵：**Q8_0→位精确**；GEMM→32F 档门禁 + 16F 档记录；attention→32F+fp32 中间 → ≤1 ulp（fp16 舍入）；确定性声明沿用 012（同机同产物同 launch 配置）。
+- **D2 数值一致性链**（r1 判据化，r2 修订）：CPU 参考（`matmul_ref`（fp32 累加，kernels 新增——单源）、`prefill_attn_ref`（012 ref 语义 + fp32 matmul）；**dequant 参考 = 001 `codes::dequantize_q8_0` 本身——r2 单源化：kernels 不另定义 dequant_ref，007/015 同源不重复**）；差分判据矩阵：**Q8_0→位精确（f32→f16 转换 = RNE 单次舍入——r2 钉死：核内 `__float2half` 与 015 host 侧 half 必须同为 RNE，跨端/跨机字节一致的前提）**；GEMM→32F 档门禁（**rtol+atol**，见 D6）+ 16F 档记录；attention→32F+fp32 中间 → ≤1 ulp（**|out|≥2^-14；近零 atol 1e-6——r2 近零元素条款**）；确定性声明沿用 012（同机同产物同 launch 配置）。
 - **D3 GQA/分页/泄漏**：GQA 映射 **`kv_head = q_head / kv_ratio`**（整数除法，连续分组，与 HF/llama.cpp 一致；非整除取整方向实现注释固定，14/2、12/2、5/2 三例核验）；页块 16/32；**未初始化页毒化测试**（0xFF/NaN 填充；被 mask 位置输出必须恰为 0）；页表 fixture 覆盖（跨 2-3 页/首尾部分页/乱序物理页/batch 1..64/kv_len 1..1k）+ **分配器物理页快照**入 fixture；free-list **LIFO 头插**（vLLM 语义）；泄漏断言**三合一**：在用==0 + 空闲==预热长度 + 守恒式（在用+空闲==预热；总分配==释放；pool 大小不变）；decode_step 确定性：无 atomicAdd、固定归约树、每 (batch,head) 一 CTA。
 - **D4 对齐 llama.cpp 的实现细节**：Q8_0=QK8_0=32（34B/block）；F16 权重 mmap 直读直拷（**无 fp32 权重 staging**）；Q8_0 **按层一次性解量化到 fp16 device buffer**（decode 循环复用；与 llama.cpp convert 路径差异记 notes）；GEMM 16F-acc 直调 `cublas::sys::cublasGemmEx`（**cudarc safe 层硬编码 CUBLAS_COMPUTE_32F——必须绕过**；compute type=16F；alpha/beta half 标量；用 009 `CudaStream` 句柄、**禁 default stream 0**；GEMM 后事件/流同步点写入 T9 契约）；tokenizer 增量 decode = 004 判据（自洽；不对拍流式 detokenizer）。
-- **D5 基准协议（落地版）**：T10 **创建** `scripts/ci/gate_throughput.sh`（llama-bench `-ngl 0 -t 24 -b 1 -n 512 -r 5` ×3 独立调用取中位数 + reinfer 侧 `cli --seed 0 --n 512` 计时 gen tok/s + **loadavg <1 才采信** + 两侧同机同参同量化 KV=f16 + 断言 ≥3×）；runner-info.json 扩展 `cpu:{model,ncores,threads}` + T6 回填 `cublas` 版本；**3× 硬闸仅 1.5B Q8_0**（0.5B CPU 太快噪声翻转；F16 CPU 太慢失真——notes 记录理由）。
+- **D5 基准协议（落地版）**：T10 **创建** `scripts/ci/gate_throughput.sh`（llama-bench `-ngl 0 -t <ncores> -b 1 -n 512 -r 5` ×3 独立调用取中位数 + reinfer 侧 `run <model> --backend cuda --seed 0 -n 512` 计时 gen tok/s——r2 命令面 + **参数源在本行（008 D5 引用点）** + **loadavg <1 才采信** + 两侧同机同参同量化 KV=f16 + 断言 ≥3×）；runner-info.json 扩展 `cpu:{model,ncores,threads}` + T6 回填 `cublas` 版本；**3× 硬闸仅 1.5B Q8_0**（0.5B CPU 太快噪声翻转；F16 CPU 太慢失真——notes 记录理由）。
 - **D6 验收递减**：① 数据管道 CPU-only → ② dequant/GEMM（32F 门禁档）真机 → ③ attention 真机 → ④ 装配（先 F16 后 Q8_0）→ ⑤ parity/3×（1.5B）。
-- **D7 Judge/Referee 构建**：llama.cpp pinned f280b2698 CUDA 构建（`-DLLAMA_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release --target llama-cli llama-bench llama-tokenize`）——**T10 前置任务**（现判定机有源码无构建产物）。
+- **D7 Judge/Referee 构建（r2 修正为 T0 显式任务）**：llama.cpp pinned f280b2698 **CPU 档**构建（`-DCMAKE_BUILD_TYPE=Release --target llama-cli llama-bench llama-tokenize llama-quantize llama-gguf`；r2：CUDA 档在对拍中不使用且 `CMAKE_CUDA_ARCHITECTURES=120` 在 nvcc 12.6 判定机不可构建——CPU 档覆盖全部 referee 工具）——**T0**；现判定机有源码无构建产物。
 
 ## Module Breakdown
 
@@ -21,22 +21,29 @@
 | `crates/tokenizer/src/{spm,bpe}.rs` | 004 判据实现（BPE 主档 + SPM 容器读入（判据依赖 004 M4 金块）） |
 | `crates/cuda/src/{dequant,gemm,attention}.rs` | dequant 核（QK8_0）、`gemm_f16_16acc`（sys 直调 16F）、`gemm_f32acc`（数值门禁档）、prefill/`decode_step_gqa` |
 | `crates/memory/src/pool.rs` | 页块池（LIFO/refcount/守恒断言/毒化测试） |
-| `bin/reinfer/src/cli.rs` | Runner 最小组装（seed 注入点=构造一次 SplitMix64，temp=0 不消费 RNG） |
-| `scripts/ci/gate_throughput.sh` + `bench/prompts/` + `scripts/golden/` | **T10 创建**（D5 落地）+ gen_tokens.sh + goldens（004 依赖） |
+| `bin/reinfer/src/cli.rs` | Runner 最小组装 + r2 单点契约：**Backend trait（load_weights / prefill(ids) / decode_step() / logits()——015/007 只实现不定义，A-M4 正式化吸收点）**；seed 注入点=构造一次 SplitMix64，temp=0 不消费 RNG（r2 声明：temp>0 顺序流=012 语义；005 纯函数化迁移差异随 005 立项记录——复现仅同 runner 实现内） |
+| `scripts/ci/gate_throughput.sh` + `bench/prompts/` + `scripts/golden/` | **T10 创建**（D5 落地；阈值/backend 参数化——007/015 复用不改造）+ q8_0 金块（**生成器 `scripts/golden/gen_q8_0_golden.sh` 已在仓，金块数据 `tests/golden/`，生成依赖 llama-quantize=T0 + 013 存档**）+ BPE tokenizer 金块（`tests/golden/tokenizer-*.json`，`bench/golden/gen_tokens.sh` 路径以 **parity.md 为准**——r2 路径唯一化） |
 
 ## Interface Contracts（关键签名，r1 修订）
 
 ```rust
-// crates/gguf（承接 001：假设 GgufReader/dequantize_q8_0 已存在；本切片仅增量）
+// crates/gguf（承接 001，单源：codes::dequantize_q8_0 即 CPU 参考）
 pub fn dequantize_q8_0(blob: &[u8], out: &mut [f32]) -> Result<(), ...>;   // QK8_0=32，单乘
+// crates/kernels（r2：matmul_ref 唯一源；dequant_ref 不另建）
+pub fn matmul_ref(a: &[f32], b: &[f32], ...) -> Vec<f32>;         // fp32 累加 naive
+pub fn prefill_attn_ref(...) -> Vec<f32>;                         // 012 ref 语义 + fp32 matmul
 // crates/cuda（新）
 pub struct Gemm;                                               // 三层明示：
-pub fn gemm_f32acc(a: &[f16], ...) -> Result<...>;             //   CUBLAS_COMPUTE_32F（diff/门禁档）
+pub fn gemm_f32acc(a: &[f16], ...) -> Result<...>;             //   CUBLAS_COMPUTE_32F（diff/门禁档 rtol+atol）
 pub fn gemm_f16_16acc(a: &[f16], ...) -> Result<...>;          //   16F（parity 记录档；sys 直调）
 pub fn prefill_attention(...) ;                                //   32F GEMM + fp32 中间（判据档）
 pub fn decode_step_gqa(...) ;                                  //   smem staged + GQA 映射（D3）
-// bin cli
-pub fn run_cli(backend, model_path, prompt, seed) -> ...;      // 模型路径=CLI/env（零硬编码）
+// bin（r2 单点契约：015/007 只实现不定义）
+pub trait Backend { fn load_weights(&mut self, spec: &WeightSpec) -> Result<(), ...>;
+                    fn prefill(&mut self, ids: &[u32]) -> Result<(), ...>;
+                    fn decode_step(&mut self) -> Result<(), ...>;
+                    fn logits(&self) -> Result<Vec<f32>, ...>; }
+pub fn run_cli(backend: &dyn Backend, model_path, prompt, seed) -> ...;   // 模型路径=CLI/env（零硬编码）
 ```
 
 ## 差异注记（001/003/004 原文 vs 本切片，r1）
@@ -71,7 +78,7 @@ pub fn run_cli(backend, model_path, prompt, seed) -> ...;      // 模型路径=C
 
 - M0：001/004/013 交付状态核对（外部依赖行）
 - M1（D1-D4）：数据管道（CPU-only，golden+真模型存档+004 判据）
-- M2（D5-D6）：dequant 位精确 + GEMM 32F 门禁/16F 记录（**judge 构建随 T10；但 llama.cpp referee 构建可作为 M2 起并行任务**）
+- M2（D5-D6）：dequant 位精确 + GEMM 32F 门禁/16F 记录（**referee 构建 = T0，M2 前须完成**——r2：T2/T4/T10 判据链全部依赖，不再"随 T10 并行"）
 - M3（D7）：attention 真机（32F 判据 + 泄漏三合一 + 毒化）
 - M4（D8）：cli 流式（F16→Q8_0）+ parity 四层
 - M5（T10）：gate_throughput.sh 创建 + 3×（1.5B）判据 + notes

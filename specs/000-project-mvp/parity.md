@@ -2,6 +2,7 @@
 
 > 2026-08-25 建立（SDD 评审 B-L1/M2/M3、C-低、B-L5 采纳统一）。所有 spec 引用的模型/prompt/门禁阈值以此为准。
 > 约定：某行 sha256/golden 尚未生成时以 `TODO(generate)` 占位，生成后必须随 golden 文件一起提交（PR 审查）。
+> 2026-08-28 互注（specs/014 r2 评审唯一化）：若本文件各行 golden 生成前一律以 013 端到端 sha 锚点为准（014 spec 模型行已钉）；**金块数据 = `tests/golden/`（q8_0/tokenizer 金块 JSON）；生成器 = `scripts/golden/`（gen_q8_0_golden.sh 已在仓）；`bench/golden/gen_tokens.sh` 仅属 tokenizer 行**——三处不混（014 plan Module Breakdown 同注）。
 
 ## 模型与权重
 
@@ -22,7 +23,7 @@
 | 项 | 值 |
 |---|---|
 | commit | f280b2698（build b10615） |
-| 构建 | LLAMA_CUDA=ON；CMAKE_CUDA_ARCHITECTURES 与判定机 GPU 对齐；不 FORCE_MMQ；记录 cuBLAS/CUDA 版本 |
+| 构建 | **r2 修订（014 T0）**：CPU 档（`-DCMAKE_BUILD_TYPE=Release`；对拍协议全 CPU 工具——llama-bench `-ngl 0`/llama-tokenize/quantize/cli；CUDA 构建不用且 nvcc 12.6 判定机不可建 ARCH=120）；记录 CPU 型号/核数 |
 | F16 对比 | 双方 compute type 一致：llama.cpp 侧 `GGML_CUDA_CUBLAS_COMPUTE_TYPE=16F` |
 | 结论基准 | 见 specs/006 基准协议（llama-bench 参数、KV dtype=f16、graph on） |
 

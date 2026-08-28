@@ -1,6 +1,7 @@
 # Tasks: GGUF tokenizer
 
 > Derived from specs/004-tokenizer/plan.md
+> **交付状态（2026-08-28 核对）**：Task1/3/4 已交付（BPE encode bpe.rs:238 + decode/增量 + fuzz 31 测试绿）；**Task2（SPM encode）未交付**——`SpmEncodeUnimplemented`（等 M4 golden 锚定）；Task5 的 `cli` 集成命令形态已被 CLI 契约 v2.15 取代（`run <model> --backend cpu|cuda`；`cli` 子命令撤销）。跟进：014 T4（BPE 金块首建 + skip 兜底）/007 T1（仅消费 BPE）已在各自 spec 注记。
 
 ## Task 1: crate scaffold + GGUF 数据读取
 

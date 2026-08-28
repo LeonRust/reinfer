@@ -1,6 +1,6 @@
 # Spec: CUDA L3 — single-request full loop（第一次跑出 token）
 
-> Status: proposal · r1（2026-08-27 四代理评审修订）· Owner: maintainers
+> Status: proposal · r2（2026-08-28 四代理评审修订：命令面/金块实体/判据 atol/trait 单点/EOS 防呆）· Owner: maintainers
 > Parent: phase-plan §L3（003 T8-T12 + 004）· 实施锚：001 Task2–4 / 004 / 003 T8-T12 / 000 parity.md
 > 模型：经 **specs/013 resolver** 获取（**ModelScope 优先，`auto` 可回退 HuggingFace**——013 r2 铁律修订版；代码路径零模型标识，另见 Constraints）
 > 前序：009（L1）/ 012（L2 JitCache + 首批内核 + 选择链）
@@ -13,21 +13,21 @@ L1/L2 证明了"能安全消费运行时"与"能编译并跑我们自己的 kern
 
 | 块 | 功能 | 实施锚 | 验收 gate（r1） |
 |---|---|---|---|
-| D1 GGUF 读取 | header/meta/tensor 表 + mmap | 001 Task2–3 | golden（**真实 tiny GGUF，`tests/data/`**）+ proptest；**真模型存档测试**（013 获取 0.5B q8_0 → reader+arch 全链 + llama.cpp `gguf --dump` 逐键比对；`#[ignore]`/独立脚本，路径经 env 注入；非主档） |
+| D1 GGUF 读取 | header/meta/tensor 表 + pread views | 001 Task2–3 | golden = **013 真模型存档**（0.5B q8_0，env 注入）reader+arch 全链 + llama.cpp `gguf --dump` 逐键/类型比对（r2：真实 tiny GGUF 无生成器——convert 需真实模型为输入，存档对拍承担 golden，`tests/data/tiny.gguf` 不再作为独立 gate）；自生成 fixture 仅作 proptest |
 | D2 量化 codec | Q8_0（**block 32 = QK8_0，34 B/block；非 256**）/F16/FP32 | 001 Task4 | 金块（`llama-quantize`，pinned commit f280b2698 + 明确 flags）**位精确（0 ulp：`y=f32(q)*f32(f16(d))` 单乘语义）**；proptest 仅作 quant∘dequant 有界性 |
 | D3 arch config | Llama/Qwen2 元数据 → typed config | 001 plan | parse 单测 + 真模型存档对拍 |
 | D4 tokenizer | GGUF BPE（qwen2 pre 特例）/SPM 容器 | 004 | **004 原文判据**：encode 逐 token ids & piece texts 100%（`llama-tokenize --ids`）+ 增量 decode 分块自洽；**不与 llama.cpp 流式 detokenizer 逐 token 对拍**；SPM 路径依赖 004 M4 金块（014 内仅 gate BPE） |
 | D5 dequant 内核 | Q8_0 并行核（QK8_0=32 语义）+ F16 直读 | 003 T8 | 与 T2 CPU 参考**位精确**；内核约束：直读存储 fp16 scale、禁 FMA 化写法（`q*d+0.0f` 禁写） |
-| D6 GEMM | Vendor 档 GEMM：**cuBLAS 封装**（f16 16F-acc，CUBLAS_COMPUTE_16F 显式；llama.cpp `GGML_CUDA_CUBLAS_COMPUTE_TYPE=16F` 对齐）| 003 T9 | 数值门禁用 **CUBLAS_COMPUTE_32F** 档：f16-in/f32-out rel 1e-4（atol 1e-6）/ f32-in/f32-out rel 1e-5；f16-out 档=双侧 fp16 舍入 ≤1 ulp；**16F-acc 档为记录项**（rel ≤1e-1 声明，parity 兜底）；形状含模型真实 K（896/1536）、K∈1..4096；perf sanity（notes） |
-| D7 attention | Prefill：两段 GEMM（NHD，**fp32 中间 buffer**）；Decode：paged GQA（块 16/32，smem staged）+ MemOps | 003 T10/T11 | 参考=**CPU naive**（`prefill_attn_ref`：012 ref 语义 + fp32 累加 matmul）；两段 GEMM 32F + fp32 中间 → 输出舍入 fp16 ≤1 ulp；16F+fp16 中间为记录项；GQA 映射 pin（见 plan）；随机页表 diff + 毒化测试；泄漏三合一断言 |
-| D8 闭环 | 最小 Runner（bin/cli）+ `reinfer cli --backend cuda --model <gguf> "<prompt>"` 流式 | 003 T12 | parity 四层（见 success metrics）；**decode ≥3× llama.cpp CPU——硬闸仅 1.5B Q8_0 档**（0.5B/F16 仅记录）；确定性（temp=0 档） |
+| D6 GEMM | Vendor 档 GEMM：**cuBLAS 封装**（f16 16F-acc，CUBLAS_COMPUTE_16F 显式；llama.cpp `GGML_CUDA_CUBLAS_COMPUTE_TYPE=16F` 对齐）| 003 T9 | 数值门禁用 **CUBLAS_COMPUTE_32F** 档：**rtol 1e-4 + atol 1e-6**（r2：rel-only 在近零元素爆表、K=1536 顺序归约差与容差同阶——双条款同 012 D6）；f16-out 档=双侧 fp16 舍入 ≤1 ulp；**16F-acc 档为记录项**（rel ≤1e-1 声明，parity 兜底）；形状含模型真实 K（896/1536）、K∈1..4096；perf sanity（notes） |
+| D7 attention | Prefill：两段 GEMM（NHD，**fp32 中间 buffer**）；Decode：paged GQA（块 16/32，smem staged）+ MemOps | 003 T10/T11 | 参考=**CPU naive**（`prefill_attn_ref`：012 ref 语义 + fp32 累加 matmul）；两段 GEMM 32F + fp32 中间 → 输出舍入 fp16 **|out|≥2^-14 元素 ≤1 ulp（近零按 atol 1e-6，r2 条款）**；16F+fp16 中间为记录项；GQA 映射 pin（见 plan）；随机页表 diff + 毒化测试（**含 unmasked 位置 NaN 注入：仅全 masked 行允许输出 0，r2 反例修正**）；泄漏三合一断言 |
+| D8 闭环 | 最小 Runner（bin）+ `reinfer run <model> --backend cuda "<prompt>"` 流式（r2：命令面契约 v2.15——`run <model>` 位置参数 + `--backend`；`cli` 子命令与 `--model` 旗撤销） | 003 T12 | parity 四层（见 success metrics）；**decode ≥3× llama.cpp CPU——硬闸仅 1.5B Q8_0 档**（0.5B/F16 仅记录）；确定性（temp=0 档）；**生成语义必含（r2）：EOS 命中即停（模型 self EOS id）· `-n` 硬限（缺省=模型上下文上限）· logits 全 NaN → 显式错误不继续走号 · embedding 越界 id → LaunchError · `-t 0` 短路 argmax 链（005 D5 语义）** |
 
 模型：Qwen2.5-0.5B-Instruct（调试）+ 1.5B（验收），from 013（q8_0 锚点 675,710,816 B/sha256 已钉；fp16 与 1.5B 的 4 份文件 sha 由 013 M3 端到端时补钉）。
 
 ## Success Metrics
 
 - 第一次流式 token：200 token 稳出（无 NaN；temp=0 档 seed 固定复现）
-- 数值对拍（**parity 四层，r1 显式枚举**）：① tokenizer 100%（004）；② F16 同 compute type 逐 token 100%（回退档:累积 drift ≤1e-4；notes 记 attention 算法差异实际一致率）；③ Q8_0 greedy ≥99.9%；④ logits 相对漂移 ≤1e-2（记录项）
+- 数值对拍（**parity 四层，r1 显式枚举**）：① tokenizer 100%（004）；② F16 同 compute type 逐 token 100%（回退档:累积 drift ≤1e-4；notes 记 attention 算法差异实际一致率）；③ Q8_0 greedy ≥99.9%；④ logits 相对漂移 ≤1e-2（记录项）——**r2 加固：harness（落点 `tests/parity.rs`，allowlist `l3-parity`）先做 logits 全量 finite 硬断言（防「全 NaN 双方 argmax 一致」假通过），drift 检查与 token 比对覆盖同一数据全量；Q8_0 档补序列级用例（整 tensor 解码 vs llama.cpp 张量输出；金块单块判据不足以测 block 跨页/boundary）**
 - decode ≥3× llama.cpp CPU（**仅 1.5B Q8_0；同机同参，008 D5 协议**，notes 四元组+CPU 身份）
 - 复现包：模型 sha（013 manifest）+ 参数 + seed + sampler 语义锚点
 

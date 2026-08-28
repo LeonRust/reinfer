@@ -5,7 +5,7 @@
 > ⑤ 最小集；⑥ 默认目录 = `~/.reinfer/models`（Windows `%USERPROFILE%\.reinfer\models`）；
 > ⑦ 增强并入：`--dry-run`、`--format/--quiet`、4 并发；⑧ 进度显示两层设计（文件条 + GLOBAL 条）。
 > **状态**：v2 已锁定本文件内容的定稿部分（v2.1：serve 章节；v2.2：run/chat/bench 章节；
-> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting）；v2.12：断点续传 + GLOBAL 净落盘；v2.13：进度渲染=indicatif（三方库，用户拍板）；v2.14：紧凑视图（方案 A——ghost 根因=多行清单溢出终端高度））；
+> v2.3：doctor 章节定稿；v2.4：通用五件套（version/completions/日志分级/no-color/`--`）；v2.5：解析实现=clap；v2.6：env 体系（RUST_LOG 兼容/SERVE_* env/doctor 回显）；v2.7：小件定稿+实现迁移路径；v2.8：bench 细节定稿；v2.9：REPL/serve 日志面定稿——设计探讨闭环；v2.10：模型目录按 repo 组织（root/{repo}/…+per-repo manifest）；v2.11：进度视图=全文件清单（完成置顶/未开始见 waiting）；v2.12：断点续传 + GLOBAL 净落盘；v2.13：进度渲染=indicatif（三方库，用户拍板）；v2.14：紧凑视图（方案 A——ghost 根因=多行清单溢出终端高度））；v2.15：run/chat/bench 增加 `--backend auto|cuda|ascend|cpu`（014/015/007 三 spec 统一命令面——2026-08-28 四代理评审 S1；后端缺省 = auto：cuda → ascend → cpu 探测链，cpu 恒兜底——007 立项后语义；doctor `--backend` 同步加 cpu 档）；
 > CLI 整体方案仍在与用户继续探讨（后续增减以 r 版本记录在本文件 changelog）；
 > 实现动工待整体探讨结束后统一批准。
 
@@ -213,12 +213,17 @@ reinfer serve <model> [-q <qtag> | -f <file>] [--revision <ref>] [--local-dir <d
 ### run / chat / bench（v2.2 定稿；决策：OpenAI 缺省表 · run/chat 无 json · REPL 核心组现定）
 
 ```
-run   <model> [-q|-f] [--device] [-n <max-tokens>] [-t <temp>] [--top-p <p>] [--top-k <k>]
-             [--seed <s>] [--max-model-len <n>] [prompt...]
-chat  <model> [-q|-f] [--device] [-n] [-t] [--top-p] [--top-k] [--seed] [--max-model-len]
-bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len <n>]
-             [--prompt-file <path>] [--format table|json]
+run   <model> [-q|-f] [--backend auto|cuda|ascend|cpu] [--device] [-n <max-tokens>]
+             [-t <temp>] [--top-p <p>] [--top-k <k>] [--seed <s>] [--max-model-len <n>] [prompt...]
+chat  <model> [-q|-f] [--backend auto|cuda|ascend|cpu] [--device] [-n] [-t] [--top-p] [--top-k]
+             [--seed] [--max-model-len]
+bench <model> [-q|-f] [--backend auto|cuda|ascend|cpu] [--device] [--max-model-len]
+             [-r/--reps <n>] [-l/--seq-len <n>] [--prompt-file <path>] [--format table|json]
 ```
+
+- **`--backend`（v2.15 定稿）**：缺省 `auto` = 探测链 cuda → ascend → cpu（有 CUDA 卡即 cuda——用户
+  2026-08-27 拍板"cuda 默认运行"）；显式档位为三 spec（014/015/007）的强制后端（错配设备 → exit 2）。
+  CPU 为恒兜底档（007「保证一定可以推理」）。`--device` 仅对设备侧后端（cuda/ascend）生效（运行时选卡）。
 
 - **工程缺省表（用户 2026-08-27 定：OpenAI API 缺省）**：`-t/--temperature=1.0` · `--top-p=1.0` ·
   `--top-k=关` · `-n/--max-tokens=模型上下文上限`。`--seed=<optional>`：给则全链确定（012 sampler host
@@ -244,7 +249,7 @@ bench <model> [-q|-f] [--device] [--max-model-len] [-r/--reps <n>] [-l/--seq-len
 ### doctor（v2.3 定稿——原预置名 diag，用户 2026-08-27 定版改名）
 
 ```
-reinfer doctor [--backend auto|cuda|ascend] [--format table|json|quiet] [--net]
+reinfer doctor [--backend auto|cuda|ascend|cpu] [--format table|json|quiet] [--net]
 ```
 
 - **语义**：环境体检（先例：flutter doctor / cargo doctor / npm doctor）——逐项 ✓/⚠/✗ 判定 +

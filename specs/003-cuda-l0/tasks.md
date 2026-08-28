@@ -1,6 +1,7 @@
 # Tasks: CUDA L0 — GPU inference loop
 
 > Derived from specs/003-cuda-l0/plan.md · 每条独立可验证；容差一律用 plan.md §D7 数值容差表
+> **双轨注记（2026-08-28，specs/014 r1/r2 评审修订）**：T8-T12 判据与实施以 **specs/014-cuda-l3-single-request（r2）为准**——T8 的「block 256, ≤1 ulp」修订为 **QK8_0=32 + 位精确（0 ulp）**；T9 的「f16 rel 1e-4 / f32 rel 1e-5」修订为 **32F 门禁 rtol+atol / 16F-acc 记录档**；T12 命令形态以 CLI 契约 v2.15（`reinfer run <model> --backend cuda`）为准，「--model Llama-8B-Q8_0.gguf」属**硬编码模型名样例，删除**（013 铁律）。T8-T12 由 014 承担（003 本行保留为锚指针）。
 
 ## T1: CUDA wiring (workspace)
 
@@ -49,7 +50,7 @@
 ## T12: Sampler 集成 + engine 单请求闭环
 
 - ModelRunner 路径：001 GGUF → 004 tokenizer（依赖）→ 003 kernels → sampler → 流式 decode；`crates/engine` 最小宿主或经 `arch` 组装（归属见 design review A-M4：engine crate 于 005 切片正式建）
-- Verification: `reinfer cli --backend cuda --model Llama-8B-Q8_0.gguf "prompt"` 流式；parity.md 矩阵跑通（F16 三层门禁/Q8_0 ≥99.9%）；decode≥3× llama.cpp CPU（基准协议，gpu-runner 判定）+ notes 记录
+- Verification: `reinfer run <model> --backend cuda "prompt"（模型引用=位置参数；零硬编码——见 014 r2）` 流式；parity.md 矩阵跑通（F16 三层门禁/Q8_0 ≥99.9%）；decode≥3× llama.cpp CPU（基准协议，gpu-runner 判定）+ notes 记录
 
 ## T13: CI 门禁
 

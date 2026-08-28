@@ -55,10 +55,21 @@ impl SpmTokenizer {
                 }
                 xs[..pieces.len()].to_vec()
             }
+            // 014 T4：真实发布 GGUF 的 token_type 为 i32 数组（转换器 v4 起）——
+            // 与 u32 同值，符号扩展安全（token_type 取值域 0..=6）。
+            Some(MetaValue::Array(ArrayValue::I32(xs))) => {
+                if xs.len() < pieces.len() {
+                    return Err(TokenizerError::InvalidMetadata {
+                        key: "tokenizer.ggml.token_type".into(),
+                        why: format!("len {} < tokens len {}", xs.len(), pieces.len()),
+                    });
+                }
+                xs[..pieces.len()].iter().map(|v| *v as u32).collect()
+            }
             Some(_) => {
                 return Err(TokenizerError::InvalidMetadata {
                     key: "tokenizer.ggml.token_type".into(),
-                    why: "expected u32 array".into(),
+                    why: "expected u32/i32 array".into(),
                 });
             }
         };

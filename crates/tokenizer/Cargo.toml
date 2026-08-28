@@ -15,3 +15,6 @@ workspace = true
 [lib]
 name = "reinfer_tokenizer"
 path = "src/tokenizer.rs"
+
+[dev-dependencies]
+serde_json = { workspace = true }

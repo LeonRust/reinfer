@@ -138,10 +138,21 @@ impl BpeTokenizer {
                 }
                 xs[..pieces.len()].to_vec()
             }
+            // 014 T4：真实发布 GGUF 的 token_type 为 i32 数组（转换器 v4 起）——
+            // 与 u32 同值，符号扩展安全（token_type 取值域 0..=6）。
+            Some(MetaValue::Array(ArrayValue::I32(xs))) => {
+                if xs.len() < pieces.len() {
+                    return Err(TokenizerError::InvalidMetadata {
+                        key: "tokenizer.ggml.token_type".into(),
+                        why: format!("len {} < tokens len {}", xs.len(), pieces.len()),
+                    });
+                }
+                xs[..pieces.len()].iter().map(|v| *v as u32).collect()
+            }
             Some(_) => {
                 return Err(TokenizerError::InvalidMetadata {
                     key: "tokenizer.ggml.token_type".into(),
-                    why: "expected u32 array".into(),
+                    why: "expected u32/i32 array".into(),
                 });
             }
         };
@@ -254,7 +265,13 @@ impl BpeTokenizer {
             };
             for frag in partition(text, &active, &self.pieces) {
                 match frag {
-                    Fragment::Raw(seg) => self.encode_word(seg, &mut out),
+                    Fragment::Raw(seg) => {
+                        // llama.cpp BPE：regex 预切分后逐 fragment 独立 merge
+                        // （QWEN2 pre-type；fragment 间不 merge——差异根因 014 T4）
+                        for piece in qwen2_fragments(seg) {
+                            self.encode_word(piece, &mut out);
+                        }
+                    }
                     Fragment::Token(id) => out.push(id),
                 }
             }
@@ -481,6 +498,158 @@ fn partition<'a>(text: &'a str, specials: &[u32], pieces: &[String]) -> Vec<Frag
         pos = start + len;
     }
     frags
+}
+
+/// QWEN2 pre-type 的 BPE 预切分（`tokenizer.ggml.pre == "qwen2"`）。
+///
+/// llama.cpp `llama-vocab.cpp` `LLAMA_VOCAB_PRE_TYPE_QWEN2` 的正则（pcre2，
+/// leftmost-first）：每个匹配片段独立做 BPE 合并，片段之间**不**合并；
+/// 014 T4 判据（encode 100%）依赖本切分与 referee 逐片段一致。
+fn qwen2_fragments(text: &str) -> Vec<&str> {
+    // Hand-written scanner replicating llama.cpp `unicode_regex_split` for
+    // the QWEN2 pre-type branch (std::regex ECMAScript: alternation order +
+    // greedy backtracking; see llama-vocab.cpp / unicode.cpp).
+    // Every fragment is BPE-merged independently (no cross-fragment merges).
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut frags = Vec::new();
+    let mut pos = 0usize;
+    while pos < n {
+        let b0 = byte_pos(&chars, pos);
+        let (len, ok) = scan_fragment(&chars, pos, n);
+        if !ok {
+            // Guard: last-resort single char (should not be reached).
+            let b1 = byte_pos(&chars, pos + 1);
+            frags.push(&text[b0..b1]);
+            pos += 1;
+            continue;
+        }
+        let b1 = byte_pos(&chars, pos + len);
+        frags.push(&text[b0..b1]);
+        pos += len;
+    }
+    frags
+}
+
+fn byte_pos(chars: &[char], idx: usize) -> usize {
+    chars[..idx].iter().map(|c| c.len_utf8()).sum()
+}
+
+fn is_cpt_letter(c: char) -> bool {
+    c.is_alphabetic()
+}
+fn is_cpt_digit(c: char) -> bool {
+    c.is_numeric()
+}
+fn is_cpt_ws(c: char) -> bool {
+    c.is_whitespace()
+}
+
+/// One-shot fragment scan at `pos`; returns (length, matched).
+fn scan_fragment(chars: &[char], pos: usize, n: usize) -> (usize, bool) {
+    // A: '(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])
+    if pos + 1 < n && chars[pos] == '\'' {
+        let c2 = chars[pos + 1];
+        let ok2 =
+            matches!(c2, 's' | 'S' | 't' | 'T' | 'm' | 'M' | 'd' | 'D');
+        let ok3 = pos + 3 <= n
+            && matches!(c2, 'r' | 'R' | 'v' | 'V' | 'l' | 'L')
+            && matches!(chars[pos + 2], 'e' | 'E');
+        if ok2 {
+            return (2, true);
+        }
+        if ok3 {
+            return (3, true);
+        }
+    }
+    // B: [^\r\n\p{L}\p{N}]?\p{L}+
+    {
+        let c0 = chars[pos];
+        if is_cpt_letter(c0) {
+            let mut k = pos + 1;
+            while k < n && is_cpt_letter(chars[k]) {
+                k += 1;
+            }
+            return (k - pos, true);
+        }
+        if !is_cpt_letter(c0)
+            && !is_cpt_digit(c0)
+            && c0 != '\r'
+            && c0 != '\n'
+            && pos + 1 < n
+            && is_cpt_letter(chars[pos + 1])
+        {
+            let mut k = pos + 2;
+            while k < n && is_cpt_letter(chars[k]) {
+                k += 1;
+            }
+            return (k - pos, true);
+        }
+    }
+    // C: \p{N} (single)
+    if is_cpt_digit(chars[pos]) {
+        return (1, true);
+    }
+    // D: " ?" [^\s\p{L}\p{N}]+ [\r\n]*
+    {
+        let mut k = pos;
+        if chars[k] == ' ' {
+            k += 1;
+        }
+        let start = k;
+        while k < n
+            && !is_cpt_ws(chars[k])
+            && !is_cpt_letter(chars[k])
+            && !is_cpt_digit(chars[k])
+        {
+            k += 1;
+        }
+        if k > start {
+            // greedy \r\n* tail
+            let mut k2 = k;
+            while k2 < n && (chars[k2] == '\r' || chars[k2] == '\n') {
+                k2 += 1;
+            }
+            return (k2 - pos, true);
+        }
+    }
+    // E: \s*[\r\n]+  (greedy: leading whitespace run then the first
+    // \r/\n run; all chars before the newline run must be whitespace)
+    {
+        let mut m = pos;
+        while m < n && chars[m] != '\r' && chars[m] != '\n' {
+            m += 1;
+        }
+        if m < n {
+            let all_ws = chars[pos..m].iter().all(|c| is_cpt_ws(*c));
+            if all_ws {
+                let mut e = m;
+                while e < n && (chars[e] == '\r' || chars[e] == '\n') {
+                    e += 1;
+                }
+                return (e - pos, true);
+            }
+        }
+        // no newline run: fall through to F/G
+    }
+    // F+G: \s+(?!\S) | \s+
+    if is_cpt_ws(chars[pos]) {
+        let mut e = pos;
+        while e < n && is_cpt_ws(chars[e]) {
+            e += 1;
+        }
+        let run = e - pos;
+        if e < n {
+            // next char is non-whitespace: \s+(?!\S) backtracks to run-1
+            // (satisfied because the next char inside the run is whitespace)
+            if run > 1 {
+                return (run - 1, true);
+            }
+            return (1, true); // fallback \s+ match
+        }
+        return (run, true);
+    }
+    (0, false)
 }
 
 /// 朴素子串查找（special 文本均很短）。

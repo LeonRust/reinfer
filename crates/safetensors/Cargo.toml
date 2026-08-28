@@ -1,12 +1,11 @@
 [package]
-name = "reinfer-arch"
+name = "reinfer-safetensors"
 version = "0.1.0"
 edition = "2024"
 
 publish = false
 
 [dependencies]
-reinfer-gguf = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

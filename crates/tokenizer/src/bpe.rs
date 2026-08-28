@@ -174,6 +174,128 @@ impl BpeTokenizer {
         Self::from_parts(pieces, types, merges, bos, eos, unk, add_bos, add_eos)
     }
 
+    /// 从 HF tokenizer.json + tokenizer_config.json 构造（Qwen3 系；014 T4 延伸）。
+    ///
+    /// 等价转换（语义与 llama.cpp QWEN2 同源——Qwen3 的 pre_tokenizer 为
+    /// Split(Qwen regex)+ByteLevel，与 GGUF QWEN2 路径一致，无 GMF
+    /// （`ignore_merges: false` 已核实））：
+    /// - `model.vocab`（str→id）→ pieces（按 id 定位，缺口留空）；
+    /// - `model.merges`（[left,right] 对）→ "left right" 串表；
+    /// - `added_tokens[].special` → CONTROL（入 specials 集合），否则 NORMAL；
+    /// - bos/eos/unk 取 tokenizer_config（str 或 {"content": str}），按文本查 id；
+    /// - `add_bos_token` 直接取自 tokenizer_config。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_hf_json(
+        tok: &serde_json::Value,
+        cfg: &serde_json::Value,
+    ) -> Result<Self, TokenizerError> {
+        let model = tok
+            .get("model")
+            .ok_or_else(|| TokenizerError::InvalidMetadata {
+                key: "tokenizer.json".into(),
+                why: "missing model section".into(),
+            })?;
+        if model.get("type").and_then(|t| t.as_str()) != Some("BPE") {
+            return Err(TokenizerError::UnsupportedModel {
+                model: model
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("<missing>")
+                    .to_string(),
+            });
+        }
+        let vocab = model.get("vocab").and_then(|v| v.as_object()).ok_or_else(|| {
+            TokenizerError::InvalidMetadata {
+                key: "tokenizer.json model.vocab".into(),
+                why: "expected object".into(),
+            }
+        })?;
+
+        // pieces 按 id 定位（缺口留空；ids 稀疏时以最大 id 为界）
+        let mut pieces: Vec<String> = Vec::new();
+        let mut text_to_id_probe: Vec<(String, u64)> = vocab
+            .iter()
+            .filter_map(|(t, id)| id.as_u64().map(|i| (t.clone(), i)))
+            .collect();
+        text_to_id_probe.sort_by_key(|(_, i)| *i);
+        for (t, i) in &text_to_id_probe {
+            let i = *i as usize;
+            if pieces.len() <= i {
+                pieces.resize(i + 1, String::new());
+            }
+            if pieces[i].is_empty() {
+                pieces[i] = t.clone();
+            }
+        }
+
+        // token_type 默认 NORMAL；added_tokens.special → CONTROL
+        let mut types = vec![TYPE_NORMAL; pieces.len()];
+        let added = tok
+            .get("added_tokens")
+            .and_then(|a| a.as_array())
+            .map(ToOwned::to_owned)
+            .unwrap_or_default();
+        for a in &added {
+            let Some(id) = a.get("id").and_then(|i| i.as_u64()) else { continue };
+            let id = id as usize;
+            let content = a.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if pieces.len() <= id {
+                pieces.resize(id + 1, String::new());
+                types.resize(id + 1, TYPE_NORMAL);
+            }
+            if pieces[id].is_empty() {
+                pieces[id] = content.to_string();
+            }
+            if a.get("special").and_then(|s| s.as_bool()).unwrap_or(false) {
+                types[id] = TYPE_CONTROL;
+            }
+        }
+
+        let merges: Vec<String> = model
+            .get("merges")
+            .and_then(|m| m.as_array())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|pr| {
+                        pr.as_array().map(|p| {
+                            p.iter()
+                                .filter_map(|s| s.as_str())
+                                .collect::<Vec<&str>>()
+                                .join(" ")
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // bos/eos/unk：token 值可为 str 或 {"content": str}；按 text 查 piece id
+        let lookup = |cfg: &serde_json::Value, name: &str| -> Result<Option<u32>, TokenizerError> {
+            let Some(v) = cfg.get(name) else {
+                return Ok(None);
+            };
+            if v.is_null() {
+                return Ok(None);
+            }
+            let text = v
+                .as_str()
+                .or_else(|| v.get("content").and_then(|c| c.as_str()));
+            let Some(text) = text else {
+                return Err(TokenizerError::InvalidMetadata {
+                    key: format!("tokenizer_config.json {name}"),
+                    why: "expected string or {content: string}".into(),
+                });
+            };
+            Ok(pieces.iter().position(|p| p == text).map(|i| i as u32))
+        };
+        let bos = lookup(cfg, "bos_token")?;
+        let eos = lookup(cfg, "eos_token")?;
+        let unk = lookup(cfg, "unk_token")?;
+        let add_bos = cfg.get("add_bos_token").and_then(|b| b.as_bool()).unwrap_or(false);
+        let add_eos = cfg.get("add_eos_token").and_then(|b| b.as_bool()).unwrap_or(false);
+
+        Self::from_parts(pieces, types, merges, bos, eos, unk, add_bos, add_eos)
+    }
+
     /// 从三表 + special 配置构造（fixture 与真实 GGUF 共用）。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
@@ -799,9 +921,9 @@ pub(crate) mod tests {
     fn encode_uncovered_bytes_are_skipped() {
         let tok = fixture(false, false);
         // '\u{0}' → U+0100 不在 vocab，byte 兜底也找不到 → 静默跳过
-        assert_eq!(tok.encode("\u{0}", false).unwrap(), []);
+        assert!(tok.encode("\u{0}", false).unwrap().is_empty());
         // emoji 字节全未覆盖 → 空序列
-        assert_eq!(tok.encode("🙂", false).unwrap(), []);
+        assert!(tok.encode("🙂", false).unwrap().is_empty());
     }
 
     #[test]

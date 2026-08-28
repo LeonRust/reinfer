@@ -129,6 +129,26 @@ impl Tokenizer {
         Ok(Tokenizer::Spm(spm::SpmTokenizer::from_container(container)))
     }
 
+    /// 自 HF `tokenizer.json` + `tokenizer_config.json` 构造
+    /// （模型文件统一对象——非 GGUF 输入面的 tokenizer 路径）。
+    pub fn from_hf_json(
+        tok: &serde_json::Value,
+        cfg: &serde_json::Value,
+    ) -> Result<Self, TokenizerError> {
+        let model = tok
+            .get("model")
+            .and_then(|m| m.get("type"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| TokenizerError::InvalidMetadata {
+                key: "tokenizer.json".into(),
+                why: "missing model.type".into(),
+            })?;
+        match model {
+            "BPE" => Ok(Tokenizer::Bpe(Box::new(bpe::BpeTokenizer::from_hf_json(tok, cfg)?))),
+            other => Err(TokenizerError::UnsupportedModel { model: other.to_string() }),
+        }
+    }
+
     /// 编码文本（special 分段 + BPE 合并；按元数据加 BOS/EOS）。
     pub fn encode(&self, text: &str, parse_special: bool) -> Result<Vec<u32>, TokenizerError> {
         match self {

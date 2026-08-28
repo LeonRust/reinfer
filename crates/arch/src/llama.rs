@@ -22,6 +22,8 @@ pub enum Architecture {
     Llama,
     /// Qwen2 系（Qwen2 / 2.5；rope type = NEOX，freq base 1e6）。
     Qwen2,
+    /// Qwen3（与 Qwen2 同 rope 语义，另具 q/k head norm）。
+    Qwen3,
 }
 
 impl Architecture {
@@ -30,6 +32,7 @@ impl Architecture {
         match self {
             Architecture::Llama => "llama",
             Architecture::Qwen2 => "qwen2",
+            Architecture::Qwen3 => "qwen3",
         }
     }
 
@@ -38,6 +41,7 @@ impl Architecture {
         match s {
             "llama" => Some(Architecture::Llama),
             "qwen2" => Some(Architecture::Qwen2),
+            "qwen3" => Some(Architecture::Qwen3),
             _ => None,
         }
     }
@@ -46,7 +50,7 @@ impl Architecture {
     fn default_rope_freq_base(self) -> f32 {
         match self {
             Architecture::Llama => 10_000.0,
-            Architecture::Qwen2 => 1_000_000.0,
+            Architecture::Qwen2 | Architecture::Qwen3 => 1_000_000.0,
         }
     }
 
@@ -54,8 +58,13 @@ impl Architecture {
     fn rope_type(self) -> RopeType {
         match self {
             Architecture::Llama => RopeType::Norm,
-            Architecture::Qwen2 => RopeType::Neox,
+            Architecture::Qwen2 | Architecture::Qwen3 => RopeType::Neox,
         }
+    }
+
+    /// 是否带 q/k head norm（Qwen3 特有——`k_norm`/`q_norm` 张量）。
+    fn has_head_norm(self) -> bool {
+        matches!(self, Architecture::Qwen3)
     }
 }
 
@@ -105,6 +114,8 @@ pub struct LlamaConfig {
     pub eos_id: Option<u32>,
     /// UNK token id（`tokenizer.ggml.unk_token_id`；缺省无）。
     pub unk_id: Option<u32>,
+    /// q/k head norm（Qwen3 系：RoPE 前对 q/k 逐头 RMSNorm）。
+    pub head_norm: bool,
 }
 
 /// 配置解析错误（消息含键名，便于定位）。
@@ -274,6 +285,117 @@ pub fn from_gguf_meta(meta: &ModelMeta) -> Result<LlamaConfig, ArchError> {
         bos_id: optional_u32(meta, "tokenizer.ggml.bos_token_id")?,
         eos_id: optional_u32(meta, "tokenizer.ggml.eos_token_id")?,
         unk_id: optional_u32(meta, "tokenizer.ggml.unk_token_id")?,
+        head_norm: architecture.has_head_norm(),
+    })
+}
+
+/// 由 HF `config.json` 构造（模型文件统一对象——非 GGUF 输入面）。
+///
+/// 键映射（transformers 4.51 Qwen3/Qwen2/LLaMA 形态，fail-closed）：
+/// - 架构：`architectures[0]`（"Qwen3ForCausalLM" 等）或 `model_type`
+///   （"qwen3" / "qwen2" / "llama"；未知 → 错误）；
+/// - `max_position_embeddings` / `num_hidden_layers` / `hidden_size` /
+///   `intermediate_size` / `vocab_size`；
+/// - 头数：`num_attention_heads` / `num_key_value_heads`（缺省 = q 头，MHA 降级）、
+///   `head_dim`（缺省 = hidden / q_heads 推导）；
+/// - `rope_theta`（缺省架构默认）、`rms_norm_eps`（缺省 1e-5）；
+/// - `bos_token_id` / `eos_token_id`（数字直取）；
+/// - Qwen3 → `head_norm = true`。
+///
+/// 零模型标识：仅架构类型字符串白名单（llama.cpp arch 表同款），无仓库/文件名。
+pub fn from_hf_config(value: &serde_json::Value) -> Result<LlamaConfig, ArchError> {
+    let model_type =
+        value.get("architectures").and_then(|a| a.as_array()).and_then(|a| a.first())
+            .and_then(|a| a.as_str())
+            .or_else(|| value.get("model_type").and_then(|m| m.as_str()))
+            .ok_or_else(|| ArchError::MissingKey { key: "architectures".into() })?;
+    let (architecture, head_norm) = match model_type {
+        "LlamaForCausalLM" | "llama" => (Architecture::Llama, false),
+        "Qwen2ForCausalLM" | "qwen2" => (Architecture::Qwen2, false),
+        "Qwen3ForCausalLM" | "qwen3" => (Architecture::Qwen3, true),
+        other => return Err(ArchError::UnknownArchitecture(other.to_string())),
+    };
+
+    let u = |key: &str| -> Result<usize, ArchError> {
+        value
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .ok_or_else(|| ArchError::MissingKey { key: key.into() })
+    };
+    let ctx_len = u("max_position_embeddings")?;
+    let n_layer = u("num_hidden_layers")?;
+    let hidden_size = u("hidden_size")?;
+    let ffn_hidden = u("intermediate_size")?;
+    let vocab_size = u("vocab_size")?;
+    let q_heads = u("num_attention_heads")?;
+    if q_heads == 0 {
+        return Err(ArchError::InvalidValue {
+            key: "num_attention_heads".into(),
+            why: "query head count must be > 0",
+        });
+    }
+    let kv_heads = value
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(q_heads);
+    if kv_heads == 0 || kv_heads > q_heads {
+        return Err(ArchError::InvalidValue {
+            key: "num_key_value_heads".into(),
+            why: "kv heads must be in 1..=query heads",
+        });
+    }
+    let head_dim = value
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| {
+            if hidden_size % q_heads != 0 { 0 } else { hidden_size / q_heads }
+        });
+    if head_dim == 0 {
+        return Err(ArchError::InvalidValue {
+            key: "head_dim".into(),
+            why: "cannot derive head_dim from hidden_size/head_count",
+        });
+    }
+    let rope_theta = value
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or_else(|| architecture.default_rope_freq_base());
+    if !rope_theta.is_finite() || rope_theta <= 0.0 {
+        return Err(ArchError::InvalidValue {
+            key: "rope_theta".into(),
+            why: "rope theta must be finite and > 0",
+        });
+    }
+    let rms_eps = value
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(1e-5);
+    let id = |key: &str| -> Option<u32> { value.get(key).and_then(|v| v.as_u64()).map(|v| v as u32) };
+
+    Ok(LlamaConfig {
+        architecture,
+        ctx_len,
+        n_layer,
+        hidden_size,
+        q_heads,
+        kv_heads,
+        head_dim,
+        value_dim: head_dim,
+        rope_dim: head_dim,
+        rope_theta,
+        rope_type: architecture.rope_type(),
+        rms_eps,
+        ffn_hidden,
+        vocab_size,
+        bos_id: id("bos_token_id"),
+        eos_id: id("eos_token_id"),
+        unk_id: id("unk_token_id"),
+        head_norm,
     })
 }
 

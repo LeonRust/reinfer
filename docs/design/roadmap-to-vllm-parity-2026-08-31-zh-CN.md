@@ -40,6 +40,8 @@
 | S2-3 | **KV 池预算**（90% 显存）+ `max-num-seqs` 语义 | 005 D2 | S2-1 | 显存常驻 20GB+、趋势平坦 |
 | S2-4 | **前缀缓存接口实现**（D9 lookup/refill → P3-01 RadixCache） | 005 D9 / P3-01 | S2-3 | 共享前缀 2-10× 收益；bit-identical |
 
+**2026-09-01**：S2-4 已开工 —— `specs/016-prefix-cache/`（draft，v1 = 页对齐 run 缓存，命中省计算；radix 前端 ‖ 引擎 prefill 偏移 ‖ executor 复制钩子；D1 run 地址/层步长、D2 refill 并入释放守卫、D3 位级论证见 plan.md）。Wave A agent 运行中；验收表在 bench/notes.md §P3-01。
+
 **2026-09-01 记录**：S2-1/S2-2 真机验收全项通过（RTX 5090 Laptop，Qwen3-0.6B，
 `REINFER_SCHEDULER=on`、`--max-num-seqs 20`）：c4（20 并发）TTFT p50 **1.17 s**
 （vLLM 0.28 参考 1.8 s，**领先 34%**，S2-1 门槛"≈2 s"达成）；同 seed/temp=0 双跑输出

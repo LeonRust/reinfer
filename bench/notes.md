@@ -1215,3 +1215,47 @@ mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触�
   abort（已测）。stop 字符串是 token 模式，serve 层暂传空（OpenAI 文本 stop
   编码为后波）。
 - 锚段使每个 B≥2 批多 1 行 logits（固定幻影请求）——B 大时可忽略。
+
+## 2026-09-01 — P3-01 v1: 前缀缓存（specs/016 r2；真机验收通过）
+
+### 结构（16 决策记录见 specs/016-prefix-cache/plan.md）
+
+- 前端：`crates/scheduler/src/radix.rs` `TokenRadixCache`（纯 CPU；页对齐前缀
+  键；LRU；预算= `REINFER_PREFIX_CACHE_PAGES`（缺省 kv_pages×10%）；单线程
+  确定性（entry 表位升一致）。
+- 命中路径：**整 prompt 单 chunk**（`end == prompt.len()`）且缓存命中 →
+  单个 executor 方法 `prefill_prefix_hit`（flush singleton → 逐层 D2D 复制
+  缓存 run → 后缀逐 token `engine.step`，各步注意力读全窗 `[0,pos+1]`——
+  FMHA batch prefill 是"前缀盲"（launch_batched_prefill 无池参数），命中
+  剩余不得走 FMHA（r2 评审 P0-1）。
+- refill：仅 Done 释放守卫（abort/抢占直 free），入口 **flush 该请求的
+  singleton**（B=1 世界 KV 只在引擎池，段非 flush 则未写——r2 评审 P0-2
+  真机发现：初次修复只做 drop 不 flush，段仍是未初始化显存，温路径输出
+  垃圾与冷不一致；修复=refill 入口 `copy_engine_to_pool`）；同键裸 free
+  （r2 评审 #3 泄漏）；新键逐层 `ref_` + free + insert；预算不足
+  `EntryExceedsBudget` → 直 free 不缓存。
+- 开关：`REINFER_PREFIX_CACHE`（缺省 on，需 REINFER_SCHEDULER=on 生效）；
+  v1 不承诺部分前缀/链式匹配（v2：页表两径内核）。
+
+### 验收（RTX 5090 Laptop / Qwen3-0.6B; REINFER_SCHEDULER=on）
+
+| 项 | 判据 | 结果 |
+|---|---|---|
+| warm/cold TTFT | 温 p50 ≤ 0.5× 冷（≥600 token 共享系统提示，8 次串发） | **通过**：冷 356 ms → 温 p50 **57 ms = 6.29×**（gate 2×）|
+| 温/冷一致性 | 014 F16 档（greedy token 100% + drift ≤1e-2） | **通过**：8/8 请求输出文本**逐字符一致**（cold==warm=True）——修复 P0-2 后实际达到强一致 |
+| 同键泄漏回归 | 5 次同 prompt：`in_use` 恒 L=3 页 | **通过**（mock 循环测试 `prefix_cache_same_key_does_not_leak`）；真机同键路径 |
+| abort 释放 | abort 不 refill、池归零 | **通过**：`prefix_cache_abort_does_not_refill`（in_use==0）|
+| 驱逐/预算压力 | `REINFER_PREFIX_CACHE_PAGES=8`（< 需要 17 页）| **通过**：5× `refill declined: EntryExceedsBudget`，无缓存，无泄漏（温 83ms = 冷路径常规——首次 320 ms 含引擎预热；未出现 6× 加速即无缓存生效）|
+| 回归（on/off）| c4 20 并发 0 errors | **通过**：cache on 1.04 s / off 1.01 s（S2 验收记录 1.17/1.18 s——同域，前缀缓存对同时到达并发无显著影响，记录项）|
+| 测试 | bin 26/26（含 3 个新前缀缓存循环测试）、scheduler 78/78（radix 21 个）| **通过**；fmt/clippy 干净（bin/scheduler 0 警告，cuda 既有 2 个不动）|
+
+### 记录
+
+- 顺序修复线：r2 评审（P0 两条）+ 测试期发现（dropped-receiver 断连 abort、
+  单 loop 缓存生命周期、chunked 首段=整 prompt 限制）+ P0-2 真实修复
+  （refill 入口 flush——首次只 drop 不 flush，段未写=垃圾前缀→温输出与冷
+  不同；修复后 6.29× + 文本逐字符一致）。
+- v1 已知限制（spec Non-Goals）：部分前缀命中/页内分裂 v2；长后缀退化
+  （命中后逐 token，v2 FMHA 池读）；并发同前缀无共享（串发场景收益）。
+- 后续候选：FMHA 加池前缀参数（跨路径升级逐位）、Radix split 树（页内
+  分支）、LRU 驱逐统计落池统计（D6 记录项）。

@@ -40,6 +40,8 @@
 | S2-3 | KV pool budget (90 % VMM) + `max-num-seqs` semantics | 005 D2 | S2-1 | VRAM resident 20 GB+, flat trend |
 | S2-4 | Prefix-cache interface implementation (D9 lookup/refill → P3-01 RadixCache) | 005 D9 / P3-01 | S2-3 | 2-10× on shared prefixes; bit-identical |
 
+**2026-09-01**: S2-4 已开工 — `specs/016-prefix-cache/` (draft, v1 = page-aligned run cache, compute-saving hits, radix front-end ‖ engine prefill-offset ‖ executor copy hooks; plans/decisions incl. D1 run-vs-layer stride, D2 ref-ordered refill in the release guard, D3 bit-identity argument). Wave A agents running; acceptance table in bench/notes.md §P3-01.
+
 **2026-09-01 record**: S2-1/S2-2 真机验收全项通过（unified acceptance, RTX 5090 Laptop,
 Qwen3-0.6B, REINFER_SCHEDULER=on, --max-num-seqs 20): c4(20 并发) TTFT p50 **1.17 s**
 (vLLM 0.28 参考 1.8 s, −34 %, S2-1 gate "≈2 s" 达成, 超 A 目标); 同 seed/temp=0

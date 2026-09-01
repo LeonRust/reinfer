@@ -107,7 +107,9 @@ mod gpu {
         let seqs = [256u32, 512, 1024, 2048, 4096, 255, 1023, 2047, 4095];
         let iters = 24u32;
 
-        println!("FMHA variant latency (us, median of {iters} launches, causal, GQA {heads}/{kv_heads}, d={d}):");
+        println!(
+            "FMHA variant latency (us, median of {iters} launches, causal, GQA {heads}/{kv_heads}, d={d}):"
+        );
         println!("  seq    |  v0 128x128w4 |  v1 128x128w8 |  v2 128x64w4 |  v3 256x128w8");
         for &seq in &seqs {
             let sq_r = seq.div_ceil(256) * 256; // max block_m 256 covers all variants
@@ -121,8 +123,12 @@ mod gpu {
             // Deterministic contents (values irrelevant — latency only).
             let hq = HostBuffer::alloc(n * 2).unwrap();
             let hk = HostBuffer::alloc(nk * 2).unwrap();
-            fill_f16(unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) });
-            fill_f16(unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) });
+            fill_f16(unsafe {
+                std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n)
+            });
+            fill_f16(unsafe {
+                std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk)
+            });
             copy(&mut MemRef::Device(&q), &MemRef::Host(&hq), n * 2, None).unwrap();
             copy(&mut MemRef::Device(&k), &MemRef::Host(&hk), nk * 2, None).unwrap();
             copy(&mut MemRef::Device(&v), &MemRef::Host(&hk), nk * 2, None).unwrap();
@@ -234,11 +240,25 @@ mod gpu {
                             *b = f16t(if is_q { f * scale } else { f });
                         }
                     };
-                    fill(unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) }, true);
-                    fill(unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) }, false);
+                    fill(
+                        unsafe {
+                            std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n)
+                        },
+                        true,
+                    );
+                    fill(
+                        unsafe {
+                            std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk)
+                        },
+                        false,
+                    );
                 } else {
-                    fill_f16(unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) });
-                    fill_f16(unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) });
+                    fill_f16(unsafe {
+                        std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n)
+                    });
+                    fill_f16(unsafe {
+                        std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk)
+                    });
                 }
                 copy(&mut MemRef::Device(&q), &MemRef::Host(&hq), n * 2, None).unwrap();
                 copy(&mut MemRef::Device(&k), &MemRef::Host(&hk), nk * 2, None).unwrap();
@@ -247,21 +267,24 @@ mod gpu {
                 // Baseline v0 output.
                 let run = |vi: usize| -> Vec<u16> {
                     fmha.launch_batched_prefill_variant(
-                        dev, vi,
+                        dev,
+                        vi,
                         q.as_ptr() as *const u16,
                         k.as_ptr() as *const u16,
                         v.as_ptr() as *const u16,
                         o.as_ptr() as *mut u16,
                         lse.as_ptr() as *mut f32,
-                        seq, 1, heads, kv_heads, d,
+                        seq,
+                        1,
+                        heads,
+                        kv_heads,
+                        d,
                     )
                     .unwrap();
                     stream.synchronize().unwrap();
                     let mut h = HostBuffer::alloc(n * 2).unwrap();
                     copy(&mut MemRef::Host(&mut h), &MemRef::Device(&o), n * 2, None).unwrap();
-                    unsafe {
-                        std::slice::from_raw_parts(h.as_ptr() as *const u16, n).to_vec()
-                    }
+                    unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n).to_vec() }
                 };
                 let refo = run(0);
                 for vi in 1..fmha.variants().len() {
@@ -284,8 +307,7 @@ mod gpu {
                         n
                     );
                     assert_eq!(
-                        nbad,
-                        0,
+                        nbad, 0,
                         "variant {vi} diverges from v0 beyond 1 ulp at seq {seq} h={heads} signed={signed}"
                     );
                 }
@@ -339,9 +361,12 @@ mod gpu {
         let hk = HostBuffer::alloc(nk * 2).unwrap();
         let hv = HostBuffer::alloc(nk * 2).unwrap();
         {
-            let qb = unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) };
-            let kb = unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) };
-            let vb = unsafe { std::slice::from_raw_parts_mut(hv.as_ptr() as *mut u8 as *mut u16, nk) };
+            let qb =
+                unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) };
+            let kb =
+                unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) };
+            let vb =
+                unsafe { std::slice::from_raw_parts_mut(hv.as_ptr() as *mut u8 as *mut u16, nk) };
             for b in qb.iter_mut() {
                 *b = f16t(gauss() * scale);
             }
@@ -381,12 +406,11 @@ mod gpu {
         // ever). Put (true,false) first — the dense test's exact cache dir
         // without decode — so a cold v2 first-launch must reproduce there if
         // the cubin is innocent; then the warm-context legs act as controls.
-        for (with_cache, with_decode) in [(true, false), (false, false), (true, true), (false, true)] {
-            let stream = if with_decode {
-                CudaStream::new(devid).unwrap()
-            } else {
-                stream0.clone()
-            };
+        for (with_cache, with_decode) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let stream =
+                if with_decode { CudaStream::new(devid).unwrap() } else { stream0.clone() };
             let cache: Option<PathBuf> = if with_cache {
                 Some(std::env::temp_dir().join("reinfer-jit-fmha-prefill"))
             } else {
@@ -400,13 +424,18 @@ mod gpu {
             let fmha = FmhaKernels::new(&arch, cache, stream.clone()).unwrap();
             let run = |fmha: &FmhaKernels, vi: usize| -> Vec<u16> {
                 fmha.launch_batched_prefill_variant(
-                    dev, vi,
+                    dev,
+                    vi,
                     q.as_ptr() as *const u16,
                     k.as_ptr() as *const u16,
                     v.as_ptr() as *const u16,
                     o.as_ptr() as *mut u16,
                     lse.as_ptr() as *mut f32,
-                    seq, 1, heads, kv_heads, d,
+                    seq,
+                    1,
+                    heads,
+                    kv_heads,
+                    d,
                 )
                 .unwrap();
                 stream.synchronize().unwrap();
@@ -480,9 +509,12 @@ mod gpu {
         let hk = HostBuffer::alloc(nk * 2).unwrap();
         let hv = HostBuffer::alloc(nk * 2).unwrap();
         {
-            let qb = unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) };
-            let kb = unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) };
-            let vb = unsafe { std::slice::from_raw_parts_mut(hv.as_ptr() as *mut u8 as *mut u16, nk) };
+            let qb =
+                unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, n) };
+            let kb =
+                unsafe { std::slice::from_raw_parts_mut(hk.as_ptr() as *mut u8 as *mut u16, nk) };
+            let vb =
+                unsafe { std::slice::from_raw_parts_mut(hv.as_ptr() as *mut u8 as *mut u16, nk) };
             for b in qb.iter_mut() {
                 *b = f16t(gauss() * scale);
             }
@@ -627,8 +659,9 @@ mod gpu {
             None,
         )
         .unwrap();
-        let lsef: &[f32] =
-            unsafe { std::slice::from_raw_parts(hlse.as_ptr() as *const f32, heads as usize * seq as usize) };
+        let lsef: &[f32] = unsafe {
+            std::slice::from_raw_parts(hlse.as_ptr() as *const f32, heads as usize * seq as usize)
+        };
         println!(
             "cold-first v2 LSE: [0..4]={:?} [128..132]={:?} (inf = early-exit branch)",
             &lsef[..4],
@@ -653,10 +686,7 @@ mod gpu {
         stream.synchronize().unwrap();
         copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o), n * 2, None).unwrap();
         let bits2 = unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n) };
-        println!(
-            "v2 #2 (same process): O[128,0,0]={:.4e}",
-            f16_to_f32(bits2[128 * nqk])
-        );
+        println!("v2 #2 (same process): O[128,0,0]={:.4e}", f16_to_f32(bits2[128 * nqk]));
         // Heal check: a v0 launch (which always works), then v2 again.
         let launch_v2 = |fmha: &FmhaKernels| {
             fmha.launch_batched_prefill(
@@ -697,10 +727,7 @@ mod gpu {
         stream.synchronize().unwrap();
         copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o), n * 2, None).unwrap();
         let bits3 = unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n) };
-        println!(
-            "v2 after v0 heal: O[128,0,0]={:.4e}",
-            f16_to_f32(bits3[128 * nqk])
-        );
+        println!("v2 after v0 heal: O[128,0,0]={:.4e}", f16_to_f32(bits3[128 * nqk]));
     }
 
     /// Last-CTA anatomy (S1-7): at seq=512 the v2 kernel runs 4 m-block
@@ -751,15 +778,17 @@ mod gpu {
         // Pattern-fill O and LSE via plain copies.
         let pat = HostBuffer::alloc(n * 2).unwrap();
         {
-            let s: &mut [u16] = unsafe {
-                std::slice::from_raw_parts_mut(pat.as_ptr() as *mut u16, n)
-            };
+            let s: &mut [u16] =
+                unsafe { std::slice::from_raw_parts_mut(pat.as_ptr() as *mut u16, n) };
             s.fill(0xAAAA);
         }
         let plse = HostBuffer::alloc(heads as usize * (seq as usize) * 4).unwrap();
         {
             let s: &mut [u32] = unsafe {
-                std::slice::from_raw_parts_mut(plse.as_ptr() as *mut u32, (heads as usize) * (seq as usize))
+                std::slice::from_raw_parts_mut(
+                    plse.as_ptr() as *mut u32,
+                    (heads as usize) * (seq as usize),
+                )
             };
             s.fill(0x41414141);
         }
@@ -799,7 +828,10 @@ mod gpu {
         )
         .unwrap();
         let lsef: &[u32] = unsafe {
-            std::slice::from_raw_parts(hlse.as_ptr() as *const u32, (heads as usize) * (seq as usize))
+            std::slice::from_raw_parts(
+                hlse.as_ptr() as *const u32,
+                (heads as usize) * (seq as usize),
+            )
         };
         let nblocks = (seq as usize) / 128;
         let mut o_stale = Vec::new();
@@ -1019,10 +1051,7 @@ mod gpu {
             let mut h = HostBuffer::alloc(n * 2).unwrap();
             copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o), n * 2, None).unwrap();
             let bits = unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n) };
-            println!(
-                "cold-first v2 smem={label}: O[128,0,0]={:.4e}",
-                f16_to_f32(bits[128 * nqk])
-            );
+            println!("cold-first v2 smem={label}: O[128,0,0]={:.4e}", f16_to_f32(bits[128 * nqk]));
         }
     }
 
@@ -1097,10 +1126,7 @@ mod gpu {
         let bits = unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n) };
         let got = f16_to_f32(bits[128 * nqk]);
         println!("warmup+v0(same buffers)+v2: O[128,0,0]={got:.4e}");
-        assert!(
-            (got + 1.2091e-1).abs() < 1e-3,
-            "v0 with the real buffers did not cure: got {got}"
-        );
+        assert!((got + 1.2091e-1).abs() < 1e-3, "v0 with the real buffers did not cure: got {got}");
     }
 
     /// Cure-mechanism probe (S1-7), grid variant: the interleaved v0 uses
@@ -1205,8 +1231,7 @@ mod gpu {
             let k0 = DeviceBuffer::alloc(devid, nk0 * 2).unwrap();
             let v0 = DeviceBuffer::alloc(devid, nk0 * 2).unwrap();
             let o0 = DeviceBuffer::alloc(devid, n0 * 2).unwrap();
-            let lse0 =
-                DeviceBuffer::alloc(devid, heads0 as usize * 256 * 4).unwrap();
+            let lse0 = DeviceBuffer::alloc(devid, heads0 as usize * 256 * 4).unwrap();
             copy(&mut MemRef::Device(&q0), &mut MemRef::Host(&hq0), n0 * 2, None).unwrap();
             copy(&mut MemRef::Device(&k0), &mut MemRef::Host(&hk0), nk0 * 2, None).unwrap();
             copy(&mut MemRef::Device(&v0), &mut MemRef::Host(&hv0), nk0 * 2, None).unwrap();
@@ -1289,8 +1314,11 @@ mod gpu {
             let o = DeviceBuffer::alloc(devid, n * b * 2).unwrap();
             // Kernel writes 128 rounded rows per (batch, head) — same sizing
             // as the dense test (b * QH * ceil(seq/128) * 128 * 4).
-            let lse =
-                DeviceBuffer::alloc(devid, b * heads as usize * (seq as usize).div_ceil(128) * 128 * 4).unwrap();
+            let lse = DeviceBuffer::alloc(
+                devid,
+                b * heads as usize * (seq as usize).div_ceil(128) * 128 * 4,
+            )
+            .unwrap();
             copy(&mut MemRef::Device(&q), &mut MemRef::Host(&hq), n * b * 2, None).unwrap();
             copy(&mut MemRef::Device(&k), &mut MemRef::Host(&hk), nk * b * 2, None).unwrap();
             copy(&mut MemRef::Device(&v), &mut MemRef::Host(&hv), nk * b * 2, None).unwrap();
@@ -1316,13 +1344,8 @@ mod gpu {
                 let bits = unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n * b) };
                 let lse_n = b * heads as usize * (seq as usize).div_ceil(128) * 128;
                 let mut hlse = HostBuffer::alloc(lse_n * 4).unwrap();
-                copy(
-                    &mut MemRef::Host(&mut hlse),
-                    &mut MemRef::Device(&lse),
-                    lse_n * 4,
-                    None,
-                )
-                .unwrap();
+                copy(&mut MemRef::Host(&mut hlse), &mut MemRef::Device(&lse), lse_n * 4, None)
+                    .unwrap();
                 let lsef: &[f32] =
                     unsafe { std::slice::from_raw_parts(hlse.as_ptr() as *const f32, lse_n) };
                 // Row 64 of batch 0: element 64*(b*nqk) (row stride is
@@ -1357,15 +1380,8 @@ mod gpu {
         let d = 128u32;
         let nqk = (heads * d) as usize;
         let kvk = (kv_heads * d) as usize;
-        for (seq, batch) in [
-            (256u32, 1u32),
-            (256, 3),
-            (1024, 1),
-            (1024, 3),
-            (4096, 1),
-            (4096, 3),
-            (100, 2),
-        ]
+        for (seq, batch) in
+            [(256u32, 1u32), (256, 3), (1024, 1), (1024, 3), (4096, 1), (4096, 3), (100, 2)]
         {
             let stream = CudaStream::new(devid).unwrap();
             let fmha = FmhaKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
@@ -1405,17 +1421,11 @@ mod gpu {
                 // then run a same-buffer v0 to get the proven-correct value.
                 let mut ho = HostBuffer::alloc(n * b * 2).unwrap();
                 copy(&mut MemRef::Host(&mut ho), &mut MemRef::Device(&o), n * b * 2, None).unwrap();
-                let ob =
-                    unsafe { std::slice::from_raw_parts(ho.as_ptr() as *const u16, n * b) };
+                let ob = unsafe { std::slice::from_raw_parts(ho.as_ptr() as *const u16, n * b) };
                 let lse_n = b * heads as usize * (seq as usize).div_ceil(128) * 128;
                 let mut hlse = HostBuffer::alloc(lse_n * 4).unwrap();
-                copy(
-                    &mut MemRef::Host(&mut hlse),
-                    &mut MemRef::Device(&lse),
-                    lse_n * 4,
-                    None,
-                )
-                .unwrap();
+                copy(&mut MemRef::Host(&mut hlse), &mut MemRef::Device(&lse), lse_n * 4, None)
+                    .unwrap();
                 let lsef: &[f32] =
                     unsafe { std::slice::from_raw_parts(hlse.as_ptr() as *const f32, lse_n) };
                 println!(
@@ -1440,12 +1450,8 @@ mod gpu {
                 .unwrap();
                 fmha.sync_stream().unwrap();
                 copy(&mut MemRef::Host(&mut ho), &mut MemRef::Device(&o), n * b * 2, None).unwrap();
-                let ob2 =
-                    unsafe { std::slice::from_raw_parts(ho.as_ptr() as *const u16, n * b) };
-                println!(
-                    "replica (100,2): then v0 O[64]={}",
-                    f16_to_f32(ob2[64 * b * nqk])
-                );
+                let ob2 = unsafe { std::slice::from_raw_parts(ho.as_ptr() as *const u16, n * b) };
+                println!("replica (100,2): then v0 O[64]={}", f16_to_f32(ob2[64 * b * nqk]));
             }
         }
     }
@@ -1470,7 +1476,12 @@ mod gpu {
         let kvk = (kv_heads * d) as usize;
         let stream = CudaStream::new(devid).unwrap();
         let fmha = FmhaKernels::new(&arch, Some(cache), stream.clone()).unwrap();
-        let run = |seq: u32, o: &DeviceBuffer, q: &DeviceBuffer, k: &DeviceBuffer, v: &DeviceBuffer, lse: &DeviceBuffer| {
+        let run = |seq: u32,
+                   o: &DeviceBuffer,
+                   q: &DeviceBuffer,
+                   k: &DeviceBuffer,
+                   v: &DeviceBuffer,
+                   lse: &DeviceBuffer| {
             fmha.launch_batched_prefill(
                 dev,
                 q.as_ptr() as *const u16,
@@ -1545,11 +1556,9 @@ mod gpu {
         let k = DeviceBuffer::alloc(devid, nk * 2).unwrap();
         let v = DeviceBuffer::alloc(devid, nk * 2).unwrap();
         let o = DeviceBuffer::alloc(devid, n * 2).unwrap();
-        let lse = DeviceBuffer::alloc(
-            devid,
-            heads as usize * (seq as usize).div_ceil(128) * 128 * 4,
-        )
-        .unwrap();
+        let lse =
+            DeviceBuffer::alloc(devid, heads as usize * (seq as usize).div_ceil(128) * 128 * 4)
+                .unwrap();
         copy(&mut MemRef::Device(&q), &mut MemRef::Host(hq), n * 2, None).unwrap();
         copy(&mut MemRef::Device(&k), &mut MemRef::Host(hk), nk * 2, None).unwrap();
         copy(&mut MemRef::Device(&v), &mut MemRef::Host(hv), nk * 2, None).unwrap();
@@ -1604,10 +1613,8 @@ mod gpu {
     fn referee_prefill_logits(prompt: &str, n_steps: usize) -> (Vec<u32>, Vec<f32>) {
         let bin = std::env::var("REINFER_REFEREE").expect("REINFER_REFEREE");
         let gguf = std::env::var("REINFER_REFEREE_GGUF").expect("REINFER_REFEREE_GGUF");
-        let threads = std::env::var("REINFER_REFEREE_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
+        let threads =
+            std::env::var("REINFER_REFEREE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let out =
             std::env::temp_dir().join(format!("reinfer-fmha-referee-{}.bin", std::process::id()));
         let out_s = out.to_string_lossy().into_owned();
@@ -1757,10 +1764,7 @@ mod gpu {
         report("f32-channel", &ids5, &row_32_5, &ref_lg5);
 
         // --- ~256 tokens ---
-        println!(
-            "fmha_leg_vs_referee: s256 text len = {} (target 256)",
-            ids256.len()
-        );
+        println!("fmha_leg_vs_referee: s256 text len = {} (target 256)", ids256.len());
         let row_f256 = eng_f16.prefill_batch(&ids256).expect("fmha prefill 256");
         let mut eng_d256 = load_engine_leg(devid, &arch, &cache, &model_dir, false);
         let row_d256 = dense_f16_row(&mut eng_d256, &ids256);
@@ -1867,7 +1871,9 @@ mod gpu {
             }
         }
         let hb_xn = HostBuffer::alloc(xnh.len()).unwrap();
-        unsafe { std::ptr::copy_nonoverlapping(xnh.as_ptr(), hb_xn.as_ptr() as *mut u8, xnh.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(xnh.as_ptr(), hb_xn.as_ptr() as *mut u8, xnh.len())
+        };
         let xn = DeviceBuffer::alloc(devid, xnh.len()).unwrap();
         copy(&mut MemRef::Device(&xn), &MemRef::Host(&hb_xn), xnh.len(), None).unwrap();
         let run = |w: &[u8], wn: usize| -> Vec<f32> {
@@ -1946,10 +1952,7 @@ mod gpu {
                     }
                 }
             }
-            eprintln!(
-                "fused_qkv_probe: {label}: max|a-b|={worst:.3e} over_d7={over}/{}",
-                s * ncol
-            );
+            eprintln!("fused_qkv_probe: {label}: max|a-b|={worst:.3e} over_d7={over}/{}", s * ncol);
         };
         cmp("A-stack/q", &ca, 0, &cq);
         cmp("A-stack/k", &ca, nqk, &ck);
@@ -1973,7 +1976,8 @@ mod gpu {
         };
         let arch = reinfer_cuda::arch::resolve_arch().expect("arch");
         let cache = std::env::temp_dir().join("reinfer-jit-fmha-referee");
-        let mut eng = Engine::load(devid, &arch, Some(cache), &model_dir, 8192).expect("engine load");
+        let mut eng =
+            Engine::load(devid, &arch, Some(cache), &model_dir, 8192).expect("engine load");
         // Warmup: pays the first-launch JIT compile / preflight / allocator
         // cost so the timed fused seq=256 run is not polluted.
         let warm: Vec<u32> = (0..64).map(|i| (i as u32) % 4096 + 3).collect();
@@ -2017,7 +2021,8 @@ mod gpu {
         };
         let arch = reinfer_cuda::arch::resolve_arch().expect("arch");
         let cache = std::env::temp_dir().join("reinfer-jit-fmha-referee");
-        let mut eng = Engine::load(devid, &arch, Some(cache), &model_dir, 8192).expect("engine load");
+        let mut eng =
+            Engine::load(devid, &arch, Some(cache), &model_dir, 8192).expect("engine load");
         let ids: Vec<u32> = (0..512usize).map(|i| (i as u32) % 4096 + 3).collect();
         let a = eng.prefill_batch(&ids).expect("prefill run 1");
         let b = eng.prefill_batch(&ids).expect("prefill run 2");
@@ -2032,10 +2037,7 @@ mod gpu {
                 }
             }
         }
-        println!(
-            "engine 512-tok prefill x2: nbad={nbad}/{} first_diff={first_diff:?}",
-            a.len()
-        );
+        println!("engine 512-tok prefill x2: nbad={nbad}/{} first_diff={first_diff:?}", a.len());
         assert_eq!(nbad, 0, "v1-pick prefill runs must be bit-identical");
     }
 
@@ -2084,10 +2086,7 @@ mod gpu {
             for _ in 1..130 {
                 last = eng.prefill_batch(&ids).expect("repeated call");
             }
-            eprintln!(
-                "  repeated s={s}: call1-vs-call130 drift {:.3e}",
-                drift(&c1, &last)
-            );
+            eprintln!("  repeated s={s}: call1-vs-call130 drift {:.3e}", drift(&c1, &last));
         }
     }
 
@@ -2136,11 +2135,7 @@ mod gpu {
             let mut worst = (0.0f32, 0usize);
             let mut nbad = 0usize;
             for (k, (a, b)) in fmha.iter().zip(&dense).enumerate() {
-                let d = a
-                    .iter()
-                    .zip(b)
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0f32, f32::max);
+                let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
                 if d > worst.0 {
                     worst = (d, k);
                 }
@@ -2264,11 +2259,8 @@ mod gpu {
                     for j in 0..=s {
                         acc += f16_to_f32(p[j]) * v32[j * kvk + kh * d + i];
                     }
-                    reff[base + i] = if sum != 0.0 && sum == sum {
-                        f32_to_f16_rne(acc / sum)
-                    } else {
-                        0
-                    };
+                    reff[base + i] =
+                        if sum != 0.0 && sum == sum { f32_to_f16_rne(acc / sum) } else { 0 };
                 }
                 reflse[h * sq_r + s] = mx + sum.ln();
             }
@@ -2295,7 +2287,8 @@ mod gpu {
         // One cell = (heads, kv_heads, seq, draw-class). The dense gate's
         // draw (gate_draw) is the known-good control; dense_draw differs
         // only in the Q scale point (scale before vs after f16 truncation).
-        let mut cells: Vec<(u32, u32, u32, &str, (HostBuffer, HostBuffer, HostBuffer))> = Vec::new();
+        let mut cells: Vec<(u32, u32, u32, &str, (HostBuffer, HostBuffer, HostBuffer))> =
+            Vec::new();
         // Keep the (256,8,4) dense cell's device buffers alive past its
         // cell so the later gate-draw cell at the same geometry cannot
         // reuse those addresses (allocator reuse would collide the
@@ -2313,14 +2306,16 @@ mod gpu {
             // f32_to_f16(f16_to_f32(q16) * scale)) — replicate exactly.
             let scale = 1.0f32 / (d as f32).sqrt();
             let nq = (seq * 8 * d) as usize;
-            let qb = unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, nq) };
+            let qb =
+                unsafe { std::slice::from_raw_parts_mut(hq.as_ptr() as *mut u8 as *mut u16, nq) };
             for b in qb.iter_mut() {
                 *b = f32_to_f16_rne(f16_to_f32(*b) * scale);
             }
             cells.push((8, 4, seq, "gate_draw", (hq, hk, hv)));
         }
         for (heads, kv_heads, seq, draw, (hq, hk, hv)) in cells {
-            let mut keep_this_cell = draw == "dense_draw" && heads == 8 && kv_heads == 4 && seq == 256;
+            let mut keep_this_cell =
+                draw == "dense_draw" && heads == 8 && kv_heads == 4 && seq == 256;
             let nqk = (heads * d) as usize;
             let kvk = (kv_heads * d) as usize;
             let n = seq as usize * nqk;
@@ -2333,8 +2328,11 @@ mod gpu {
             let lse = DeviceBuffer::alloc(devid, heads as usize * sq_r * 4).unwrap();
             let cell_addr = || {
                 (
-                    q.as_ptr() as usize, k.as_ptr() as usize, v.as_ptr() as usize,
-                    o.as_ptr() as usize, lse.as_ptr() as usize,
+                    q.as_ptr() as usize,
+                    k.as_ptr() as usize,
+                    v.as_ptr() as usize,
+                    o.as_ptr() as usize,
+                    lse.as_ptr() as usize,
                 )
             };
             copy(&mut MemRef::Device(&q), &mut MemRef::Host(&hq), n * 2, None).unwrap();
@@ -2342,15 +2340,21 @@ mod gpu {
             copy(&mut MemRef::Device(&v), &mut MemRef::Host(&hv), nk * 2, None).unwrap();
             let q32: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(hq.as_ptr() as *const u16, n)
-                    .iter().map(|&b| f16_to_f32(b)).collect()
+                    .iter()
+                    .map(|&b| f16_to_f32(b))
+                    .collect()
             };
             let k32: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(hk.as_ptr() as *const u16, nk)
-                    .iter().map(|&b| f16_to_f32(b)).collect()
+                    .iter()
+                    .map(|&b| f16_to_f32(b))
+                    .collect()
             };
             let v32: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(hv.as_ptr() as *const u16, nk)
-                    .iter().map(|&b| f16_to_f32(b)).collect()
+                    .iter()
+                    .map(|&b| f16_to_f32(b))
+                    .collect()
             };
             let ratio = heads / kv_heads;
             // Host f16-P reference + true LSE per (s, h). LSE layout in the
@@ -2380,11 +2384,8 @@ mod gpu {
                         for j in 0..=s {
                             acc += f16_to_f32(p[j]) * v32[j * kvk + kh * d as usize + i];
                         }
-                        reff[base + i] = if sum != 0.0 && sum == sum {
-                            f32_to_f16_rne(acc / sum)
-                        } else {
-                            0
-                        };
+                        reff[base + i] =
+                            if sum != 0.0 && sum == sum { f32_to_f16_rne(acc / sum) } else { 0 };
                     }
                     reflse[h * sq_r + s] = mx + sum.ln();
                 }
@@ -2406,8 +2407,7 @@ mod gpu {
                 .unwrap();
                 stream.synchronize().unwrap();
                 let mut h = HostBuffer::alloc(n * 2).unwrap();
-                copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o), n * 2, None)
-                    .unwrap();
+                copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o), n * 2, None).unwrap();
                 unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n).to_vec() }
             };
             // Launch #1 (preflight fires), then #2..#28.
@@ -2444,7 +2444,10 @@ mod gpu {
                 for h in 0..heads as usize {
                     let base = s * nqk + h * d as usize;
                     let bad = (0..d as usize)
-                        .filter(|&i| (f16_to_f32(snaps[27][base + i]) - f16_to_f32(reff[base + i])).abs() > 1e-3)
+                        .filter(|&i| {
+                            (f16_to_f32(snaps[27][base + i]) - f16_to_f32(reff[base + i])).abs()
+                                > 1e-3
+                        })
                         .count();
                     if bad > 0 {
                         band_bad[(s / 64).min(3)] += 1;
@@ -2457,7 +2460,9 @@ mod gpu {
                 for h in 0..heads as usize {
                     let base = s * nqk + h * d as usize;
                     for i in 0..d as usize {
-                        if (f16_to_f32(snaps[27][base + i]) - f16_to_f32(reff[base + i])).abs() > 1e-3 {
+                        if (f16_to_f32(snaps[27][base + i]) - f16_to_f32(reff[base + i])).abs()
+                            > 1e-3
+                        {
                             first_bad = Some((s, h));
                             break 'outer;
                         }
@@ -2507,15 +2512,21 @@ mod gpu {
                 copy(&mut MemRef::Device(&v), &mut MemRef::Host(&dhv), nk * 2, None).unwrap();
                 let dq32: Vec<f32> = unsafe {
                     std::slice::from_raw_parts(dhq.as_ptr() as *const u16, n)
-                        .iter().map(|&b| f16_to_f32(b)).collect()
+                        .iter()
+                        .map(|&b| f16_to_f32(b))
+                        .collect()
                 };
                 let dk32: Vec<f32> = unsafe {
                     std::slice::from_raw_parts(dhk.as_ptr() as *const u16, nk)
-                        .iter().map(|&b| f16_to_f32(b)).collect()
+                        .iter()
+                        .map(|&b| f16_to_f32(b))
+                        .collect()
                 };
                 let dv32: Vec<f32> = unsafe {
                     std::slice::from_raw_parts(dhv.as_ptr() as *const u16, nk)
-                        .iter().map(|&b| f16_to_f32(b)).collect()
+                        .iter()
+                        .map(|&b| f16_to_f32(b))
+                        .collect()
                 };
                 let (dref, _) = fmha_host_ref(
                     &dq32,
@@ -2533,7 +2544,9 @@ mod gpu {
                     for h in 0..heads as usize {
                         let base = s * nqk + h * d as usize;
                         for i in 0..d as usize {
-                            let dv = (f16_to_f32(snaps2[27][base + i]) - f16_to_f32(dref[base + i])).abs();
+                            let dv = (f16_to_f32(snaps2[27][base + i])
+                                - f16_to_f32(dref[base + i]))
+                            .abs();
                             if dv > w2 {
                                 w2 = dv;
                             }
@@ -2592,11 +2605,7 @@ mod gpu {
                 };
                 println!(
                     "SAME-BUFFER data-change (gate->dense) at seq={seq} h={heads} kv={kv_heads}: L28 {w2:.2e} nbad={nb2}/{} | {det2} | {anat2} | b0(0..63):{} b1(64..127):{} b2(128..191):{} b3(192..255):{}",
-                    n,
-                    band2[0],
-                    band2[1],
-                    band2[2],
-                    band2[3]
+                    n, band2[0], band2[1], band2[2], band2[3]
                 );
                 // Decisive control: run the SAME re-drawn (dense) data
                 // through a FRESH FmhaKernels instance on fresh buffers.
@@ -2632,8 +2641,7 @@ mod gpu {
                     .unwrap();
                     stream.synchronize().unwrap();
                     let mut h = HostBuffer::alloc(n * 2).unwrap();
-                    copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o2), n * 2, None)
-                        .unwrap();
+                    copy(&mut MemRef::Host(&mut h), &mut MemRef::Device(&o2), n * 2, None).unwrap();
                     unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u16, n).to_vec() }
                 };
                 let fresh = launch2(&fmha2);
@@ -2679,13 +2687,11 @@ mod gpu {
                 let ch16 = HostBuffer::alloc(n * 2).unwrap();
                 let chk16 = HostBuffer::alloc(nk * 2).unwrap();
                 {
-                    let s: &mut [u16] = unsafe {
-                        std::slice::from_raw_parts_mut(ch16.as_ptr() as *mut u16, n)
-                    };
+                    let s: &mut [u16] =
+                        unsafe { std::slice::from_raw_parts_mut(ch16.as_ptr() as *mut u16, n) };
                     s.fill(0x7BFF);
-                    let sk: &mut [u16] = unsafe {
-                        std::slice::from_raw_parts_mut(chk16.as_ptr() as *mut u16, nk)
-                    };
+                    let sk: &mut [u16] =
+                        unsafe { std::slice::from_raw_parts_mut(chk16.as_ptr() as *mut u16, nk) };
                     sk.fill(0x7BFF);
                 }
                 copy(&mut MemRef::Device(&cq), &mut MemRef::Host(&ch16), n * 2, None).unwrap();
@@ -2780,20 +2786,21 @@ mod gpu {
                 //   broken  -> the addresses themselves are cursed -> the
                 //     preflight is a red herring
                 let fmha3 = FmhaKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
-                fmha3.launch_batched_prefill(
-                    dev,
-                    q.as_ptr() as *const u16,
-                    k.as_ptr() as *const u16,
-                    v.as_ptr() as *const u16,
-                    o.as_ptr() as *mut u16,
-                    lse.as_ptr() as *mut f32,
-                    seq,
-                    1,
-                    heads,
-                    kv_heads,
-                    d,
-                )
-                .unwrap();
+                fmha3
+                    .launch_batched_prefill(
+                        dev,
+                        q.as_ptr() as *const u16,
+                        k.as_ptr() as *const u16,
+                        v.as_ptr() as *const u16,
+                        o.as_ptr() as *mut u16,
+                        lse.as_ptr() as *mut f32,
+                        seq,
+                        1,
+                        heads,
+                        kv_heads,
+                        d,
+                    )
+                    .unwrap();
                 stream.synchronize().unwrap();
                 let mut fg = HostBuffer::alloc(n * 2).unwrap();
                 copy(&mut MemRef::Host(&mut fg), &mut MemRef::Device(&o), n * 2, None).unwrap();
@@ -2826,7 +2833,8 @@ mod gpu {
                 // skipped-write model they must be BIT-IDENTICAL (the v2
                 // last CTA never writes O; the readback shows the last
                 // writer's values = the gate launches').
-                let stale_rows = snaps2[27][128 * nqk..256 * nqk] == snaps[27][128 * nqk..256 * nqk];
+                let stale_rows =
+                    snaps2[27][128 * nqk..256 * nqk] == snaps[27][128 * nqk..256 * nqk];
                 let stale_rows_n = (0..128 * nqk)
                     .filter(|&i| snaps2[27][128 * nqk + i] != snaps[27][128 * nqk + i])
                     .count();
@@ -2844,15 +2852,17 @@ mod gpu {
                 // rows 0..127 are freshly computed.
                 let paaa = HostBuffer::alloc(n * 2).unwrap();
                 {
-                    let s: &mut [u16] = unsafe {
-                        std::slice::from_raw_parts_mut(paaa.as_ptr() as *mut u16, n)
-                    };
+                    let s: &mut [u16] =
+                        unsafe { std::slice::from_raw_parts_mut(paaa.as_ptr() as *mut u16, n) };
                     s.fill(0xAAAA);
                 }
                 let plse = HostBuffer::alloc(heads as usize * sq_r * 4).unwrap();
                 {
                     let s: &mut [u32] = unsafe {
-                        std::slice::from_raw_parts_mut(plse.as_ptr() as *mut u32, (heads as usize) * sq_r)
+                        std::slice::from_raw_parts_mut(
+                            plse.as_ptr() as *mut u32,
+                            (heads as usize) * sq_r,
+                        )
                     };
                     s.fill(0x41414141);
                 }
@@ -2872,8 +2882,7 @@ mod gpu {
                     for h in 0..heads as usize {
                         let base = s * nqk + h * d as usize;
                         for i in 0..d as usize {
-                            let dv =
-                                (f16_to_f32(pat[base + i]) - f16_to_f32(dref[base + i])).abs();
+                            let dv = (f16_to_f32(pat[base + i]) - f16_to_f32(dref[base + i])).abs();
                             if dv > wp0 && s < 128 {
                                 wp0 = dv;
                             }
@@ -2883,9 +2892,7 @@ mod gpu {
                         }
                     }
                 }
-                same_aaa = (128 * nqk..256 * nqk)
-                    .filter(|&i| pat[i] == 0xAAAA)
-                    .count();
+                same_aaa = (128 * nqk..256 * nqk).filter(|&i| pat[i] == 0xAAAA).count();
                 let mut hlse2 = HostBuffer::alloc(heads as usize * sq_r * 4).unwrap();
                 copy(
                     &mut MemRef::Host(&mut hlse2),
@@ -2895,7 +2902,10 @@ mod gpu {
                 )
                 .unwrap();
                 let lse2f: &[u32] = unsafe {
-                    std::slice::from_raw_parts(hlse2.as_ptr() as *const u32, (heads as usize) * sq_r)
+                    std::slice::from_raw_parts(
+                        hlse2.as_ptr() as *const u32,
+                        (heads as usize) * sq_r,
+                    )
                 };
                 // All heads pooled: rows 128..255 across 8 heads.
                 let lse_aaa = (0..heads as usize)
@@ -2926,8 +2936,8 @@ mod gpu {
                     for h in 0..heads as usize {
                         let base = s * nqk + h * d as usize;
                         for i in 0..d as usize {
-                            let dv = (f16_to_f32(gateback[base + i]) - f16_to_f32(reff[base + i]))
-                                .abs();
+                            let dv =
+                                (f16_to_f32(gateback[base + i]) - f16_to_f32(reff[base + i])).abs();
                             if dv > wg {
                                 wg = dv;
                             }
@@ -2939,7 +2949,6 @@ mod gpu {
                 }
                 println!("RE-UP gate data same bufs: worst {wg:.2e} nbad={nbg}/{}", n);
             }
-
 
             // The closures borrow q/k/v/o/lse; end the borrows before the
             // keepalive move below (the re-draw block above is the last

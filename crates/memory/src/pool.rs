@@ -164,6 +164,11 @@ pub enum MemoryError {
         /// 当前空闲页数。
         free: usize,
     },
+    /// 非法长度（`KvSegmentPool::alloc(0)` 等）。
+    InvalidLen {
+        /// 非法长度。
+        n: usize,
+    },
 }
 
 #[cfg(test)]

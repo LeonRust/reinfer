@@ -1,0 +1,18 @@
+{
+  "task": "T7 gate fixture — machine-readable values (mirror of bench/gate-fixture.md)",
+  "source": "bench/baseline-llamacpp.json (result_tg512.median_5)",
+  "protocol": "decode single-stream tok/s vs llama.cpp CUDA reference; gate = 0.85 x reference (wave acceptance); ci_red = 0.9 x reference (CI red: measured median <= 0.9 x baseline)",
+  "reference_tok_s": 352.70,
+  "gate_0_85x": 299.8,
+  "ci_red_0_9x": 317.4,
+  "reference_commit": "f280b26983ad0fdb705a0d9ebf0503e76f2899b0",
+  "model_gguf_sha256": "d04bceb664d484eaf134cdbc63745f5241bea80132c458e61c9449f488fe2abc",
+  "note": "gate_0_85x = round(0.85 * reference_tok_s, 1); ci_red_0_9x = round(0.9 * reference_tok_s, 1). Values must stay consistent with baseline-llamacpp.json — enforced by the gpu-less fixture test (bin/reinfer gate_fixture_verdict_cases).",
+  "verdict_cases": {
+    "red_fail": 250.0,
+    "pass_ci_red": 300.0,
+    "green": 320.0,
+    "boundary_gate": 299.8,
+    "boundary_ci_red": 317.4
+  }
+}

@@ -143,7 +143,10 @@ mod gpu {
 
     /// First divergent step index and the max logits delta there (both
     /// bit and magnitude) — diagnostic for replay-vs-eager divergence.
-    fn first_divergence(logits_on: &[Vec<f32>], logits_off: &[Vec<f32>]) -> Option<(usize, f32, u64)> {
+    fn first_divergence(
+        logits_on: &[Vec<f32>],
+        logits_off: &[Vec<f32>],
+    ) -> Option<(usize, f32, u64)> {
         for (i, (a, b)) in logits_on.iter().zip(logits_off.iter()).enumerate() {
             if a.len() != b.len() {
                 return Some((i, f32::NAN, u64::MAX));
@@ -239,10 +242,7 @@ mod gpu {
         // is version-pinned to the build-time libcudart and reports 12.x
         // even when libcudart.so.13 is preloaded.
         if v2_params_available() {
-            assert!(
-                on.graph_replays() > 0,
-                "graph-smoke: V2 must replay the all-custom graph"
-            );
+            assert!(on.graph_replays() > 0, "graph-smoke: V2 must replay the all-custom graph");
             assert!(
                 on.graph_eager_fallbacks() <= 32,
                 "graph-smoke: eager fallbacks must be capture attempts only (got {})",
@@ -331,38 +331,35 @@ mod gpu {
             // replay removes the per-kernel launch overhead — and the
             // GPU-busy mean (measured after warm-up, so every bucket is
             // already captured) is the floor the wall mean approaches.
-                assert!(
-                    on.graph_replays() > 0,
-                    "anchor: 13.x must replay the all-custom graph"
-                );
-                assert!(
-                    on.graph_eager_fallbacks() <= 32,
-                    "anchor: eager fallbacks must be capture attempts only (got {})",
-                    on.graph_eager_fallbacks()
-                );
-                assert!(
-                    on_tpot < off_tpot,
-                    "anchor: replay wall tpot {on_tpot:.3} must beat eager {off_tpot:.3} ms/step"
-                );
-                let on_busy = gpu_busy_ms(&mut on, &ids, 64);
-                let off_busy = gpu_busy_ms(&mut off, &ids, 64);
-                // Same kernels, same buffers — the GPU cost of a step must
-                // be the same whether launched eagerly or replayed.
-                assert!(
-                    on_busy <= off_busy * 1.5 + 0.05,
-                    "anchor: replay GPU busy {on_busy:.3} must match eager {off_busy:.3} ms/step"
-                );
-                println!(
-                    "graph-anchor (Graph V2 replay): captures {}, replays {}, eager \
+            assert!(on.graph_replays() > 0, "anchor: 13.x must replay the all-custom graph");
+            assert!(
+                on.graph_eager_fallbacks() <= 32,
+                "anchor: eager fallbacks must be capture attempts only (got {})",
+                on.graph_eager_fallbacks()
+            );
+            assert!(
+                on_tpot < off_tpot,
+                "anchor: replay wall tpot {on_tpot:.3} must beat eager {off_tpot:.3} ms/step"
+            );
+            let on_busy = gpu_busy_ms(&mut on, &ids, 64);
+            let off_busy = gpu_busy_ms(&mut off, &ids, 64);
+            // Same kernels, same buffers — the GPU cost of a step must
+            // be the same whether launched eagerly or replayed.
+            assert!(
+                on_busy <= off_busy * 1.5 + 0.05,
+                "anchor: replay GPU busy {on_busy:.3} must match eager {off_busy:.3} ms/step"
+            );
+            println!(
+                "graph-anchor (Graph V2 replay): captures {}, replays {}, eager \
                      fallbacks {}; wall tpot on {on_tpot:.3} vs off {off_tpot:.3} ms/step \
                      (ratio {:.3}); GPU busy on {on_busy:.3} vs off {off_busy:.3} ms/step \
                      (wall/busy on: {:.3})",
-                    on.graph_captures(),
-                    on.graph_replays(),
-                    on.graph_eager_fallbacks(),
-                    on_tpot / off_tpot,
-                    on_tpot / on_busy
-                );
+                on.graph_captures(),
+                on.graph_replays(),
+                on.graph_eager_fallbacks(),
+                on_tpot / off_tpot,
+                on_tpot / on_busy
+            );
         } else {
             // 12.x fail-closed boundary: no replay may succeed; every step
             // serves eager (and counts as an eager fallback).

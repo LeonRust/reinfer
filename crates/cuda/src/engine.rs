@@ -27,6 +27,7 @@ use crate::graph::{
     layout_slots,
 };
 use crate::jit::{CtxGuard, JLib, KernelFn, cu_kernel_of, launch_fmha};
+use crate::layer_fused::{LayerFusedKernels, LayerFusedSpec};
 use crate::stream::CudaStream;
 use cudarc::cublas::sys as blas;
 use cudarc::driver::sys as dsys;
@@ -658,6 +659,17 @@ pub struct Engine {
     /// 256-thread block, >= 32; hidden <= 1024), or when the kernels
     /// failed to load (fail-open to the split path with a note).
     fused: Option<FusedDecodeKernels>,
+    /// S1-10: decode-step deep fusion (REINFER_LAYER_FUSED, default on
+    /// when the fused path is active). The whole layer runs in ONE
+    /// persistent kernel (8 internal stages, grid barriers) — 30
+    /// nodes/step instead of 229/60 — bit-identical to the S1-9 fused
+    /// kernels by construction (see layer_fused.rs). `None` when disabled
+    /// by env, when the fused path is off, on the parity-f32 tier, when
+    /// the geometry misses the 512-col gates (head_dim outside
+    /// [64, 256] / not a 512 divisor, hidden > 1024, max_kv == 0, the
+    /// stage-7 stripe merge) or the occupancy query fails — fail-open
+    /// back to the S1-9 fused path with a note.
+    layer_fused: Option<LayerFusedKernels>,
     kernels: DenseKernels,
     diff: DiffKernels,
     decode: DecodeKernels,
@@ -765,6 +777,16 @@ pub struct Engine {
     graph_captures: u64,
     /// S1-3: successful replay count (diagnostics/tests).
     graph_replays: u64,
+    /// S2-B: batch-decode kernels (per-request-position rope etc.; loaded
+    /// lazily on the first B>1 `batch_decode_step`).
+    batch_kernels: Option<BatchDecodeKernels>,
+    /// S2-B: per-batch device scratch (grown lazily; `None` until the first
+    /// B>1 `batch_decode_step`).
+    batch_scratch: Option<BatchScratch>,
+    /// S2-B+: cache key of the last-uploaded batch identity page tables /
+    /// kv-pointer array (see the init comment; invalidated when the batch
+    /// scratch reallocates).
+    batch_pages_key: Option<Vec<(usize, u32)>>,
 }
 
 const BLOCK_LEN: usize = 32;
@@ -780,11 +802,25 @@ const PARITY_F32_ENV: &str = "REINFER_PARITY_F32";
 /// sequence as the A/B reference arm). Off words mirror the opt-out
 /// convention (like REINFER_DECODE_FLASH).
 const FUSED_ENV: &str = "REINFER_FUSED";
+/// S1-10: layer-fused decode-step env (default **on** when the fused path
+/// is active — the layer kernel replaces the 8-node/layer S1-9 sequence;
+/// `REINFER_LAYER_FUSED=off` keeps the S1-9 fused path as the A/B arm).
+const LAYER_FUSED_ENV: &str = "REINFER_LAYER_FUSED";
 
 /// REINFER_FUSED parsing: unset -> **on** (default); off words mirror the
 /// opt-out convention (like REINFER_DECODE_FLASH).
 #[must_use]
 fn fused_decode_disabled_from_env(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+    }
+}
+
+/// REINFER_LAYER_FUSED parsing: unset -> **on** (default); off words mirror
+/// the opt-out convention.
+#[must_use]
+fn layer_fused_disabled_from_env(value: Option<&str>) -> bool {
     match value {
         None => false,
         Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
@@ -904,6 +940,101 @@ fn decode_profile_enabled_from_env(value: Option<&str>) -> bool {
 /// Decode-step profiler env var name (public for tests).
 pub const DECODE_PROFILE_ENV: &str = "REINFER_DECODE_PROFILE";
 
+/// REINFER_BATCH_PROF parsing: unset -> **off** (default; diagnostic
+/// probe, same on-word convention as REINFER_DECODE_PROFILE).
+#[must_use]
+fn batch_prof_enabled_from_env(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
+        }
+    }
+}
+
+/// Batch-step trace env var name (public for tests).
+pub const BATCH_PROF_ENV: &str = "REINFER_BATCH_PROF";
+
+/// S2-B+: batch-step segment trace (REINFER_BATCH_PROF=on) — CUDA event
+/// brackets around the batch step's segments (stage/embed/qkv/attn/rest/
+/// lm), measured AFTER the step's stream synchronizes and printed per
+/// step as mean ms per segment. Record tier (the batch perf tests read
+/// the printed lines); inert when off.
+///
+/// Event discipline (like DecodeProfiler): `mark` only records; the
+/// elapsed time of a bracket is NOT read mid-flight — cudaEventElapsedTime
+/// returns NOT_READY until the GPU reaches the end event, and the caller
+/// synchronizes only at `finish`. So `mark` queues (start_event, label)
+/// pairs and `finish` (post-sync) measures every pair and prints.
+#[derive(Debug)]
+struct BatchTrace {
+    active: bool,
+    dev: DeviceId,
+    /// Segment-start events in order, with the label of the segment each
+    /// starts. Segment i spans evs[i] .. evs[i+1] (the last spans
+    /// evs[last] .. the closing event `finish` records).
+    evs: Vec<(CudaEvent, &'static str)>,
+    /// Per-step host wall clock (the GPU timeline is in flight).
+    step_t0: Option<std::time::Instant>,
+}
+
+impl BatchTrace {
+    /// Inert unless REINFER_BATCH_PROF is on (env read at construction —
+    /// one per batch step; `std::env::var` is a ~100 ns lookup).
+    fn new(dev: DeviceId) -> Self {
+        let active = batch_prof_enabled_from_env(std::env::var(BATCH_PROF_ENV).ok().as_deref());
+        Self {
+            active,
+            dev,
+            evs: Vec::new(),
+            step_t0: if active { Some(std::time::Instant::now()) } else { None },
+        }
+    }
+
+    /// Open a new segment at the current stream position. No-op when off.
+    fn mark(&mut self, stream: &CudaStream, label: &'static str) -> Result<(), LaunchError> {
+        if !self.active {
+            return Ok(());
+        }
+        let ev = CudaEvent::new(self.dev)?;
+        ev.record(stream)?;
+        self.evs.push((ev, label));
+        Ok(())
+    }
+
+    /// Record the closing event and print the per-step table. The caller
+    /// synchronizes the stream BEFORE calling — the events are then
+    /// complete, so every `elapsed_ms` is well-defined (no NOT_READY
+    /// mid-flight reads; the elapsed of a bracket is never read in
+    /// `mark`). No-op when off.
+    fn finish(&mut self, stream: &CudaStream) -> Result<(), LaunchError> {
+        if !self.active {
+            return Ok(());
+        }
+        let mut measured: Vec<(&'static str, f32)> = Vec::with_capacity(self.evs.len());
+        let mut it = self.evs.drain(..);
+        if let Some((mut prev, mut prev_label)) = it.next() {
+            let end = CudaEvent::new(self.dev)?;
+            end.record(stream)?;
+            for (start, label) in it {
+                measured.push((prev_label, prev.elapsed_ms(&start)?));
+                prev = start;
+                prev_label = label;
+            }
+            measured.push((prev_label, prev.elapsed_ms(&end)?));
+        }
+        let wall = self.step_t0.take().map(|t| t.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
+        let gpu: f32 = measured.iter().map(|(_, ms)| ms).sum();
+        println!("[reinfer-cuda] batch step profile (wall {wall:.3} ms, gpu busy {gpu:.3} ms):");
+        for (label, ms) in &measured {
+            let share = if gpu > 0.0 { ms / gpu * 100.0 } else { 0.0 };
+            println!("  {label:>6} {ms:8.3} ms  {share:5.1}%");
+        }
+        self.step_t0 = Some(std::time::Instant::now());
+        Ok(())
+    }
+}
+
 const SEG_SMALL: u8 = 0;
 const SEG_QKV: u8 = 1;
 const SEG_ATTN: u8 = 2;
@@ -917,9 +1048,12 @@ const SEG_FFN_D: u8 = 5;
 /// split path's ffn-norm/add_cast launches.
 const SEG_FFN_RMS: u8 = 6;
 const SEG_LM_HEAD: u8 = 7;
-const SEG_COUNT: usize = 8;
+/// S1-10: the whole layer in one persistent kernel (the layer-fused path —
+/// replaces SEG_SMALL..SEG_FFN_RMS with a single attributed segment).
+const SEG_LAYER: u8 = 8;
+const SEG_COUNT: usize = 9;
 const SEG_NAMES: [&str; SEG_COUNT] =
-    ["small", "qkv", "attn", "o", "ffn_gu", "ffn_d", "ffn_rms", "lm_head"];
+    ["small", "qkv", "attn", "o", "ffn_gu", "ffn_d", "ffn_rms", "lm_head", "layer"];
 
 /// Mean of a segment across the aggregation window (ms/step).
 #[derive(Debug, Clone, Copy)]
@@ -1443,6 +1577,280 @@ impl DecodeGemmPlans {
     }
 }
 
+// ---------------------------------------------------------------------------
+// S2-B: batch decode (B requests x 1 token merged forward).
+//
+// `Engine::batch_decode_step` runs B decode steps in one call. The GEMM
+// surface is batched: the requests' activation rows form A = [B, h_in] and
+// every projection (qkv/o/ffn/lm_head — the weights are shared across the
+// batch) runs one m = B GEMM.
+//
+// S2-B+ (2026-09-01): the batch step's two hot spots are batched too —
+// the projections route to the JIT batched pair (`Jgemm::launch_batch`:
+// `gemv_mb_f16f32` + `gemv_mb_f16f32_reduce`, one launch per plan instead
+// of one m=B cublas call) and the per-request attention loop is replaced
+// by ONE batched kv-slot write launch (`kv_write_batch_f16`, grid = B) +
+// ONE batched flash decode launch (`decode_step_gqa_flash_batch`, grid =
+// B*QH). Both kernels replicate the single-request arithmetic per row /
+// per (request, head) CTA byte-for-byte, so with the JitGemm path on
+// (REINFER_JGEMM default) every request's logits are BIT-IDENTICAL to its
+// independent single-request run — the S2-B cublas drift record is gone.
+// Deterministic (fixed reduction orders, no atomics). With REINFER_JGEMM
+// off the cublas m=B reference keeps the old drift contract.
+//
+// The batch path's QKV projection uses the SEPARATED q/k/v weights (NOT
+// the fused `qkv_proj`): the fused GEMM (n = nqk+2kvk, nslabs 8) groups
+// the f32 partials differently than the split path's three n = nqk GEMMs
+// (nslabs 24) — a D7 drift amplified to ~1e-2 logit scale by f16 storage.
+// Same (n, k) per projection reproduces the single path's arithmetic
+// exactly. The fused weight remains for the prefill batch path.
+//
+// KV segments: every request's segment lives in a pool with the KvStore
+// layout (K region [total_pages][block_len][kv_heads][d] f16, then the V
+// region at `total_pages*block_len*kv_heads*d` elements). A request's
+// segment owns `n_layer*pp` contiguous pages; layer li reads physical pages
+// [base_pages + li*pp, base_pages + (li+1)*pp). Two pool shapes are
+// accepted: ONE shared pool pointer for the whole call (`SegRef::kv ==
+// null` selects the engine's own pool with base_pages = 0; otherwise the
+// batch pool with per-request `base_pages` — the A3 shape), or a separate
+// pool per request (`base_pages` = 0, each pool is one segment's K+V
+// region). The batched kernels carry a [B] device array of pool bases
+// (`BatchScratch::kv_ptrs`; uniform entries for shared pools). The full
+// per-layer identity page tables ([B][n_layer][pp] u32) are uploaded only
+// when the segment set changes (the per-step H2D upload is skipped for
+// repeated segments — the table content is per-segment, not per-step).
+//
+// B=1 falls back to the existing single-request path (`Engine::step` — the
+// layer-fused persistent kernel) with a bit-level guarantee; the request's
+// SegRef is then ignored (the single path always uses the engine pool).
+// The parity-f32 tier likewise runs per-request single steps (no batched
+// f32 GEMM path this wave).
+//
+// S2-B numerics record (pre-S2-B+, cublas m=B): max |diff| over B=4
+// logits vs independent single runs 1.9e-2..3.6e-2 — the drift started at
+// D7 in the GEMM outputs, and every f16 storage rounding-boundary flip
+// (f16 ulp ~ 1e-2 at activation magnitudes) amplified it to logit scale;
+// the same amplification appears between the m=1 jgemm and m=1 cublas
+// paths (measured 2.5e-2..5.9e-2). Argmax was preserved (verified).
+// ---------------------------------------------------------------------------
+
+/// KV segment reference for one batch request (S2-B).
+#[derive(Debug, Clone, Copy)]
+pub struct SegRef {
+    /// K-region base pointer of the pool this request's segment lives in
+    /// (KvStore layout). `null` = the engine's own pool; `base_pages` must
+    /// then be 0. One call may either share ONE pool pointer across its
+    /// requests (varying `base_pages` — the A3 shape) or give every
+    /// request its own pool (`base_pages` = 0).
+    pub kv: *mut u16,
+    /// Physical page index of the segment's layer-0 run within the pool.
+    pub base_pages: u32,
+    /// KV length in tokens (the request's `kv_len` — the attention window).
+    pub len: usize,
+}
+
+impl SegRef {
+    /// The engine's own KV pool segment (base page 0).
+    pub fn engine(len: usize) -> Self {
+        Self { kv: std::ptr::null_mut(), base_pages: 0, len }
+    }
+}
+
+/// One batch decode request (S2-B): write `token` at sequence position
+/// `pos` into the request's KV segment, attend over [0, kv.len), return the
+/// logits row.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchReq {
+    /// The token id to embed and predict the next token from.
+    pub token: u32,
+    /// Absolute sequence position of this token (RoPE + the KV write slot).
+    pub pos: usize,
+    /// The request's KV segment (all requests of one call share one pool).
+    pub kv: SegRef,
+}
+
+/// S2-B: batch-decode companion kernels (kernels/decode_batch_kernels.cu) —
+/// row-wise variants with per-request parameters (positions). Loaded lazily
+/// on the first B>1 batch step (JitCache pipeline, like DenseKernels).
+#[derive(Debug)]
+pub struct BatchDecodeKernels {
+    /// Loaded cubin (kept alive — kernel fn is a module symbol).
+    #[allow(dead_code)]
+    lib: JLib,
+    rope_batch: KernelFn,
+    /// S2-B+: batched KV-slot write (grid = B; replaces the B per-request
+    /// kv_write launches of the per-request attention loop).
+    kv_write_batch: KernelFn,
+}
+
+impl BatchDecodeKernels {
+    /// Load the batch-decode kernel unit (JitCache pipeline).
+    pub fn new(arch: &str, cache_dir: Option<PathBuf>) -> Result<Self, LaunchError> {
+        let tc = probe_toolchain_for_arch(arch)?;
+        let src = KernelSource {
+            name: "decode_batch_kernels",
+            src: include_str!("../kernels/decode_batch_kernels.cu"),
+            headers: vec![],
+            flags: gencode_flags(arch)?,
+            arch: arch.to_string(),
+            toolchain_ver: tc.ver_line.clone(),
+        };
+        let cache = JitCache::open(cache_dir)?;
+        let key = JitKey::new(&src, &tc);
+        let (_, cubin_path) = cache.build_once(&key, &src, || compile_cubin(&src, &tc))?;
+        let bytes = std::fs::read(&cubin_path).map_err(|_| LaunchError::Fatal)?;
+        let lib = JLib::from_bytes(bytes)?;
+        let rope_batch = lib.kernel("rope_neox_batch_f16")?;
+        let kv_write_batch = lib.kernel("kv_write_batch_f16")?;
+        Ok(Self { lib, rope_batch, kv_write_batch })
+    }
+
+    /// Batch half-split RoPE (grid = B*heads, block 256): row r =
+    /// b*heads + h uses request b's position; the element scale is folded
+    /// like `rope_heads_f16` (q scaled, k with 1.0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_rope_batch(
+        &self,
+        dev: u32,
+        stream: &CudaStream,
+        x: *mut u16,
+        pos: *const u32,
+        b: u32,
+        heads: u32,
+        half: u32,
+        eta: f32,
+        scale: f32,
+    ) -> Result<(), LaunchError> {
+        let _guard = CtxGuard::set_current(dev)?;
+        // C3 discipline (jit.rs header): kernelParams entries must be
+        // addresses of LOCAL variables.
+        let nv: [i32; 5] =
+            [b as i32, heads as i32, half as i32, eta.to_bits() as i32, scale.to_bits() as i32];
+        let mut args: [*mut c_void; 7] = [
+            (&x as *const *mut u16) as *mut c_void,
+            (&pos as *const *const u32) as *mut c_void,
+            (&nv[0] as *const i32) as *mut c_void,
+            (&nv[1] as *const i32) as *mut c_void,
+            (&nv[2] as *const i32) as *mut c_void,
+            (&nv[3] as *const i32) as *mut c_void,
+            (&nv[4] as *const i32) as *mut c_void,
+        ];
+        // SAFETY: `x`/`pos` are live device buffers (the engine's batch
+        // scratch); geometry locals for params.
+        unsafe {
+            crate::jit::launch_rows(self.rope_batch, stream, dev, b * heads, 256, args.as_mut_ptr())
+        }
+    }
+
+    /// S2-B+: batched KV-slot write — ONE launch over B requests (grid =
+    /// B, block 256): request b writes its (k_rows, v_rows) rows to the
+    /// slot `(base_pages + li*pp + pos[b]/block_len, pos[b] % block_len)`
+    /// of its pool base `kv_ptrs[b]` — byte-identical to the per-request
+    /// `kv_write_row` launches it replaces (see
+    /// kernels/decode_batch_kernels.cu). `pages` is the [B][n_layer][pp]
+    /// identity page table; `max_kv` derives pp (engine contract
+    /// pp * BLOCK_LEN == max_kv).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_write_batch(
+        &self,
+        dev: u32,
+        stream: &CudaStream,
+        k_rows: *const u16,
+        v_rows: *const u16,
+        kv_ptrs: *const *const u16,
+        pages: *const u32,
+        pos: *const u32,
+        b: u32,
+        block_len: u32,
+        kv_heads: u32,
+        d: u32,
+        total_pages: u32,
+        n_layer: u32,
+        li: u32,
+        max_kv: u32,
+    ) -> Result<(), LaunchError> {
+        let _guard = CtxGuard::set_current(dev)?;
+        let nv: [i32; 8] = [
+            b as i32,
+            block_len as i32,
+            kv_heads as i32,
+            d as i32,
+            total_pages as i32,
+            n_layer as i32,
+            li as i32,
+            max_kv as i32,
+        ];
+        let mut args: [*mut c_void; 13] = [
+            (&k_rows as *const *const u16) as *mut c_void,
+            (&v_rows as *const *const u16) as *mut c_void,
+            (&kv_ptrs as *const *const *const u16) as *mut c_void,
+            (&pages as *const *const u32) as *mut c_void,
+            (&pos as *const *const u32) as *mut c_void,
+            (&nv[0] as *const i32) as *mut c_void,
+            (&nv[1] as *const i32) as *mut c_void,
+            (&nv[2] as *const i32) as *mut c_void,
+            (&nv[3] as *const i32) as *mut c_void,
+            (&nv[4] as *const i32) as *mut c_void,
+            (&nv[5] as *const i32) as *mut c_void,
+            (&nv[6] as *const i32) as *mut c_void,
+            (&nv[7] as *const i32) as *mut c_void,
+        ];
+        unsafe {
+            crate::jit::launch_rows(self.kv_write_batch, stream, dev, b, 256, args.as_mut_ptr())
+        }
+    }
+}
+
+/// S2-B: per-batch device scratch (grown lazily to the largest batch seen;
+/// the buffers never move afterwards, matching the engine's stable-pointer
+/// discipline). All sizes are per-batch-capacity `cap` (the full per-layer
+/// identity page tables are `cap * n_layer * pp` entries).
+#[derive(Debug)]
+pub struct BatchScratch {
+    /// Current batch capacity (all buffers sized for this many requests).
+    pub cap: usize,
+    // Per-step host staging (H2D uploads).
+    toks_hb: HostBuffer,
+    lens_hb: HostBuffer,
+    pos_hb: HostBuffer,
+    pages_hb: HostBuffer,
+    kv_ptrs_hb: HostBuffer,
+    // Per-step device inputs.
+    toks: DeviceBuffer,
+    lens: DeviceBuffer,
+    pos: DeviceBuffer,
+    /// Full per-layer identity page tables:
+    /// [b][li*pp + j] = base_pages_b + li*pp + j (covers both the flash
+    /// identity fast path — page[0] of the layer's table — and the naive
+    /// kernel's page[lp] indexing).
+    pages: DeviceBuffer,
+    /// Per-request pool K-region base pointers [B] (the batched kv-write
+    /// and batched flash kernels index `kv_ptrs[b]` — uniform entries for
+    /// the shared-pool shape, per-request segment bases otherwise).
+    kv_ptrs: DeviceBuffer,
+    // f16 activation buffers ([B x ...] row-major).
+    x: DeviceBuffer,
+    xn: DeviceBuffer,
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    attn: DeviceBuffer,
+    oadd: DeviceBuffer,
+    down: DeviceBuffer,
+    // f32 GEMM output buffers ([B x ...] row-major).
+    c_q: DeviceBuffer,
+    c_k: DeviceBuffer,
+    c_v: DeviceBuffer,
+    c_o: DeviceBuffer,
+    c_g: DeviceBuffer,
+    c_u: DeviceBuffer,
+    c_d: DeviceBuffer,
+    logits: DeviceBuffer,
+    /// Naive-attention fallback scratch (q_heads x max_kv f32).
+    scores: DeviceBuffer,
+    logits_hb: HostBuffer,
+}
+
 /// Expected kernel-node count of the f16 decode step (mirror of
 /// `step_decode_launches`): gather + per-layer [rms_attn, q/k/v gemms and
 /// casts, head norms (when `head_norm`), rope q/k, kv_write, decode,
@@ -1465,7 +1873,15 @@ const fn expected_node_count(
     head_norm: bool,
     jgemm: bool,
     fused: bool,
+    layer_fused: bool,
 ) -> usize {
+    if layer_fused {
+        // S1-10: per-layer ONE persistent kernel (gather + rms_attn(0)
+        // folded into the layer-0 kernel — no separate bookend nodes) +
+        // the lm_head phase pair (the last layer's internal stage computes
+        // the final norm — no separate final-rms node).
+        return n_layers + 2;
+    }
     if fused {
         // S1-9: gather + rms_attn(0) + per-layer 8 fused nodes (p1_qkv,
         // p2_qkv, flash_fused [kv write + attention], p1_o, p2_o, p1_gu,
@@ -1699,9 +2115,7 @@ impl GraphStepDecl {
         // node, whose slot is derived from kv_len inside the kernel (no
         // per-step cells; the zip loop is a no-op when the vecs are
         // empty).
-        for (li, (&c_phys, &c_off)) in
-            self.cell_kv_phys.iter().zip(&self.cell_kv_off).enumerate()
-        {
+        for (li, (&c_phys, &c_off)) in self.cell_kv_phys.iter().zip(&self.cell_kv_off).enumerate() {
             let phys = (li * pp + lp) as u32;
             self.cells[c_phys] = phys as u64;
             self.cells[c_off] = off as u64;
@@ -1729,6 +2143,12 @@ impl GraphStepDecl {
     /// with `(d + max_kv) * 4` bytes dynamic smem — the actual launch
     /// geometry (refresh rewrites the geometry from the declaration).
     fn build(eng: &Engine) -> Result<Self, LaunchError> {
+        // S1-10: the layer-fused kernels loaded -> the declaration mirrors
+        // the one-kernel-per-layer sequence (the exact mirror of
+        // `step_decode_launches_layer_fused`).
+        if eng.layer_fused.is_some() {
+            return Self::build_layer_fused(eng);
+        }
         // S1-9: the fused kernels loaded -> the declaration mirrors the
         // fused 7-node sequence (the exact mirror of
         // `step_decode_launches_fused`).
@@ -1867,34 +2287,32 @@ impl GraphStepDecl {
         // grid = ncols — the exact mirror of `Jgemm::launch`), else the
         // cublas node (replay fails closed on the V2 read-back — the
         // REINFER_JGEMM=off boundary).
-        let declare_gemm = |acc: &mut SpecAcc, pl: &GemmPlan| {
-            match (jgemm, eng.jgemm.as_ref()) {
-                (Some((partials, phase1, phase2)), Some(jg)) if jg.matches(pl) => {
-                    let (ncols, nslabs) = jg.shape(pl.n, pl.k);
-                    acc.custom(
-                        phase1,
-                        6,
-                        g(ncols * nslabs),
-                        b256,
-                        &[
-                            cell_ptr(pl.a),
-                            cell_ptr(pl.b),
-                            partials,
-                            pl.n as u64,
-                            pl.k as u64,
-                            nslabs as u64,
-                        ],
-                    );
-                    acc.custom(
-                        phase2,
-                        4,
-                        g(ncols),
-                        b256,
-                        &[partials, cell_ptr(pl.c), pl.n as u64, nslabs as u64],
-                    );
-                }
-                _ => acc.gemm(pl),
+        let declare_gemm = |acc: &mut SpecAcc, pl: &GemmPlan| match (jgemm, eng.jgemm.as_ref()) {
+            (Some((partials, phase1, phase2)), Some(jg)) if jg.matches(pl) => {
+                let (ncols, nslabs) = jg.shape(pl.n, pl.k);
+                acc.custom(
+                    phase1,
+                    6,
+                    g(ncols * nslabs),
+                    b256,
+                    &[
+                        cell_ptr(pl.a),
+                        cell_ptr(pl.b),
+                        partials,
+                        pl.n as u64,
+                        pl.k as u64,
+                        nslabs as u64,
+                    ],
+                );
+                acc.custom(
+                    phase2,
+                    4,
+                    g(ncols),
+                    b256,
+                    &[partials, cell_ptr(pl.c), pl.n as u64, nslabs as u64],
+                );
             }
+            _ => acc.gemm(pl),
         };
 
         for li in 0..n_layers {
@@ -2105,7 +2523,7 @@ impl GraphStepDecl {
 
         // Launch-order self-check: a divergence from the eager launch
         // count would fail every capture closed (diagnostic only).
-        let expected = expected_node_count(n_layers, cfg.head_norm, jgemm.is_some(), false);
+        let expected = expected_node_count(n_layers, cfg.head_norm, jgemm.is_some(), false, false);
         if acc.specs.len() != expected {
             eprintln!(
                 "reinfer-cuda graph: spec declaration count {} != expected {expected} — \
@@ -2130,11 +2548,8 @@ impl GraphStepDecl {
         // so the arrays must live as long as the decl. Built here, after
         // `cells` is final — the arrays' entries are the cell addresses and
         // the per-node array for node n is `&arg_slots[cell_off[n]]`.
-        let arg_slots: Vec<*mut c_void> = acc
-            .cells
-            .iter()
-            .map(|c| (c as *const u64) as *mut c_void)
-            .collect();
+        let arg_slots: Vec<*mut c_void> =
+            acc.cells.iter().map(|c| (c as *const u64) as *mut c_void).collect();
 
         // CUfunction launch handles for the decl-driven launch (Graph V2 —
         // the same kernels the eager launch fns use; converted once here so
@@ -2282,13 +2697,7 @@ impl GraphStepDecl {
             let w = &eng.layers[li];
             // 1. phase-1 of the q/k/v plans (a = xn, the layer input)
             let table = unsafe { (g.tables as *const PlanRow).add(li * 7) };
-            acc.custom(
-                h_p1,
-                2,
-                gd(g.grid_qkv[li]),
-                b256,
-                &[cell_ptr(table), 3],
-            );
+            acc.custom(h_p1, 2, gd(g.grid_qkv[li]), b256, &[cell_ptr(table), 3]);
             // 2. q/k/v phase-2 + casts + head-norm + rope (22 slots; pos
             // at slot 16 is per-step — one shared cell for q and k)
             let (wq, wk) = match (&w.q_norm, &w.k_norm) {
@@ -2363,13 +2772,7 @@ impl GraphStepDecl {
             // (all B*QH heads), which the flash blocks write only for
             // their own heads — folding it in would race across blocks.
             // Stream-ordered after the flash node, it is race-free.
-            acc.custom(
-                h_p1,
-                2,
-                gd(g.grid_o[li]),
-                b256,
-                &[cell_ptr(unsafe { table.add(3) }), 1],
-            );
+            acc.custom(h_p1, 2, gd(g.grid_o[li]), b256, &[cell_ptr(unsafe { table.add(3) }), 1]);
             // 5. o phase-2 + residual add + ffn rms (consumes the o
             // phase-1 node's partials)
             acc.custom(
@@ -2389,13 +2792,7 @@ impl GraphStepDecl {
             );
             // 6. gate/up phase-1 — reads p2_o's ffn-normed xn (the split
             // path's read point)
-            acc.custom(
-                h_p1,
-                2,
-                gd(g.grid_gu[li]),
-                b256,
-                &[cell_ptr(unsafe { table.add(4) }), 2],
-            );
+            acc.custom(h_p1, 2, gd(g.grid_gu[li]), b256, &[cell_ptr(unsafe { table.add(4) }), 2]);
             // 7. gate/up phase-2 + cast-SiLU-GLU + down phase-1 in one
             // kernel (`gemv_p2_gu_p1d_swiglu`, grid = ncols_d*nslabs_d,
             // the split's full down phase-1 tile grid): each block
@@ -2404,13 +2801,7 @@ impl GraphStepDecl {
             // (bx/nslabs_d, bx%nslabs_d) (valid iff every slab's k-range
             // fits in its block's stripe — checked in build_plans).
             // Block-local, same arithmetic as the split p2_gu + p1_d pair.
-            acc.custom(
-                h_p2gud,
-                2,
-                gd(g.grid_gu_p2),
-                b256,
-                &[cell_ptr(unsafe { table.add(4) }), 3],
-            );
+            acc.custom(h_p2gud, 2, gd(g.grid_gu_p2), b256, &[cell_ptr(unsafe { table.add(4) }), 3]);
             // 8. down phase-2 + residual add + next layer's attn rms (the
             // last layer's rms target is final_norm — the fused step's
             // final norm lives here, no separate final-rms node)
@@ -2442,16 +2833,11 @@ impl GraphStepDecl {
             4,
             gd(g.grid_lm),
             b256,
-            &[
-                cell_ptr(g.plm),
-                cell_ptr(eng.logits.as_ptr()),
-                eng.cfg.vocab_size as u64,
-                1,
-            ],
+            &[cell_ptr(g.plm), cell_ptr(eng.logits.as_ptr()), eng.cfg.vocab_size as u64, 1],
         );
 
         // Launch-order self-check (diagnostic only).
-        let expected = expected_node_count(n_layers, cfg.head_norm, true, true);
+        let expected = expected_node_count(n_layers, cfg.head_norm, true, true, false);
         if acc.specs.len() != expected {
             eprintln!(
                 "reinfer-cuda graph: fused spec declaration count {} != expected {expected} — \
@@ -2472,11 +2858,8 @@ impl GraphStepDecl {
             }
         }
         // Stable per-node kernelParams arrays (Graph V2 — see `arg_slots`).
-        let arg_slots: Vec<*mut c_void> = acc
-            .cells
-            .iter()
-            .map(|c| (c as *const u64) as *mut c_void)
-            .collect();
+        let arg_slots: Vec<*mut c_void> =
+            acc.cells.iter().map(|c| (c as *const u64) as *mut c_void).collect();
 
         // CUfunction launch handles for the decl-driven launch (Graph V2).
         let mut launch_fns = Vec::with_capacity(acc.specs.len());
@@ -2509,6 +2892,168 @@ impl GraphStepDecl {
             // The fused declaration folds the kv write into the fused
             // flash node (slot derived from kv_len in-kernel) — no
             // phys/off cells; write_step's zip loop is a no-op.
+            cell_kv_phys: Vec::new(),
+            cell_kv_off: Vec::new(),
+            refresh,
+        })
+    }
+
+    /// S1-10: layer-fused declaration — the exact launch-order mirror of
+    /// `step_decode_launches_layer_fused`: per layer ONE persistent kernel
+    /// (grid = occupancy-gated co-resident blocks, 512 threads, dynamic
+    /// smem = (d + max_kv) * 4; the internal 8 stages + grid barriers
+    /// replace the whole S1-9 node group — the gather and rms_attn(0)
+    /// bookends are folded into the layer-0 kernel), then the lm_head
+    /// phase pair (multi p1 + the shared jgemm reduce). n_layers + 2
+    /// nodes, every one a `CustomKernel` with full pointer-slot coverage
+    /// (Graph V2 refresh-safe). Per-step refresh slots: the `pos` of every
+    /// layer node (cell shared by the q/k rope passes inside) and the
+    /// layer-0 node's `token` — the 13.2 driver bakes kernel params at
+    /// capture, so every replay re-refreshes these nodes' params from the
+    /// cells (V2 SetParams).
+    fn build_layer_fused(eng: &Engine) -> Result<Self, LaunchError> {
+        let cfg = &eng.cfg;
+        let n_layers = eng.layers.len();
+        let lf = eng.layer_fused.as_ref().expect("layer_fused loaded");
+        // The layer kernel reads the SAME plan table and partials segments
+        // the S1-9 fused path uploads — the fused geometry is the shared
+        // data surface.
+        let fused = eng.fused.as_ref().expect("fused loaded (layer gate)");
+        let g_f = fused.geom();
+
+        // CUkernel handle of the persistent layer kernel.
+        let cu = |lib: cudarc::driver::sys::CUlibrary,
+                  name: &str|
+         -> Result<*mut c_void, LaunchError> { cu_kernel_of(lib, name) };
+        let flib = lf.raw_lib();
+        let h_layer = cu(flib, "decode_step_layer_fused")?;
+        // lm_head phase pair reuses the fused path's multi p1 + the
+        // loaded Jgemm's reduce kernel.
+        let h_p1 = cu(fused.raw_lib(), "gemv_m1_f16f32_multi")?;
+        let (_, h_reduce) = eng.jgemm.as_ref().expect("jgemm loaded").kernel_handles()?;
+
+        let b512 = cudarc::runtime::sys::dim3 { x: 512, y: 1, z: 1 };
+        let b256 = cudarc::runtime::sys::dim3 { x: 256, y: 1, z: 1 };
+        let gd = |x: u32| cudarc::runtime::sys::dim3 { x, y: 1, z: 1 };
+
+        let mut acc = SpecAcc::default();
+        let mut refresh: Vec<(usize, usize)> = Vec::with_capacity(n_layers + 1);
+        let mut cell_rope_q_pos = Vec::with_capacity(n_layers);
+        let mut cell_rope_k_pos = Vec::with_capacity(n_layers);
+        // Shared layer-node cells: the stable const blob, the barrier
+        // buffer, the fused plan table base (this layer's 7 rows) and the
+        // per-layer weight pointers.
+        let c_ptr = lf.const_ptr();
+        let bar_ptr = lf.bar_ptr();
+        let tables = g_f.tables as *const PlanRow;
+        for li in 0..n_layers {
+            let w = &eng.layers[li];
+            let wnext = if li + 1 < n_layers {
+                cell_ptr(eng.layers[li + 1].attn_norm.as_ptr())
+            } else {
+                cell_ptr(eng.final_norm.as_ptr())
+            };
+            let table = unsafe { tables.add(li * 7) };
+            let wq = match &w.q_norm {
+                Some(qn) => cell_ptr(qn.as_ptr()),
+                None => 0,
+            };
+            let wk = match &w.k_norm {
+                Some(kn) => cell_ptr(kn.as_ptr()),
+                None => 0,
+            };
+            acc.custom_with_shared(
+                h_layer,
+                11,
+                gd(lf.grid()),
+                b512,
+                lf.shared(),
+                &[
+                    c_ptr as u64,
+                    cell_ptr(table),
+                    wnext,
+                    cell_ptr(w.ffn_norm.as_ptr()),
+                    wq,
+                    wk,
+                    bar_ptr as u64,
+                    li as u64,
+                    n_layers as u64,
+                    0, // pos (per-step)
+                    0, // token (per-step; read only by the layer-0 node)
+                ],
+            );
+            refresh.push((acc.specs.len() - 1, 9)); // pos (per-step)
+            cell_rope_q_pos.push(acc.cell_of(9));
+            cell_rope_k_pos.push(acc.cell_of(9));
+        }
+        refresh.push((0, 10)); // layer-0 token (per-step)
+        let cell_token = acc.cell_of(10);
+
+        // lm_head phase pair: multi p1 (a = xn) + shared reduce p2
+        acc.custom(h_p1, 2, gd(g_f.grid_lm), b256, &[cell_ptr(g_f.lm_table), 1]);
+        acc.custom(
+            h_reduce,
+            4,
+            gd(g_f.grid_lm),
+            b256,
+            &[cell_ptr(g_f.plm), cell_ptr(eng.logits.as_ptr()), eng.cfg.vocab_size as u64, 1],
+        );
+
+        // Launch-order self-check (diagnostic only).
+        let expected = expected_node_count(n_layers, cfg.head_norm, true, true, true);
+        if acc.specs.len() != expected {
+            eprintln!(
+                "reinfer-cuda graph: layer-fused spec declaration count {} != expected {expected} — \
+                 declaration out of sync with step_decode_launches_layer_fused; captures will \
+                 fail closed",
+                acc.specs.len()
+            );
+        }
+
+        // Constant update list — one PtrUpdate per declared slot, pointing
+        // at the cell addresses (built last: `cells` must never move).
+        let mut updates = Vec::with_capacity(acc.specs.len());
+        for (node, spec) in acc.specs.iter().enumerate() {
+            let base = acc.cell_off[node];
+            for (slot, _) in &spec.ptr_slots {
+                let cell_ptr = (&mut acc.cells[base + *slot] as *mut u64) as *mut c_void;
+                updates.push(PtrUpdate { node, slot: *slot, ptr: cell_ptr });
+            }
+        }
+        // Stable per-node kernelParams arrays (Graph V2 — see `arg_slots`).
+        let arg_slots: Vec<*mut c_void> =
+            acc.cells.iter().map(|c| (c as *const u64) as *mut c_void).collect();
+
+        // CUfunction launch handles for the decl-driven launch (Graph V2).
+        let mut launch_fns = Vec::with_capacity(acc.specs.len());
+        for spec in &acc.specs {
+            if spec.role == NodeRole::CustomKernel {
+                let mut f: dsys::CUfunction = std::ptr::null_mut();
+                // SAFETY: `spec.handle` is a live CUkernel from
+                // cuLibraryGetKernel (engine-owned library); output slot
+                // valid; null handle would fail the call (fails closed).
+                let r = unsafe { dsys::cuKernelGetFunction(&mut f, spec.handle as dsys::CUkernel) };
+                if r != dsys::CUresult::CUDA_SUCCESS {
+                    return Err(LaunchError::Fatal);
+                }
+                launch_fns.push(f);
+            } else {
+                launch_fns.push(std::ptr::null_mut());
+            }
+        }
+
+        Ok(Self {
+            specs: acc.specs,
+            launch_fns,
+            cell_off: acc.cell_off,
+            cells: acc.cells,
+            arg_slots,
+            updates,
+            cell_token,
+            cell_rope_q_pos,
+            cell_rope_k_pos,
+            // No kv phys/off cells — the layer kernel derives its kv slot
+            // from kv_len inside (write_step's zip loop is a no-op).
             cell_kv_phys: Vec::new(),
             cell_kv_off: Vec::new(),
             refresh,
@@ -2676,23 +3221,23 @@ impl Engine {
                 None
             } else {
                 let q16 = to_f16_rm(
-                    &safe.tensor(&p("self_attn.q_proj.weight")).map_err(|e| {
-                        EngineError::Sts(format!("self_attn.q_proj.weight: {e}"))
-                    })?,
+                    &safe
+                        .tensor(&p("self_attn.q_proj.weight"))
+                        .map_err(|e| EngineError::Sts(format!("self_attn.q_proj.weight: {e}")))?,
                     nqk,
                     h,
                 )?;
                 let k16 = to_f16_rm(
-                    &safe.tensor(&p("self_attn.k_proj.weight")).map_err(|e| {
-                        EngineError::Sts(format!("self_attn.k_proj.weight: {e}"))
-                    })?,
+                    &safe
+                        .tensor(&p("self_attn.k_proj.weight"))
+                        .map_err(|e| EngineError::Sts(format!("self_attn.k_proj.weight: {e}")))?,
                     kvk,
                     h,
                 )?;
                 let v16 = to_f16_rm(
-                    &safe.tensor(&p("self_attn.v_proj.weight")).map_err(|e| {
-                        EngineError::Sts(format!("self_attn.v_proj.weight: {e}"))
-                    })?,
+                    &safe
+                        .tensor(&p("self_attn.v_proj.weight"))
+                        .map_err(|e| EngineError::Sts(format!("self_attn.v_proj.weight: {e}")))?,
                     kvk,
                     h,
                 )?;
@@ -2712,8 +3257,7 @@ impl Engine {
                 for r in 0..h {
                     let row = r * n2;
                     fused[row..row + nq2].copy_from_slice(&q16[r * nq2..(r + 1) * nq2]);
-                    fused[row + nq2..row + nq2 + nk2]
-                        .copy_from_slice(&k16[r * nk2..(r + 1) * nk2]);
+                    fused[row + nq2..row + nq2 + nk2].copy_from_slice(&k16[r * nk2..(r + 1) * nk2]);
                     fused[row + nq2 + nk2..(r + 1) * n2]
                         .copy_from_slice(&v16[r * nk2..(r + 1) * nk2]);
                 }
@@ -2792,6 +3336,9 @@ impl Engine {
             // S1-9: placeholder — built below from the fully-constructed
             // `this` (needs the plans and the loaded JitGemm).
             fused: None,
+            // S1-10: placeholder — built below after the fused kernels
+            // (the layer kernel reads the fused geometry).
+            layer_fused: None,
             kernels,
             diff,
             decode,
@@ -2840,6 +3387,16 @@ impl Engine {
             graph_execs: GraphExecStore::new(dev.index()),
             graph_captures: 0,
             graph_replays: 0,
+            // S2-B: lazy-loaded on the first B>1 batch step.
+            batch_kernels: None,
+            batch_scratch: None,
+            // S2-B+: last-uploaded batch segment set — the per-request
+            // (pool ptr, base_pages) keys the identity page tables and the
+            // kv-pointer array depend on. A matching key skips both H2D
+            // uploads (the table content is per-segment, not per-step;
+            // len/pos/tokens still upload every step). `None` = never
+            // uploaded or the scratch was reallocated.
+            batch_pages_key: None,
             parity_f32,
             prof: DecodeProfiler::new(dev),
             prefill_prof: PrefillProfiler::new(dev),
@@ -2908,6 +3465,74 @@ impl Engine {
                 }
             }
         };
+        // S1-10: layer-fused decode kernels (REINFER_LAYER_FUSED, default
+        // on when the fused path is active). The whole layer runs in ONE
+        // persistent kernel (8 internal stages, grid barriers) — 30
+        // nodes/step for Qwen3-0.6B instead of 228 — bit-identical to the
+        // S1-9 fused kernels by construction (see layer_fused.rs). Off
+        // when the fused path is off, when disabled by env, or when the
+        // 512-thread geometry misses the gates (head_dim not a 512
+        // divisor, outside [64, 256], not even; hidden > 1024). Any build
+        // failure (kernel load, the stage-7 stripe-merge gate, the
+        // occupancy query) fails open to the S1-9 fused path with a note.
+        this.layer_fused = if this.fused.is_none()
+            || layer_fused_disabled_from_env(std::env::var(LAYER_FUSED_ENV).ok().as_deref())
+            || 512 % this.cfg.head_dim != 0
+            || this.cfg.head_dim < 64
+            || this.cfg.head_dim > 256
+            || this.cfg.head_dim % 2 != 0
+            || this.cfg.hidden_size > 1024
+        {
+            None
+        } else {
+            let g = this.fused.as_ref().expect("fused loaded (gate above)").geom();
+            let spec = LayerFusedSpec {
+                h: this.cfg.hidden_size,
+                nqk: this.cfg.q_heads * this.cfg.head_dim,
+                kvk: this.cfg.kv_heads * this.cfg.head_dim,
+                ffn: this.cfg.ffn_hidden,
+                d: this.cfg.head_dim,
+                q_heads: this.cfg.q_heads,
+                kv_heads: this.cfg.kv_heads,
+                block_len: BLOCK_LEN,
+                max_kv: this.pp * BLOCK_LEN,
+                total_pages: this.cfg.n_layer * this.pp,
+                pp: this.pp,
+                eta: this.cfg.rope_theta,
+                eps: this.cfg.rms_eps,
+                head_norm: this.cfg.head_norm,
+                embed: this.embed.as_ptr() as *const u16,
+                x: this.x.as_ptr() as *mut u16,
+                xn: this.xn.as_ptr() as *mut u16,
+                q16: this.q.as_ptr() as *mut u16,
+                k16: this.k.as_ptr() as *mut u16,
+                v16: this.v.as_ptr() as *mut u16,
+                attn: this.attn.as_ptr() as *mut u16,
+                kv: this.kv.data.as_ptr() as *mut u16,
+                lens: this.lens_dev.as_ptr() as *const u32,
+                pages: this.pages_dev.as_ptr() as *const u32,
+                wnorm0: this.layers[0].attn_norm.as_ptr() as *const u16,
+            };
+            match LayerFusedKernels::new(dev.index(), arch, cache_dir.clone()) {
+                Ok(mut lf) => match lf.build(dev, g, &spec) {
+                    Ok(()) => Some(lf),
+                    Err(e) => {
+                        eprintln!(
+                            "reinfer-cuda: layer-fused decode build failed — S1-9 fused \
+                             path (fail-open): {e}"
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "reinfer-cuda: layer-fused decode kernels load failed — S1-9 fused \
+                         path (fail-open): {e}"
+                    );
+                    None
+                }
+            }
+        };
         // S1-3: decode-step graph declaration — built once for the f16
         // channel (the parity-f32 tier stays eager; its launch sequence
         // differs). When the fused kernels are loaded, the declaration
@@ -2951,6 +3576,14 @@ impl Engine {
     /// 配置。
     pub fn config(&self) -> &LlamaConfig {
         &self.cfg
+    }
+
+    /// S2-B: the engine's own KV store (data + geometry). The batch-pool
+    /// seeding flow clones this store's content into batch segments
+    /// (bit-identical KV for the B=1/B>1 comparison), and the A3 pool
+    /// integration reads its layout from here.
+    pub fn kv_store(&self) -> &crate::decode::KvStore {
+        &self.kv
     }
 
     /// 设备索引。
@@ -3211,6 +3844,25 @@ impl Engine {
             && !decode_flash_disabled_from_env(std::env::var(DECODE_FLASH_ENV).ok().as_deref());
         if use_decl && self.launch_decode_decl(stream, kv_len).is_ok() {
             return Ok(());
+        }
+        // S1-10: layer-fused decode step (REINFER_LAYER_FUSED, default on
+        // when the fused path is active) — the whole layer runs in ONE
+        // persistent kernel (30 nodes/step; bit-identical to the S1-9
+        // fused sequence; see layer_fused.rs). The graph declaration
+        // mirrors this sequence when loaded (the decl-driven path above).
+        // Note: the trace/detail anchors (mid-layer q/attn readbacks) are
+        // unavailable inside a persistent kernel — with anchors requested
+        // the step falls through to the S1-9 fused path (same numerics).
+        if self.layer_fused.is_some() && detail.is_none() {
+            match self.step_decode_launches_layer_fused(stream, token, pos, kv_len, trace) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "reinfer-cuda: layer-fused decode step failed ({e}); running the S1-9 \
+                         fused sequence"
+                    );
+                }
+            }
         }
         // S1-9: fused decode step (REINFER_FUSED, default on) — the whole
         // layer runs 8 nodes instead of 27 (bit-identical to the split
@@ -3552,6 +4204,105 @@ impl Engine {
         Ok(())
     }
 
+    /// S1-10: layer-fused decode step — ONE persistent kernel per layer
+    /// (8 internal stages, grid barriers; 30 nodes/step for Qwen3-0.6B
+    /// instead of 228), bit-identical to the S1-9 fused sequence
+    /// (layer_fused.rs / decode_layer_fused_kernels.cu). Launch order is
+    /// the graph declaration's mirror: per layer [decode_step_layer_fused
+    /// (gather + rms_attn(0) folded into the layer-0 kernel; q/k/v
+    /// phase-1, q/k/v phase-2 + head-norm + rope, kv write + flash,
+    /// o phase-1, o phase-2 + residual + ffn norm, gate/up phase-1,
+    /// gate/up phase-2 + swiglu + down phase-1, down phase-2 + residual +
+    /// next attn norm)], lm_head phase pair. The detail anchors are
+    /// unavailable (mid-layer kernel), so the caller falls through to the
+    /// fused step when anchors are requested; the trace anchors (x per
+    /// layer) read back after each layer kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn step_decode_launches_layer_fused(
+        &mut self,
+        stream: &CudaStream,
+        token: u32,
+        pos: usize,
+        kv_len: usize,
+        trace: &mut Option<Vec<Vec<f32>>>,
+    ) -> Result<(), EngineError> {
+        let h = self.cfg.hidden_size;
+        let g = self.fused.as_ref().expect("fused loaded (layer gate)").geom();
+        self.prof.begin_step(stream)?;
+        // 步内恒量（kv_len 不变）：lens 每步只上传一次。
+        self.upload_lens(stream, kv_len as u32)?;
+        self.prof.count(SEG_SMALL);
+        let layers = self.layers.as_ptr();
+        let n_layers = self.layers.len();
+        for li in 0..n_layers {
+            let w = unsafe { &*layers.add(li) };
+            let wnext = if li + 1 < n_layers {
+                unsafe { &*layers.add(li + 1) }.attn_norm.as_ptr() as *const u16
+            } else {
+                self.final_norm.as_ptr() as *const u16
+            };
+            let table = unsafe { (g.tables as *const PlanRow).add(li * 7) };
+            // Per-layer head-norm weights (the stage-2 hn path), like the
+            // S1-9 per-layer p2_qkv launches — NOT layer-0 consts.
+            let (wq, wk) = match (&w.q_norm, &w.k_norm) {
+                (Some(qn), Some(kn)) => (qn.as_ptr() as *const u16, kn.as_ptr() as *const u16),
+                _ => (std::ptr::null(), std::ptr::null()),
+            };
+            self.layer_fused.as_ref().expect("layer_fused loaded").launch(
+                stream,
+                table,
+                wnext,
+                w.ffn_norm.as_ptr() as *const u16,
+                wq,
+                wk,
+                li as i32,
+                n_layers as i32,
+                pos as u32,
+                token,
+            )?;
+            self.prof.count(SEG_LAYER);
+            // trace anchor: the post-layer x (the residual stream after the
+            // down add — the fused path's read point).
+            if let Some(tr) = trace {
+                stream.synchronize()?;
+                let hb = HostBuffer::alloc(h * 2)?;
+                copy(&mut MemRef::Host(&hb), &mut MemRef::Device(&self.x), h * 2, None)?;
+                stream.synchronize()?;
+                let row: Vec<f32> = unsafe {
+                    std::slice::from_raw_parts(hb.as_ptr() as *const u16, h)
+                        .iter()
+                        .map(|v| f16_bits_to_f32(*v))
+                        .collect()
+                };
+                tr.push(row);
+            }
+        }
+        // final norm + lm_head：末层 kernel 内的 down rms 已用 final_norm
+        // 把 xn 写好，lm p1 直接读 xn（与 fused 路径同构）。
+        self.prof.start_segment(SEG_LM_HEAD, stream)?;
+        let fused = self.fused.as_ref().expect("fused loaded (layer gate)");
+        fused.launch_p1(stream, g.lm_table, 1, g.grid_lm)?;
+        self.prof.count(SEG_LM_HEAD);
+        fused.launch_reduce(
+            stream,
+            g.plm,
+            self.logits.as_ptr() as *mut f32,
+            self.cfg.vocab_size as u32,
+            1,
+            g.grid_lm,
+        )?;
+        self.prof.count(SEG_LM_HEAD);
+        self.prof.end_segment(SEG_LM_HEAD, stream)?;
+        self.prof.end_wall();
+        self.prof.finalize(stream)?;
+        // Stage-level attribution (REINFER_DECODE_PROFILE only): fold the
+        // layer kernels' clock64 marks into the 20-step mean table.
+        if self.prof.is_active() {
+            self.layer_fused.as_mut().expect("layer_fused loaded").profile_accumulate(stream)?;
+        }
+        Ok(())
+    }
+
     /// S1-9: fused decode step — 8 nodes/layer instead of 27, bit-identical
     /// to the split sequence (fused.rs / decode_fused_kernels.cu). Launch
     /// order is the graph declaration's mirror:
@@ -3635,9 +4386,7 @@ impl Engine {
             self.prof.count(SEG_QKV);
             // 2. q/k/v phase-2 + casts + head-norm + rope (one launch)
             let (wq, wk) = match (&w.q_norm, &w.k_norm) {
-                (Some(qn), Some(kn)) => {
-                    (qn.as_ptr() as *const u16, kn.as_ptr() as *const u16)
-                }
+                (Some(qn), Some(kn)) => (qn.as_ptr() as *const u16, kn.as_ptr() as *const u16),
                 _ => (std::ptr::null(), std::ptr::null()),
             };
             fused.launch_p2_qkv(
@@ -4495,12 +5244,7 @@ impl Engine {
         let (c_qkv, c_q, c_k, c_v) = if fused_qkv {
             (Some(c32(s * (nqk + 2 * kvk))?), None, None, None)
         } else {
-            (
-                None,
-                Some(c32(s * nqk)?),
-                Some(c32(s * kvk)?),
-                Some(c32(s * kvk)?),
-            )
+            (None, Some(c32(s * nqk)?), Some(c32(s * kvk)?), Some(c32(s * kvk)?))
         };
         let c_o = c32(s * h)?;
         let c_g = c32(s * ffn)?;
@@ -4585,52 +5329,44 @@ impl Engine {
                     kvk as u32,
                 )?;
                 self.prefill_prof.mark(stream, PTag::CastQkv)?;
-                (
-                    q_buf.as_ptr() as *mut u16,
-                    k_buf.as_ptr() as *mut u16,
-                    v_buf.as_ptr() as *mut u16,
-                )
+                (q_buf.as_ptr() as *mut u16, k_buf.as_ptr() as *mut u16, v_buf.as_ptr() as *mut u16)
             } else {
-                    let c_q = c_q.as_ref().expect("separated scratch present");
-                    let c_k = c_k.as_ref().expect("separated scratch present");
-                    let c_v = c_v.as_ref().expect("separated scratch present");
-                    let q = q.as_ref().expect("separated q present");
-                    let k = k.as_ref().expect("separated k present");
-                    let v = v.as_ref().expect("separated v present");
-                    self.gemm1r(&xn, &w.q_proj, s, nqk, h, c_q)?;
-                    self.prefill_prof.mark(stream, PTag::GemmQkv)?;
-                    self.diff.launch_cast_f32_f16(
-                        dev,
-                        stream,
-                        c_q.as_ptr() as *const f32,
-                        q.as_ptr() as *mut u16,
-                        (s * nqk) as u32,
-                    )?;
-                    self.gemm1r(&xn, &w.k_proj, s, kvk, h, c_k)?;
-                    self.prefill_prof.mark(stream, PTag::GemmQkv)?;
-                    self.diff.launch_cast_f32_f16(
-                        dev,
-                        stream,
-                        c_k.as_ptr() as *const f32,
-                        k.as_ptr() as *mut u16,
-                        (s * kvk) as u32,
-                    )?;
-                    self.gemm1r(&xn, &w.v_proj, s, kvk, h, c_v)?;
-                    self.prefill_prof.mark(stream, PTag::GemmQkv)?;
-                    self.diff.launch_cast_f32_f16(
-                        dev,
-                        stream,
-                        c_v.as_ptr() as *const f32,
-                        v.as_ptr() as *mut u16,
-                        (s * kvk) as u32,
-                    )?;
-                    self.prefill_prof.mark(stream, PTag::CastQkv)?;
-                    (
-                        q.as_ptr() as *mut u16,
-                        k.as_ptr() as *mut u16,
-                        v.as_ptr() as *mut u16,
-                    )
-                };
+                let c_q = c_q.as_ref().expect("separated scratch present");
+                let c_k = c_k.as_ref().expect("separated scratch present");
+                let c_v = c_v.as_ref().expect("separated scratch present");
+                let q = q.as_ref().expect("separated q present");
+                let k = k.as_ref().expect("separated k present");
+                let v = v.as_ref().expect("separated v present");
+                self.gemm1r(&xn, &w.q_proj, s, nqk, h, c_q)?;
+                self.prefill_prof.mark(stream, PTag::GemmQkv)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    c_q.as_ptr() as *const f32,
+                    q.as_ptr() as *mut u16,
+                    (s * nqk) as u32,
+                )?;
+                self.gemm1r(&xn, &w.k_proj, s, kvk, h, c_k)?;
+                self.prefill_prof.mark(stream, PTag::GemmQkv)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    c_k.as_ptr() as *const f32,
+                    k.as_ptr() as *mut u16,
+                    (s * kvk) as u32,
+                )?;
+                self.gemm1r(&xn, &w.v_proj, s, kvk, h, c_v)?;
+                self.prefill_prof.mark(stream, PTag::GemmQkv)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    c_v.as_ptr() as *const f32,
+                    v.as_ptr() as *mut u16,
+                    (s * kvk) as u32,
+                )?;
+                self.prefill_prof.mark(stream, PTag::CastQkv)?;
+                (q.as_ptr() as *mut u16, k.as_ptr() as *mut u16, v.as_ptr() as *mut u16)
+            };
             let qc = q_ptr as *const u16;
             let kc = k_ptr as *const u16;
             let vc = v_ptr as *const u16;
@@ -4867,6 +5603,635 @@ impl Engine {
             pos += 1;
         }
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // S2-B: batch decode step (B requests x 1 token merged forward).
+    //
+    // `batch_decode_step` — see the S2-B section header above this impl.
+    // B=1 and the parity-f32 tier fall back to per-request `step` (bit-level
+    // guarantee; the request's SegRef is ignored — the single path always
+    // uses the engine's own pool). B>1 runs the GEMM-batched split-style
+    // sequence with the per-request attention loop.
+    // -----------------------------------------------------------------------
+
+    /// Ensure the batch-decode kernels are loaded (lazy; the B=1 fallback
+    /// never touches this path).
+    fn ensure_batch_kernels(&mut self) -> Result<(), EngineError> {
+        if self.batch_kernels.is_some() {
+            return Ok(());
+        }
+        let dev = self.dev;
+        let _guard = CtxGuard::set_current(dev)?;
+        let bk = BatchDecodeKernels::new(&self.arch, None)?;
+        self.batch_kernels = Some(bk);
+        Ok(())
+    }
+
+    /// Grow (or allocate) the batch scratch to `b` requests. All buffers
+    /// are sized for the NEW capacity; the old set is dropped (no step is
+    /// in flight — the batch step owns the stream between launches).
+    fn batch_scratch_ensure(&mut self, b: usize) -> Result<(), EngineError> {
+        if self.batch_scratch.as_ref().is_some_and(|sc| sc.cap >= b) {
+            return Ok(());
+        }
+        // The new scratch's pages/kv-pointer buffers are uninitialized —
+        // the next step must re-upload them (the cache key would otherwise
+        // match a previous call's upload and skip the refresh).
+        self.batch_pages_key = None;
+        let dev = DeviceId::new(self.dev);
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let nqk = cfg.q_heads * cfg.head_dim;
+        let kvk = cfg.kv_heads * cfg.head_dim;
+        let ffn = cfg.ffn_hidden;
+        let vocab = cfg.vocab_size;
+        let max_kv = self.pp * BLOCK_LEN;
+        let table_entries = b * cfg.n_layer * self.pp;
+        let a16 = |n: usize| DeviceBuffer::alloc(dev, n * 2).map_err(EngineError::Launch);
+        let c32 = |n: usize| DeviceBuffer::alloc(dev, n * 4).map_err(EngineError::Launch);
+        let u32b = |n: usize| DeviceBuffer::alloc(dev, n * 4).map_err(EngineError::Launch);
+        let hb = |n: usize| HostBuffer::alloc(n * 4).map_err(EngineError::Launch);
+        self.batch_scratch = Some(BatchScratch {
+            cap: b,
+            toks_hb: hb(b)?,
+            lens_hb: hb(b)?,
+            pos_hb: hb(b)?,
+            pages_hb: hb(table_entries)?,
+            kv_ptrs_hb: HostBuffer::alloc(b * 8).map_err(EngineError::Launch)?,
+            toks: u32b(b)?,
+            lens: u32b(b)?,
+            pos: u32b(b)?,
+            pages: u32b(table_entries)?,
+            kv_ptrs: DeviceBuffer::alloc(dev, b * 8).map_err(EngineError::Launch)?,
+            x: a16(b * h)?,
+            xn: a16(b * h)?,
+            q: a16(b * nqk)?,
+            k: a16(b * kvk)?,
+            v: a16(b * kvk)?,
+            attn: a16(b * nqk)?,
+            oadd: a16(b * h)?,
+            down: a16(b * ffn)?,
+            c_q: c32(b * nqk)?,
+            c_k: c32(b * kvk)?,
+            c_v: c32(b * kvk)?,
+            c_o: c32(b * h)?,
+            c_g: c32(b * ffn)?,
+            c_u: c32(b * ffn)?,
+            c_d: c32(b * h)?,
+            logits: c32(b * vocab)?,
+            scores: c32(cfg.q_heads * max_kv)?,
+            logits_hb: HostBuffer::alloc(b * vocab * 4).map_err(EngineError::Launch)?,
+        });
+        Ok(())
+    }
+
+    /// 批量解码步：B 请求 x 1 token 合并前向（S2-B）。每条请求返回其
+    /// logits 行（f32 行主序 [vocab]）；请求顺序即返回顺序。
+    ///
+    /// B=1 回退既有单请求路径（layer-fused persistent kernel——位级保证；
+    /// SegRef 被忽略）。B>1 走 GEMM 批量化（m=B 的 jgemm 批内核，缺省
+    /// REINFER_JGEMM on——逐请求位级一致；cublas m=B 为回退档）+ 批
+    /// attention（一次 kv 写 + 一次 flash decode，网格 B*QH）；KV 段/
+    /// 页表/len 由每条请求携带（单池约束，见 `SegRef`）。页表与池指针
+    /// 数组仅段集变化时上传（连续步同一段集跳过 H2D）。
+    pub fn batch_decode_step(&mut self, reqs: &[BatchReq]) -> Result<Vec<Vec<f32>>, EngineError> {
+        if reqs.is_empty() {
+            return Err(EngineError::Sts("empty batch".into()));
+        }
+        // B=1: the single-request path (bit-level guarantee — the layer
+        // kernel is the same one `step` runs). The SegRef is ignored: the
+        // single path always writes/reads the engine's own pool.
+        if reqs.len() == 1 {
+            let r = &reqs[0];
+            let lg = self.step(r.token, r.pos, r.kv.len)?;
+            return Ok(vec![lg]);
+        }
+        // parity-f32 tier: no batched GEMM path this wave — per-request
+        // single steps (the f32 channel's own pool; SegRef ignored).
+        if self.parity_f32 {
+            let mut out = Vec::with_capacity(reqs.len());
+            for r in reqs {
+                out.push(self.step(r.token, r.pos, r.kv.len)?);
+            }
+            return Ok(out);
+        }
+        self.ensure_batch_kernels()?;
+        self.batch_scratch_ensure(reqs.len())?;
+        // Take the scratch out of `self` so the launches can borrow `&self`
+        // (the scratch itself is only read — host staging is written
+        // through raw pointers).
+        let sc = self.batch_scratch.take().expect("ensured above");
+        let out = self.batch_step_impl(reqs, &sc);
+        self.batch_scratch = Some(sc);
+        out
+    }
+
+    /// B>1 batch step body (GEMM-batched split-style sequence). See the
+    /// S2-B section header for the numerics contract.
+    fn batch_step_impl(
+        &mut self,
+        reqs: &[BatchReq],
+        sc: &BatchScratch,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        let cfg = &self.cfg;
+        let b = reqs.len();
+        let h = cfg.hidden_size;
+        let nqk = cfg.q_heads * cfg.head_dim;
+        let kvk = cfg.kv_heads * cfg.head_dim;
+        let ffn = cfg.ffn_hidden;
+        let vocab = cfg.vocab_size;
+        let d = cfg.head_dim;
+        let kv_heads = cfg.kv_heads;
+        let q_heads = cfg.q_heads;
+        let ratio = q_heads / kv_heads;
+        let n_layers = self.layers.len();
+        let eps = cfg.rms_eps;
+        let eta = cfg.rope_theta;
+        let max_kv = self.pp * BLOCK_LEN;
+
+        // Pool contract: either every request shares ONE pool pointer (the
+        // engine's own pool when null — `base_pages` must be 0 — or one
+        // batch pool; `base_pages` may then vary: the A3 shared-pool shape),
+        // or every request brings its own pool (`base_pages` = 0 — each
+        // pool is the segment's own K+V region). Mixed shapes are rejected.
+        let p0 = reqs[0].kv.kv;
+        let shared_pool = reqs.iter().all(|r| r.kv.kv == p0);
+        let mut pool_pages = 0u32;
+        for (i, r) in reqs.iter().enumerate() {
+            if r.token as usize >= vocab {
+                return Err(EngineError::EmbeddingOov(r.token));
+            }
+            if shared_pool {
+                if r.kv.kv.is_null() && r.kv.base_pages != 0 {
+                    return Err(EngineError::Sts(format!(
+                        "batch req {i}: the engine pool requires base_pages = 0"
+                    )));
+                }
+            } else if r.kv.kv.is_null() || r.kv.base_pages != 0 {
+                return Err(EngineError::Sts(format!(
+                    "batch req {i}: per-request pools require a non-null kv \
+                     pointer and base_pages = 0"
+                )));
+            }
+            if r.kv.len == 0 || r.kv.len > max_kv {
+                return Err(EngineError::Sts(format!(
+                    "batch req {i}: kv len {} out of range (1..{max_kv})",
+                    r.kv.len
+                )));
+            }
+            if r.pos / BLOCK_LEN >= self.pp {
+                return Err(EngineError::Sts(format!(
+                    "batch req {i}: pos {} beyond the segment's {} pages",
+                    r.pos, self.pp
+                )));
+            }
+            pool_pages = pool_pages.max(r.kv.base_pages + (n_layers * self.pp) as u32);
+        }
+        // The shared pool's K-region base (per-request bases are resolved
+        // in the attention loop below). `pool_pages` is the K-region size
+        // of the pool each request lives in: the max segment extent for a
+        // shared pool, n_layer*pp for per-request pools — the kernel
+        // derives each V region as kv_base + pool_pages*block_len*kv_heads*d
+        // (KvStore layout).
+        let pool_kv = if p0.is_null() { self.kv.data.as_ptr() as *mut u16 } else { p0 };
+
+        let dev = self.dev;
+        let stream = &self.stream;
+        // Row-wise companion kernels (gather/rms/cast) — lazy-loaded like
+        // the prefill path (CtxGuard before the JitCache load).
+        if self.prefill.is_none() {
+            let _guard = CtxGuard::set_current(dev)?;
+            self.prefill = Some(PrefillKernels::new(&self.arch, None)?);
+        }
+        let pk = self.prefill.as_ref().expect("loaded above");
+
+        // S2-B+: batch-step trace (REINFER_BATCH_PROF=on) — event brackets
+        // around staging/embed/per-layer qkv|attn|rest/lm/readback; printed
+        // after the step's stream synchronizes (record tier for the tests).
+        let mut trace = BatchTrace::new(DeviceId::new(dev));
+
+        // Per-step H2D staging: tokens, kv lens, positions (every step),
+        // plus the full per-layer identity page tables and the per-request
+        // pool-base pointer array — both depend only on the SEGMENTS, so a
+        // repeated segment set skips those two uploads (the batch decode
+        // loop calls with the same segments and advancing len/pos).
+        {
+            let seg_key: Vec<(usize, u32)> =
+                reqs.iter().map(|r| (r.kv.kv as usize, r.kv.base_pages)).collect();
+            let pages_changed = self.batch_pages_key.as_ref() != Some(&seg_key);
+            let mut toks = Vec::with_capacity(b * 4);
+            let mut lens = Vec::with_capacity(b * 4);
+            let mut pos = Vec::with_capacity(b * 4);
+            let mut pages = Vec::with_capacity(b * n_layers * self.pp * 4);
+            let mut kv_ptrs = Vec::with_capacity(b * 8);
+            for r in reqs {
+                toks.extend_from_slice(&r.token.to_le_bytes());
+                lens.extend_from_slice(&(r.kv.len as u32).to_le_bytes());
+                pos.extend_from_slice(&(r.pos as u32).to_le_bytes());
+                // The null (engine-pool) shape resolves to the engine's
+                // pool base; per-request pools carry their own segment base.
+                let pool = if r.kv.kv.is_null() { pool_kv } else { r.kv.kv };
+                kv_ptrs.extend_from_slice(&(pool as usize).to_le_bytes());
+                if pages_changed {
+                    for li in 0..n_layers {
+                        let base = r.kv.base_pages + (li * self.pp) as u32;
+                        for j in 0..self.pp {
+                            pages.extend_from_slice(&(base + j as u32).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            // SAFETY: the staging buffers are exactly the byte sizes filled
+            // above (cap = b >= the current batch).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    toks.as_ptr(),
+                    sc.toks_hb.as_ptr() as *mut u8,
+                    toks.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    lens.as_ptr(),
+                    sc.lens_hb.as_ptr() as *mut u8,
+                    lens.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    pos.as_ptr(),
+                    sc.pos_hb.as_ptr() as *mut u8,
+                    pos.len(),
+                );
+                if pages_changed {
+                    std::ptr::copy_nonoverlapping(
+                        pages.as_ptr(),
+                        sc.pages_hb.as_ptr() as *mut u8,
+                        pages.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        kv_ptrs.as_ptr(),
+                        sc.kv_ptrs_hb.as_ptr() as *mut u8,
+                        kv_ptrs.len(),
+                    );
+                }
+            }
+            copy(
+                &mut MemRef::Device(&sc.toks),
+                &MemRef::Host(&sc.toks_hb),
+                toks.len(),
+                Some(stream),
+            )?;
+            copy(
+                &mut MemRef::Device(&sc.lens),
+                &MemRef::Host(&sc.lens_hb),
+                lens.len(),
+                Some(stream),
+            )?;
+            copy(&mut MemRef::Device(&sc.pos), &MemRef::Host(&sc.pos_hb), pos.len(), Some(stream))?;
+            if pages_changed {
+                copy(
+                    &mut MemRef::Device(&sc.pages),
+                    &MemRef::Host(&sc.pages_hb),
+                    pages.len(),
+                    Some(stream),
+                )?;
+                copy(
+                    &mut MemRef::Device(&sc.kv_ptrs),
+                    &MemRef::Host(&sc.kv_ptrs_hb),
+                    kv_ptrs.len(),
+                    Some(stream),
+                )?;
+                self.batch_pages_key = Some(seg_key);
+            }
+        }
+        trace.mark(stream, "stage")?;
+
+        // embed gather -> x [B, h]
+        pk.launch_gather_rows(
+            dev,
+            stream,
+            self.embed.as_ptr() as *const u16,
+            sc.x.as_ptr() as *mut u16,
+            sc.toks.as_ptr() as *const u32,
+            b as u32,
+            h as u32,
+        )?;
+        trace.mark(stream, "embed")?;
+
+        let qs = 1.0 / (d as f32).sqrt();
+        let layers = self.layers.as_ptr();
+        for li in 0..n_layers {
+            let w = unsafe { &*layers.add(li) };
+            // attn norm (rows = B)
+            pk.launch_rms_norm_rows(
+                dev,
+                stream,
+                sc.x.as_ptr() as *const u16,
+                sc.xn.as_ptr() as *mut u16,
+                w.attn_norm.as_ptr() as *const u16,
+                b as u32,
+                h as u32,
+                eps,
+            )?;
+            // QKV projection (m=B; the separated GEMMs — the fused
+            // qkv_proj weight is NOT used here: its single n=3072 GEMM
+            // slabs k into 8 partials while the split path's per-
+            // projection n=1024 GEMMs (and the single-request plans)
+            // use 24 — a different f32 partial grouping, i.e. D7 drift
+            // (~1e-2 logit scale after f16 storage) instead of the
+            // required bit-level match. Same (n, k) per projection
+            // reproduces the split path's arithmetic exactly; the fused
+            // weight remains for the prefill batch path, which reads it
+            // as its own GEMM (no bitwise cross-path contract).
+            let (q_ptr, k_ptr, v_ptr) = {
+                self.gemm_batch_jgemm(&sc.xn, &w.q_proj, b, nqk, h, &sc.c_q)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    sc.c_q.as_ptr() as *const f32,
+                    sc.q.as_ptr() as *mut u16,
+                    (b * nqk) as u32,
+                )?;
+                self.gemm_batch_jgemm(&sc.xn, &w.k_proj, b, kvk, h, &sc.c_k)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    sc.c_k.as_ptr() as *const f32,
+                    sc.k.as_ptr() as *mut u16,
+                    (b * kvk) as u32,
+                )?;
+                self.gemm_batch_jgemm(&sc.xn, &w.v_proj, b, kvk, h, &sc.c_v)?;
+                self.diff.launch_cast_f32_f16(
+                    dev,
+                    stream,
+                    sc.c_v.as_ptr() as *const f32,
+                    sc.v.as_ptr() as *mut u16,
+                    (b * kvk) as u32,
+                )?;
+                (sc.q.as_ptr() as *mut u16, sc.k.as_ptr() as *mut u16, sc.v.as_ptr() as *mut u16)
+            };
+            // q/k head norms (rows = B*heads, weights shared)
+            if let (Some(qn), Some(kn)) = (&w.q_norm, &w.k_norm) {
+                self.kernels.launch_rms_heads(
+                    dev,
+                    stream,
+                    q_ptr,
+                    q_ptr,
+                    qn.as_ptr() as *const u16,
+                    (b * q_heads) as u32,
+                    d as u32,
+                    eps,
+                )?;
+                self.kernels.launch_rms_heads(
+                    dev,
+                    stream,
+                    k_ptr,
+                    k_ptr,
+                    kn.as_ptr() as *const u16,
+                    (b * kv_heads) as u32,
+                    d as u32,
+                    eps,
+                )?;
+            }
+            // RoPE (per-request positions; q scale folded into the q pass)
+            let bk = self.batch_kernels.as_ref().expect("loaded (gate above)");
+            bk.launch_rope_batch(
+                dev,
+                stream,
+                q_ptr,
+                sc.pos.as_ptr() as *const u32,
+                b as u32,
+                q_heads as u32,
+                (d / 2) as u32,
+                eta,
+                qs,
+            )?;
+            bk.launch_rope_batch(
+                dev,
+                stream,
+                k_ptr,
+                sc.pos.as_ptr() as *const u32,
+                b as u32,
+                kv_heads as u32,
+                (d / 2) as u32,
+                eta,
+                1.0,
+            )?;
+            trace.mark(stream, "qkv")?;
+
+            // S2-B+: batched attention — ONE kv-slot write launch and ONE
+            // flash decode launch over the whole batch (grid = B*QH; each
+            // (request, head) CTA's arithmetic is verbatim the single-
+            // request flash, so the batch attention is bit-identical per
+            // request — see decode_flash_kernels.cu). The full identity
+            // page table serves the flash identity fast path (page[0]) and
+            // the naive fallback (page[lp]); `kv_ptrs[b]` carries each
+            // request's pool base (uniform for the shared-pool shape).
+            let table_base = sc.pages.as_ptr() as *const u32;
+            let kv_ptrs = sc.kv_ptrs.as_ptr() as *const *const u16;
+            let bk = self.batch_kernels.as_ref().expect("loaded (gate above)");
+            bk.launch_kv_write_batch(
+                dev,
+                stream,
+                k_ptr,
+                v_ptr,
+                kv_ptrs,
+                table_base,
+                sc.pos.as_ptr() as *const u32,
+                b as u32,
+                BLOCK_LEN as u32,
+                kv_heads as u32,
+                d as u32,
+                pool_pages,
+                n_layers as u32,
+                li as u32,
+                max_kv as u32,
+            )?;
+            let flash = self.decode.launch_decode_step_gqa_flash_batch(
+                dev,
+                q_ptr,
+                table_base,
+                kv_ptrs,
+                sc.lens.as_ptr() as *const u32,
+                sc.attn.as_ptr() as *mut u16,
+                b as u32,
+                q_heads as u32,
+                d as u32,
+                BLOCK_LEN as u32,
+                ratio as u32,
+                kv_heads as u32,
+                max_kv as u32,
+                pool_pages,
+                n_layers as u32,
+                li as u32,
+                1, // identity page table (per-layer base in page[0])
+            );
+            if let Err(e) = flash {
+                // The batched KV write already completed (separate launch,
+                // stream-ordered) — the per-request naive fallback reads it.
+                self.decode_flash_fallbacks += 1;
+                eprintln!(
+                    "reinfer-cuda: batch decode flash attn fallback (layer {li}): \
+                     {e} — naive GQA"
+                );
+                for (bi, r) in reqs.iter().enumerate() {
+                    let q_row = unsafe { (q_ptr as *const u16).add(bi * nqk) };
+                    let attn_row = unsafe { (sc.attn.as_ptr() as *mut u16).add(bi * nqk) };
+                    let lens_b = unsafe { (sc.lens.as_ptr() as *const u32).add(bi) };
+                    // SAFETY: table row for (bi, li) is within the batch
+                    // table ([B x n_layer x pp] entries; page[0] = the
+                    // layer base).
+                    let table =
+                        unsafe { table_base.add(bi * n_layers * self.pp + li * self.pp) };
+                    let kv_b = if shared_pool { pool_kv } else { r.kv.kv };
+                    self.decode.launch_decode_step_gqa(
+                        dev,
+                        q_row,
+                        table,
+                        kv_b,
+                        lens_b,
+                        sc.scores.as_ptr() as *mut f32,
+                        attn_row,
+                        1,
+                        q_heads as u32,
+                        d as u32,
+                        BLOCK_LEN as u32,
+                        ratio as u32,
+                        kv_heads as u32,
+                        max_kv as u32,
+                        pool_pages,
+                    )?;
+                }
+            }
+            trace.mark(stream, "attn")?;
+
+            // o projection (m=B) -> residual add
+            self.gemm_batch_jgemm(&sc.attn, &w.o_proj, b, h, nqk, &sc.c_o)?;
+            self.diff.launch_cast_f32_f16(
+                dev,
+                stream,
+                sc.c_o.as_ptr() as *const f32,
+                sc.oadd.as_ptr() as *mut u16,
+                (b * h) as u32,
+            )?;
+            self.kernels.launch_add(
+                dev,
+                stream,
+                sc.x.as_ptr() as *mut u16,
+                sc.oadd.as_ptr() as *const u16,
+                (b * h) as u32,
+            )?;
+
+            // FFN: norm (rows = B), gate/up (m=B), fused cast-SiLU-GLU,
+            // down (m=B), residual add
+            pk.launch_rms_norm_rows(
+                dev,
+                stream,
+                sc.x.as_ptr() as *const u16,
+                sc.xn.as_ptr() as *mut u16,
+                w.ffn_norm.as_ptr() as *const u16,
+                b as u32,
+                h as u32,
+                eps,
+            )?;
+            self.gemm_batch_jgemm(&sc.xn, &w.gate_proj, b, ffn, h, &sc.c_g)?;
+            self.gemm_batch_jgemm(&sc.xn, &w.up_proj, b, ffn, h, &sc.c_u)?;
+            self.kernels.launch_fused_cast_swiglu(
+                dev,
+                stream,
+                sc.c_g.as_ptr() as *const f32,
+                sc.c_u.as_ptr() as *const f32,
+                sc.down.as_ptr() as *mut u16,
+                (b * ffn) as u32,
+            )?;
+            self.gemm_batch_jgemm(&sc.down, &w.down_proj, b, h, ffn, &sc.c_d)?;
+            self.diff.launch_cast_f32_f16(
+                dev,
+                stream,
+                sc.c_d.as_ptr() as *const f32,
+                sc.oadd.as_ptr() as *mut u16,
+                (b * h) as u32,
+            )?;
+            self.kernels.launch_add(
+                dev,
+                stream,
+                sc.x.as_ptr() as *mut u16,
+                sc.oadd.as_ptr() as *const u16,
+                (b * h) as u32,
+            )?;
+            trace.mark(stream, "rest")?;
+        }
+
+        // final norm (rows = B) -> lm_head (m=B) -> readback B x vocab.
+        // The "lm" segment opens before the final norm so the lm_head GEMM
+        // (the step's biggest single GEMM) lands in it, not in the last
+        // layer's "rest" bracket.
+        trace.mark(stream, "lm")?;
+        pk.launch_rms_norm_rows(
+            dev,
+            stream,
+            sc.x.as_ptr() as *const u16,
+            sc.xn.as_ptr() as *mut u16,
+            self.final_norm.as_ptr() as *const u16,
+            b as u32,
+            h as u32,
+            eps,
+        )?;
+        self.gemm_batch_jgemm(&sc.xn, &self.lm_head, b, vocab, h, &sc.logits)?;
+        stream.synchronize()?;
+        trace.finish(stream)?;
+        copy(&mut MemRef::Host(&sc.logits_hb), &MemRef::Device(&sc.logits), b * vocab * 4, None)?;
+        Ok((0..b)
+            .map(|i| {
+                // SAFETY: logits_hb is [B x vocab] f32; row i starts at
+                // i*vocab elements.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        (sc.logits_hb.as_ptr() as *const f32).add(i * vocab),
+                        vocab,
+                    )
+                    .to_vec()
+                }
+            })
+            .collect())
+    }
+
+    /// S2-B+: batch-decode projection GEMM (m = B) — routes to the JIT
+    /// batched pair (`Jgemm::launch_batch`: `gemv_mb_f16f32` +
+    /// `gemv_mb_f16f32_reduce`) when the JitGemm unit is loaded
+    /// (REINFER_JGEMM default on; per-row arithmetic identical to the m=1
+    /// kernels — the batch GEMM surface matches the single path bitwise),
+    /// else the cublas `gemm1r` reference (the S2-B drift record). A
+    /// jgemm launch failure falls back to cublas with the
+    /// `jgemm_fallbacks` counter incremented (same discipline as
+    /// `gemm_exec_plan`). Layout contract identical to `gemm1r`'s cublas
+    /// call: `a` [m x k] f16 row-major, `w` [k x n] f16 row-major,
+    /// `c` [m x n] f32 row-major.
+    fn gemm_batch_jgemm(
+        &self,
+        a: &DeviceBuffer,
+        w: &DeviceBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        c: &DeviceBuffer,
+    ) -> Result<(), EngineError> {
+        if let Some(jg) = &self.jgemm {
+            match jg.launch_batch(
+                &self.stream,
+                a.as_ptr() as *const u16,
+                w.as_ptr() as *const u16,
+                c.as_ptr() as *mut f32,
+                m,
+                n,
+                k,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    self.jgemm_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("reinfer-cuda: batch jgemm launch failed — cublas fallback: {e}");
+                }
+            }
+        }
+        self.gemm1r(a, w, m, n, k, c)
     }
 
     /// 行主序输出 GEMM（prefill 批路径专用）：`C = A·B` 直接写出行主序
@@ -5404,7 +6769,9 @@ impl PrefillProfiler {
         for t in &prof.tags {
             println!(
                 "[reinfer-cuda] REINFER_PREFILL_PROFILE:   {:<14} {:.3} ms/layer x{}",
-                t.tag, t.ms, t.launches / layers
+                t.tag,
+                t.ms,
+                t.launches / layers
             );
         }
         prof
@@ -5503,28 +6870,35 @@ mod tests {
     fn expected_node_count_formula() {
         // cublas path (JitGemm off): 20n+3 / 18n+3 — gather + per-layer
         // (13/11 small kernels + 7 gemms) + final rms_norm + lm_head gemm.
-        assert_eq!(expected_node_count(28, true, false, false), 563);
-        assert_eq!(expected_node_count(28, false, false, false), 507);
-        assert_eq!(expected_node_count(1, true, false, false), 23);
-        assert_eq!(expected_node_count(4, true, false, false), 83);
-        assert_eq!(expected_node_count(4, false, false, false), 75);
+        assert_eq!(expected_node_count(28, true, false, false, false), 563);
+        assert_eq!(expected_node_count(28, false, false, false, false), 507);
+        assert_eq!(expected_node_count(1, true, false, false, false), 23);
+        assert_eq!(expected_node_count(4, true, false, false, false), 83);
+        assert_eq!(expected_node_count(4, false, false, false, false), 75);
         // Graph V2 (JitGemm loaded): every m=1 decode GEMM doubles into
         // the jgemm phase pair — 27n+4 / 25n+4.
-        assert_eq!(expected_node_count(28, true, true, false), 760);
-        assert_eq!(expected_node_count(28, false, true, false), 704);
-        assert_eq!(expected_node_count(1, true, true, false), 31);
-        assert_eq!(expected_node_count(4, true, true, false), 112);
-        assert_eq!(expected_node_count(4, false, true, false), 104);
+        assert_eq!(expected_node_count(28, true, true, false, false), 760);
+        assert_eq!(expected_node_count(28, false, true, false, false), 704);
+        assert_eq!(expected_node_count(1, true, true, false, false), 31);
+        assert_eq!(expected_node_count(4, true, true, false, false), 112);
+        assert_eq!(expected_node_count(4, false, true, false, false), 104);
         // S1-9 fused decode: 4 + 8n — the bookends (gather, rms_attn(0),
         // lm phase pair) plus the 8 fused nodes per layer (p1_qkv, p2_qkv,
         // kv_write, flash, p2_o, p2_gu, p1_ogud, p2_down), independent of
         // head_norm/jgemm (the fused kernels cover both variants).
-        assert_eq!(expected_node_count(28, true, true, true), 228);
-        assert_eq!(expected_node_count(28, false, true, true), 228);
-        assert_eq!(expected_node_count(28, true, false, true), 228);
-        assert_eq!(expected_node_count(1, true, true, true), 12);
-        assert_eq!(expected_node_count(4, true, true, true), 36);
-        assert_eq!(expected_node_count(4, false, true, true), 36);
+        assert_eq!(expected_node_count(28, true, true, true, false), 228);
+        assert_eq!(expected_node_count(28, false, true, true, false), 228);
+        assert_eq!(expected_node_count(28, true, false, true, false), 228);
+        assert_eq!(expected_node_count(1, true, true, true, false), 12);
+        assert_eq!(expected_node_count(4, true, true, true, false), 36);
+        assert_eq!(expected_node_count(4, false, true, true, false), 36);
+        // S1-10 layer-fused decode: n + 2 — one persistent kernel per
+        // layer (gather + rms_attn(0) folded into layer 0) + the lm_head
+        // phase pair, independent of head_norm/jgemm/fused.
+        assert_eq!(expected_node_count(28, true, true, true, true), 30);
+        assert_eq!(expected_node_count(28, false, false, false, true), 30);
+        assert_eq!(expected_node_count(1, true, true, true, true), 3);
+        assert_eq!(expected_node_count(4, false, true, false, true), 6);
     }
 
     /// Fabricated declaration for the cell-index bookkeeping test (mirrors
@@ -5568,11 +6942,8 @@ mod tests {
         // Fake handles: launch_fns stays null (the bookkeeping tests never
         // launch through the declaration).
         let launch_fns = vec![std::ptr::null_mut(); acc.specs.len()];
-        let arg_slots: Vec<*mut c_void> = acc
-            .cells
-            .iter()
-            .map(|c| (c as *const u64) as *mut c_void)
-            .collect();
+        let arg_slots: Vec<*mut c_void> =
+            acc.cells.iter().map(|c| (c as *const u64) as *mut c_void).collect();
         GraphStepDecl {
             specs: acc.specs,
             launch_fns,

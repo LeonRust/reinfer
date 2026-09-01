@@ -38,6 +38,10 @@ pub struct DecodeKernels {
     /// current slot + flash attention + the o-projection phase-1 in one
     /// launch (see decode_flash_kernels.cu; used only by the fused step).
     flash_fused: KernelFn,
+    /// S2-B+: batched flash decode (B requests in one launch, grid =
+    /// B*QH; per-request page rows and pool bases from batch tables —
+    /// see decode_flash_kernels.cu). Used by the batch decode step.
+    flash_batch: KernelFn,
     stream: CudaStream,
     arch: String,
 }
@@ -86,6 +90,7 @@ impl DecodeKernels {
         let flash = flash_lib.kernel("decode_step_gqa_flash")?;
         let flash_f32 = flash_lib.kernel("decode_step_gqa_flash_f32")?;
         let flash_fused = flash_lib.kernel("decode_step_gqa_flash_fused")?;
+        let flash_batch = flash_lib.kernel("decode_step_gqa_flash_batch")?;
         Ok(Self {
             lib,
             decode,
@@ -94,6 +99,7 @@ impl DecodeKernels {
             flash,
             flash_f32,
             flash_fused,
+            flash_batch,
             stream,
             arch: arch.to_string(),
         })
@@ -384,6 +390,90 @@ impl DecodeKernels {
         unsafe {
             super::jit::launch_fmha(
                 self.flash_fused,
+                &self.stream,
+                dev,
+                b * qh,
+                1,
+                1,
+                512,
+                smem,
+                args.as_mut_ptr(),
+            )
+        }
+    }
+
+    /// S2-B+: batched flash decode (f16 tier) — ONE launch over the whole
+    /// batch: grid = B*QH, one CTA per (request, q_head) exactly like
+    /// `launch_decode_step_gqa_flash`, with the per-request page row and
+    /// pool base resolved inside the kernel from the batch tables:
+    /// `pages` is [B][n_layer][pp] (the identity page tables; row (b, li)
+    /// at pages[(b*n_layer + li)*pp], page[0] = the layer's first physical
+    /// page — the `identity == 1` fast path), `kv` is [B] pool K-region
+    /// bases (uniform for the shared-pool shape), `kv_lens` [B]. Per-(b,h)
+    /// arithmetic is verbatim the single-request flash — bit-identical
+    /// per request. Same smem budget guard as the single flash (fails
+    /// `LaunchError::Fatal` when (d + max_kv) * 4 > 48 KB — the engine
+    /// falls back to the per-request naive loop).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_decode_step_gqa_flash_batch(
+        &self,
+        dev: u32,
+        q: *const u16,
+        pages: *const u32,
+        kv: *const *const u16,
+        kv_lens: *const u32,
+        out: *mut u16,
+        b: u32,
+        qh: u32,
+        d: u32,
+        block_len: u32,
+        kv_ratio: u32,
+        kv_heads: u32,
+        max_kv: u32,
+        total_pages: u32,
+        n_layer: u32,
+        li: u32,
+        identity: u32,
+    ) -> Result<(), LaunchError> {
+        let smem = (d + max_kv) * 4;
+        if smem > FLASH_SMEM_MAX {
+            return Err(LaunchError::Fatal);
+        }
+        let _guard = CtxGuard::set_current(dev)?;
+        let b_p: i32 = b as i32;
+        let k_p: i32 = qh as i32;
+        let nv: [i32; 9] = [
+            d as i32,
+            block_len as i32,
+            kv_ratio as i32,
+            kv_heads as i32,
+            max_kv as i32,
+            total_pages as i32,
+            n_layer as i32,
+            li as i32,
+            identity as i32,
+        ];
+        let mut args: [*mut c_void; 16] = [
+            (&q as *const *const u16) as *mut c_void,
+            (&pages as *const *const u32) as *mut c_void,
+            (&kv as *const *const *const u16) as *mut c_void,
+            (&kv_lens as *const *const u32) as *mut c_void,
+            (&out as *const *mut u16) as *mut c_void,
+            (&b_p as *const i32) as *mut c_void,
+            (&k_p as *const i32) as *mut c_void,
+            (&nv[0] as *const i32) as *mut c_void,
+            (&nv[1] as *const i32) as *mut c_void,
+            (&nv[2] as *const i32) as *mut c_void,
+            (&nv[3] as *const i32) as *mut c_void,
+            (&nv[4] as *const i32) as *mut c_void,
+            (&nv[5] as *const i32) as *mut c_void,
+            (&nv[6] as *const i32) as *mut c_void,
+            (&nv[7] as *const i32) as *mut c_void,
+            (&nv[8] as *const i32) as *mut c_void,
+        ];
+        unsafe {
+            super::jit::launch_fmha(
+                self.flash_batch,
                 &self.stream,
                 dev,
                 b * qh,

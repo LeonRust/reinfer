@@ -1067,7 +1067,11 @@ impl Capture<'_> {
     /// End the capture, enumerate kernel nodes, instantiate the exec, and
     /// record bucket memory/counter accounting. `specs` must cover the
     /// kernel nodes in launch order (same-shape guard).
-    pub fn finish(mut self, specs: &[KernelSpec], refresh: &[(usize, usize)]) -> Result<GraphExec, LaunchError> {
+    pub fn finish(
+        mut self,
+        specs: &[KernelSpec],
+        refresh: &[(usize, usize)],
+    ) -> Result<GraphExec, LaunchError> {
         // SAFETY: capture window active on this stream; output slot valid.
         let mut graph: sys::cudaGraph_t = std::ptr::null_mut();
         let r = unsafe { sys::cudaStreamEndCapture(self.stream.handle(), &mut graph) };
@@ -1978,8 +1982,7 @@ impl GraphExec {
             // exec in place and reports the result struct).
             let r = unsafe { sys::cudaGraphExecUpdate(self.exec, self.graph, &mut info) };
             if r == sys::cudaError_t::cudaSuccess
-                && info.result
-                    == sys::cudaGraphExecUpdateResult::cudaGraphExecUpdateSuccess
+                && info.result == sys::cudaGraphExecUpdateResult::cudaGraphExecUpdateSuccess
             {
                 counters.exec_update_success.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -2374,13 +2377,9 @@ extern "C" __global__ void graph_fake_scale(const float* a, const float* c, floa
             let mut args0 = self.args0;
             let mut args1 = self.args1;
             // SAFETY: test-owned kernels/buffers; context set by caller.
-            unsafe {
-                launch_rows(self.add, stream, self.dev, GRID, BLOCK, args0.as_mut_ptr())
-            }?;
+            unsafe { launch_rows(self.add, stream, self.dev, GRID, BLOCK, args0.as_mut_ptr()) }?;
             // SAFETY: same as above.
-            unsafe {
-                launch_rows(self.scale, stream, self.dev, GRID, BLOCK, args1.as_mut_ptr())
-            }?;
+            unsafe { launch_rows(self.scale, stream, self.dev, GRID, BLOCK, args1.as_mut_ptr()) }?;
             Ok(())
         }
 
@@ -2825,7 +2824,9 @@ extern "C" __global__ void graph_fake_scale(const float* a, const float* c, floa
         let mut exec = capture_fake_step(&pool, &stream, &lib, add, scale, dev.index(), 8, &cells1);
 
         if v2 {
-            eprintln!("V2 node-params available: asserting the full ExecUpdate/re-instantiate path");
+            eprintln!(
+                "V2 node-params available: asserting the full ExecUpdate/re-instantiate path"
+            );
             // Reference: eager (work = a+b = 3; out = work*c = 9 everywhere).
             let cells_eager =
                 Cells::from_buffers(&a, &b, &c, work.as_ptr().cast_mut().cast(), &out);

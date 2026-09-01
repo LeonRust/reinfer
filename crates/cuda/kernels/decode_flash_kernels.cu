@@ -369,6 +369,45 @@ extern "C" __global__ void decode_step_gqa_flash_f32(
 }
 
 // ---------------------------------------------------------------------------
+// S2-B+: batched flash decode — the whole batch in ONE launch (grid =
+// B*QH), replacing the per-request loop of B launches. Each (b, h) CTA
+// resolves request b's own page row and pool base from the batch tables
+// instead of receiving a per-request pointer:
+//   pages:    [B][n_layer][pp] u32 identity page tables (row (b, li) at
+//             pages[(b*n_layer + li)*pp ..]; page[0] = the layer's first
+//             physical page — the identity fast path, as in the engine's
+//             batch scratch);
+//   kv:       [B] pool K-region bases — the shared-pool call has uniform
+//             entries; per-request-pool calls (the S2-B A3 shape) index
+//             each request's own segment;
+//   kv_lens:  [B] u32 per-request attention windows.
+// The per-(b, h) arithmetic (phases A/B/C, q row -> smem, out row write)
+// is verbatim `decode_flash_impl<false>` — bit-identical per request to
+// the single-request flash, so the batch step's attention matches the
+// single path bitwise. pp is derived as max_kv / block_len (the engine
+// guarantees pp * block_len == max_kv).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void decode_step_gqa_flash_batch(
+    const void* __restrict__ q,               // [B, QH, d] f16
+    const unsigned int* __restrict__ pages,   // [B][n_layer][pp] identity tables
+    const unsigned short* const* __restrict__ kv,      // [B] pool K-region bases
+    const unsigned int* __restrict__ kv_lens, // [B]
+    void* __restrict__ out,                   // [B, QH, d] f16
+    int B, int QH, int d, int block_len, int kv_ratio, int kv_heads,
+    int max_kv, int total_pages, int n_layer, int li, int identity) {
+    int cta = blockIdx.x;
+    if (cta >= B * QH) {
+        return;
+    }
+    int b = cta / QH;
+    int h = cta % QH;
+    int pp = max_kv / block_len;
+    const unsigned int* page = pages + ((size_t)b * n_layer + li) * pp;
+    decode_flash_impl<false>(q, page, kv[b], kv_lens, out, B, QH, d, block_len,
+                             kv_ratio, kv_heads, max_kv, total_pages, identity);
+}
+
+// ---------------------------------------------------------------------------
 // S1-9 fused decode: decode_step_gqa_flash_fused — the flash attention
 // kernel with the kv-cache write fused in (f16 tier only; grid = B*QH
 // blocks of FLASH_TPB threads, same as the split flash):

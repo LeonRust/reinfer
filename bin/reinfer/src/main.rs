@@ -15,6 +15,8 @@
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod pipeline;
+#[cfg(feature = "cuda")] // S2-D 调度器循环（serve 接线；CUDA 后端专用）
+mod sched_loop;
 mod serve;
 use reinfer_models::api::FileEntry;
 use reinfer_models::download::{MANIFEST, Verify, local_hit, read_manifest, target_path};
@@ -281,6 +283,10 @@ struct RunArgs {
     /// Effective context window (defaults to model max_position_embeddings)
     #[arg(long = "max-model-len", value_name = "N")]
     max_model_len: Option<usize>,
+
+    /// Print a machine-parseable perf line (tok/s, tpot, graph/jgemm/fallback counters)
+    #[arg(long = "perf")]
+    perf: bool,
 
     /// Prompt remainder (space-joined); when absent, reads stdin
     #[arg(trailing_var_arg = true)]
@@ -690,6 +696,32 @@ fn cmd_run_cuda(
         first_tok,
         a.model,
     );
+    // --perf: one machine-parseable line (decode-avg tpot excludes the first token).
+    // Counters feed the regression-gate record (006 T7 / bench/gate-fixture.md).
+    if a.perf {
+        let (n_dec, dec_ms) = if stat.tokens >= 2 {
+            let ft = stat.first_token.map(|d| d.as_millis() as f64).unwrap_or(0.0);
+            ((stat.tokens - 1) as f64, (dgen.as_millis() as f64 - ft).max(0.0))
+        } else {
+            (stat.tokens as f64, dgen.as_millis() as f64)
+        };
+        eprintln!(
+            "PERF model={} tokens={} tpot_ms={:.3} tok_s={:.2} first_token_ms={} \
+             graph_captures={} graph_replays={} graph_eager_fallbacks={} \
+             jgemm_enabled={} jgemm_fallbacks={} decode_flash_fallbacks={}",
+            a.model,
+            stat.tokens,
+            dec_ms / n_dec.max(1.0),
+            stat.tokens as f64 / dgen.as_secs_f64(),
+            first_tok,
+            engine.graph_captures(),
+            engine.graph_replays(),
+            engine.graph_eager_fallbacks(),
+            engine.jgemm_enabled(),
+            engine.jgemm_fallbacks(),
+            engine.decode_flash_fallbacks(),
+        );
+    }
     0
 }
 
@@ -2218,5 +2250,103 @@ mod tests {
     fn expand_tilde_and_glob() {
         assert_eq!(expand_tilde("/a/b"), PathBuf::from("/a/b"));
         assert_eq!(expand_tilde("rel/dir"), PathBuf::from("rel/dir"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 006 T7 / S1-8: decode regression gate fixture (gpu-less).
+    // Verdict logic shared with bench/perf-gate.sh; values locked in
+    // bench/gate-fixture.json (machine-readable mirror of bench/gate-fixture.md).
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, PartialEq)]
+    enum GateVerdict {
+        /// tok/s >= 0.9 x reference: no 10% regression, CI green.
+        Green,
+        /// 0.85 x reference <= tok/s < 0.9 x reference: gate met, CI red.
+        PassCiRed,
+        /// tok/s < 0.85 x reference: decode gate NOT met.
+        Fail,
+    }
+
+    fn gate_verdict(tok_s: f64, gate: f64, ci_red: f64) -> GateVerdict {
+        if tok_s >= ci_red {
+            GateVerdict::Green
+        } else if tok_s >= gate {
+            GateVerdict::PassCiRed
+        } else {
+            GateVerdict::Fail
+        }
+    }
+
+    fn round1(x: f64) -> f64 {
+        (x * 10.0).round() / 10.0
+    }
+
+    fn gate_fixture_vals() -> (f64, f64, f64, serde_json::Value) {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |p: &str| {
+            std::fs::read_to_string(repo.join(p)).unwrap_or_else(|e| panic!("read {p}: {e}"))
+        };
+        let base: serde_json::Value = serde_json::from_str(&read("bench/baseline-llamacpp.json"))
+            .expect("baseline-llamacpp.json parse");
+        let fx: serde_json::Value = serde_json::from_str(&read("bench/gate-fixture.json"))
+            .expect("gate-fixture.json parse");
+        let ref_tok_s = base["result_tg512"]["median_5"].as_f64().expect("reference median_5");
+        let gate = fx["gate_0_85x"].as_f64().expect("fixture gate");
+        let ci_red = fx["ci_red_0_9x"].as_f64().expect("fixture ci_red");
+        (ref_tok_s, gate, ci_red, fx)
+    }
+
+    #[test]
+    fn gate_fixture_verdict_cases() {
+        let (ref_tok_s, gate, ci_red, fx) = gate_fixture_vals();
+        // Fixture thresholds must stay derivable from the baseline reference.
+        assert!((gate - round1(0.85 * ref_tok_s)).abs() < 1e-9, "gate {gate} vs 0.85x");
+        assert!((ci_red - round1(0.9 * ref_tok_s)).abs() < 1e-9, "ci_red {ci_red} vs 0.9x");
+        assert!((gate - 299.8).abs() < 1e-9, "gate locked to 299.8, got {gate}");
+        assert!((ci_red - 317.4).abs() < 1e-9, "ci_red locked to 317.4, got {ci_red}");
+        // Three verdict cases, read from the fixture: red / pass / green.
+        let c = &fx["verdict_cases"];
+        assert_eq!(
+            gate_verdict(c["red_fail"].as_f64().unwrap(), gate, ci_red),
+            GateVerdict::Fail,
+            "250 tok/s must FAIL (below 0.85x gate)"
+        );
+        assert_eq!(
+            gate_verdict(c["pass_ci_red"].as_f64().unwrap(), gate, ci_red),
+            GateVerdict::PassCiRed,
+            "300 tok/s must PASS with CI red (in [0.85x, 0.9x))"
+        );
+        assert_eq!(
+            gate_verdict(c["green"].as_f64().unwrap(), gate, ci_red),
+            GateVerdict::Green,
+            "320 tok/s must be GREEN (>= 0.9x)"
+        );
+        // Boundaries are inclusive on both thresholds.
+        assert_eq!(
+            gate_verdict(c["boundary_gate"].as_f64().unwrap(), gate, ci_red),
+            GateVerdict::PassCiRed,
+            "299.8 == gate is PASS"
+        );
+        assert_eq!(
+            gate_verdict(c["boundary_ci_red"].as_f64().unwrap(), gate, ci_red),
+            GateVerdict::Green,
+            "317.4 == ci_red is GREEN"
+        );
+        assert_eq!(gate_verdict(gate - 0.01, gate, ci_red), GateVerdict::Fail);
+    }
+
+    #[test]
+    fn parse_run_perf_flag() {
+        let r = parse(&["reinfer", "run", "m", "--perf", "-n", "8", "Hello"]).unwrap();
+        match r.command {
+            Cmd::Run(x) => assert!(x.perf),
+            _ => unreachable!(),
+        }
+        let r = parse(&["reinfer", "run", "m", "Hello"]).unwrap();
+        match r.command {
+            Cmd::Run(x) => assert!(!x.perf),
+            _ => unreachable!(),
+        }
     }
 }

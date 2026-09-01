@@ -121,3 +121,115 @@ extern "C" __global__ void gemv_m1_f16f32_reduce(
     }
     c[col] = acc;
 }
+
+// ---------------------------------------------------------------------------
+// S2-B+: batched m-row variant — C[B x n] = A[B x k] x B[k x n], one launch
+// over the whole batch instead of B m=1 launches (or one m=B cublas call).
+// Per-(b, col, slab) arithmetic is byte-for-byte the m=1 kernel's (same
+// stride-4 k walk, same four ILP accumulators, same (acc0+acc1)+(acc2+acc3)
+// tree, same ascending-slab phase-2 sums), so each output row is bit-
+// identical to the m=1 path given the same A row and B matrix — the batch
+// decode step's GEMM surface becomes bit-identical to the single-request
+// path per request (replacing the cublas m=B drift of S2-B).
+//
+// Layouts (all row-major, matching the engine's batch decode scratch):
+//   a:       [B x k] f16 — request b's activation row at a + b*k (contiguous
+//            rows; the engine's per-layer xn/q/attn/down batch buffers);
+//   b:       [k x n] f16 — the shared weight matrix, ld = n (same as m=1);
+//   partials: [B][nslabs][n] f32 s-major — row b's slab partials at
+//            partials[b*nslabs*n + slab*n + col] (phase-1 writes, phase-2
+//            reads — layout identical to the m=1 partials per row);
+//   c:       [B x n] f32 — output row b at c + b*n.
+//
+// Parallelism: the m=1 grid (ncols*nslabs blocks) is replicated per row:
+// grid1 = B * ncols * nslabs (bx decomposes as cell = bx / B — the m=1
+// (col-block, slab) decomposition — and ROW = bx % B, the fast-varying
+// index: the B rows' blocks for the same cell are consecutive blockIdx
+// values, so they are co-scheduled and share the cell's W slice in L2 —
+// W streams from DRAM once per cell instead of B times; the lm_head
+// (n = vocab) is bandwidth-bound and this ordering measured ~1.9 ms ->
+// ~0.6 ms at B=4), grid2 = B * ncols. No atomics, fixed orders
+// everywhere — deterministic. Coalescing is unchanged from m=1: the 32
+// lanes of a warp read 64 contiguous B bytes at one k position; the A row
+// per block is uniform.
+// ---------------------------------------------------------------------------
+
+// Phase 1: per-(row, column-block, k-slab) partial dot products.
+// grid = B * ncols * nslabs, block = 256.
+extern "C" __global__ void gemv_mb_f16f32(
+    const __half* __restrict__ a,   // [B x k] f16 row-major
+    const __half* __restrict__ b,   // [k x n] f16 row-major
+    float* __restrict__ partials,   // [B][nslabs][n] f32 s-major
+    int B,
+    int n,
+    int k,
+    int nslabs) {
+    int ncols = (n + 255) / 256;
+    int per_row = ncols * nslabs;
+    int bx = blockIdx.x;
+    // bb fastest-varying: the B rows' blocks for the same (slab, colgroup)
+    // cell are CONSECUTIVE blockIdx values, so they are co-scheduled and
+    // share the cell's W slice in L2 — the batch's rows read W from DRAM
+    // once instead of B times (the lm_head, n = vocab, is bandwidth-bound:
+    // measured ~1.9 ms -> ~0.6 ms at B=4). Bit-identity is untouched:
+    // every block still computes the same (bb, slab, col) partial with the
+    // same per-element arithmetic — only the block -> cell assignment
+    // order changes.
+    int bb = bx % B;
+    int rem = bx / B;
+    int col = (rem / nslabs) * 256 + threadIdx.x;
+    if (col >= n) {
+        return;
+    }
+    int slab = rem % nslabs;
+    int slab_k = (k + nslabs - 1) / nslabs;  // ceil; last slab is shorter
+    int ks = slab * slab_k;
+    int ke = ks + slab_k;
+    if (ke > k) {
+        ke = k;
+    }
+    const __half* ar = a + (size_t)bb * k;
+    // Four independent accumulators over four consecutive k positions
+    // (identical ILP pattern and fixed tree to gemv_m1_f16f32).
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (int k0 = ks; k0 < ke; k0 += 4) {
+        acc0 += __half2float(__ldg(&ar[k0])) *
+                __half2float(__ldg(&b[(size_t)k0 * n + col]));
+        if (k0 + 1 < ke) {
+            acc1 += __half2float(__ldg(&ar[k0 + 1])) *
+                    __half2float(__ldg(&b[(size_t)(k0 + 1) * n + col]));
+        }
+        if (k0 + 2 < ke) {
+            acc2 += __half2float(__ldg(&ar[k0 + 2])) *
+                    __half2float(__ldg(&b[(size_t)(k0 + 2) * n + col]));
+        }
+        if (k0 + 3 < ke) {
+            acc3 += __half2float(__ldg(&ar[k0 + 3])) *
+                    __half2float(__ldg(&b[(size_t)(k0 + 3) * n + col]));
+        }
+    }
+    partials[((size_t)bb * nslabs + slab) * n + col] = (acc0 + acc1) + (acc2 + acc3);
+}
+
+// Phase 2: per-row, per-column reduction of the slab partials (ascending
+// slab order — fixed, deterministic). grid = B * ncols, block = 256.
+extern "C" __global__ void gemv_mb_f16f32_reduce(
+    const float* __restrict__ partials,  // [B][nslabs][n] s-major
+    float* __restrict__ c,               // [B x n] f32
+    int B,
+    int n,
+    int nslabs) {
+    int ncols = (n + 255) / 256;
+    int bx = blockIdx.x;
+    int bb = bx / ncols;
+    int col = (bx - bb * ncols) * 256 + threadIdx.x;
+    if (col >= n) {
+        return;
+    }
+    const float* p = partials + (size_t)bb * nslabs * n + col;
+    float acc = 0.0f;
+    for (int s = 0; s < nslabs; ++s) {
+        acc += p[(size_t)s * n];
+    }
+    c[(size_t)bb * n + col] = acc;
+}

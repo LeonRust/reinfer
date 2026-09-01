@@ -29,9 +29,9 @@
 | S1-5 | (conditional) decode-attn FMHA tier (G3; only if profile shows attn >40 %) | 006-2 T2 | S1-1 | D7 + 4K text 100 % |
 | S1-6 | Dual-stream mode ① (event nodes in graph) | 006 T5 | S1-3 | both modes identical |
 | S1-7 | prefill depth: QKV fused kernel + FMHA heuristics tuning (+ conditional vendor tier) | 006 T1 | S0-1 | prefill ≈238.8+ tok/s |
-| S1-8 | Benchmark regression gate (baseline.json 5-median + CI red δ≤0.9× + harness diff runs) | 006 T7 | S1-2/3/4/7 | CI red on 10 % regression |
+| S1-8 | Benchmark regression gate (baseline.json 5-median + CI red δ≤0.9× + harness diff runs) | 006 T7 | S1-2/3/4/7 | CI red on 10 % regression. **Filed 2026-09-01 (doc/script/test only, no crates touched):** protocol card `bench/gate-fixture.md` (formula, thresholds 0.85×=299.8 / 0.9×=317.4, commit+flags manually-fill, per-wave re-run table) + `bench/perf-gate.sh` (one-line: build → reference check → `run_all.py perf_c1` → median tpot → tok/s → PASS/FAIL; `--update-baseline`) + gpu-less fixture test `gate_fixture_verdict_cases` (three verdict cases + boundaries, values locked in `bench/gate-fixture.json`). Gate judged **FAIL (record) 2026-09-01**: protocol tpot 4.100ms = 243.9 tok/s (81.4% of 299.8; S1-10c final; 20× over baseline 12.5, all bit-level/D7/determinism green; 95W power wall + micro-kernel efficiency limits documented — flash at machine-reachable optimum, D7 correctly blocked nslab widening, add_rms split landed (-15/-31%); next physical headroom per plan = power-limit raise by user (C-option) and/or micro-kernel multi-wave (B-option, registered as tech-debt). benchmark-gap §4 ladder = expectation track, not a second gate. |
 
-### Stage 2 — serving concurrency (≈4-8 weeks; c4 → ≈2 s)
+### Stage 2 — serving concurrency (OPEN 2026-09-01) (≈4-8 weeks; c4 → ≈2 s)
 
 | ID | Feature | Spec anchor | Dep | Acceptance |
 |---|---|---|---|---|
@@ -39,6 +39,16 @@
 | S2-2 | Continuous batching + chunked prefill with token budget (scheduler core) | 005 | S2-1 | batch decode GPU-utilized |
 | S2-3 | KV pool budget (90 % VMM) + `max-num-seqs` semantics | 005 D2 | S2-1 | VRAM resident 20 GB+, flat trend |
 | S2-4 | Prefix-cache interface implementation (D9 lookup/refill → P3-01 RadixCache) | 005 D9 / P3-01 | S2-3 | 2-10× on shared prefixes; bit-identical |
+
+**2026-09-01 record**: S2-1/S2-2 真机验收全项通过（unified acceptance, RTX 5090 Laptop,
+Qwen3-0.6B, REINFER_SCHEDULER=on, --max-num-seqs 20): c4(20 并发) TTFT p50 **1.17 s**
+(vLLM 0.28 参考 1.8 s, −34 %, S2-1 gate "≈2 s" 达成, 超 A 目标); 同 seed/temp=0
+双跑输出 byte-identical; abort 隔离 9/9 幸存者 == 基线; on/off 单请求文本一致 +
+completion_tokens == max_tokens (48/48); c1 TTFT p50 68 ms. 验收中修复两个阻断 bug
+(页口径换算 serve.rs `sched_kv_pages`; spawn 握手死锁 `SchedHandle::spawn`) —
+详见 `bench/notes.md` S2-D 节。细节: 单请求 TTFT(68 ms, 9 ms 参考) 受 CPU 采样
+readback 上限 (S2-3/S3 后 GPU sampler 波); VRAM 池 20.6 GB 按 0.9 预算精确闭环。
+S2-3 (steady 20 GB+ flat) 与 S2-4 (prefix cache) 未启动。
 
 ### Stage 3 — API/feature parity & maturity (long tail; two critical)
 

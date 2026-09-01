@@ -54,6 +54,7 @@ pub mod fmha;
 pub mod fused;
 pub mod gemm;
 pub mod graph;
+pub mod layer_fused;
 mod send_sync;
 
 #[cfg(feature = "cuda")]

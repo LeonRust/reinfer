@@ -29,7 +29,7 @@
 | S1-5 | （条件）**decode-attn FMHA 档**（G3；仅 profile 显示 attn>40% 才做） | 006-2 T2 | S1-1 | D7 + 4K 文本 100% |
 | S1-6 | **双流模式①**（图内事件节点） | 006 T5 | S1-3 | 两模式一致 |
 | S1-7 | **prefill 深度**：QKV 融合核 + FMHA heuristics 调准（+ 条件 vendor 档） | 006 T1 | S0-1 | prefill ≈238.8+ |
-| S1-8 | **基准回归门禁**（baseline.json 5 次中位数 + CI 红 δ≤0.9× + 台面差分运行） | 006 T7 | S1-2/3/4/7 | CI 10% 回归即红 |
+| S1-8 | **基准回归门禁**（baseline.json 5 次中位数 + CI 红 δ≤0.9× + 台面差分运行） | 006 T7 | S1-2/3/4/7 | CI 10% 回归即红。**2026-09-01 建档（纯文档/脚本/测试域，未触 crates）：** 协议卡 `bench/gate-fixture.md`（计算式、阈值 0.85×=299.8 / 0.9×=317.4、commit+构建 flags 手动填、每波重跑登记表）+ `bench/perf-gate.sh`（一行式：build → 参照检查 → `run_all.py perf_c1` → tpot 中位数 → tok/s → PASS/FAIL；`--update-baseline`）+ 无 GPU fixture 单测 `gate_fixture_verdict_cases`（三 case + 边界，数值锁于 `bench/gate-fixture.json`）。判定生效待 decode ≥299.8 tok/s（S1-9b ~285 tok/s）；benchmark-gap §4 阶梯=预期轨道（非第二门禁） |
 
 ### Stage 2 —— 服务化并发（≈4-8 周；c4→≈2s）
 
@@ -39,6 +39,16 @@
 | S2-2 | **连续批 + chunked prefill + token 预算**（调度核心） | 005 | S2-1 | 批量 decode GPU 利用 |
 | S2-3 | **KV 池预算**（90% 显存）+ `max-num-seqs` 语义 | 005 D2 | S2-1 | 显存常驻 20GB+、趋势平坦 |
 | S2-4 | **前缀缓存接口实现**（D9 lookup/refill → P3-01 RadixCache） | 005 D9 / P3-01 | S2-3 | 共享前缀 2-10× 收益；bit-identical |
+
+**2026-09-01 记录**：S2-1/S2-2 真机验收全项通过（RTX 5090 Laptop，Qwen3-0.6B，
+`REINFER_SCHEDULER=on`、`--max-num-seqs 20`）：c4（20 并发）TTFT p50 **1.17 s**
+（vLLM 0.28 参考 1.8 s，**领先 34%**，S2-1 门槛"≈2 s"达成）；同 seed/temp=0 双跑输出
+byte-identical；abort 隔离 9/9 幸存者 == 基线；on/off 单请求文本一致且
+completion_tokens == max_tokens（48/48）；c1 TTFT p50 68 ms。验收中修复两个阻断
+bug（页口径换算 `serve.rs::sched_kv_pages`；spawn 握手死锁 `SchedHandle::spawn`）
+——详见 `bench/notes.md` S2-D 节。已知：单请求 TTFT（68 ms vs 9 ms 参考）受 CPU
+采样 readback 上限（GPU sampler 波在后）；VRAM 池 20.6 GB 按 0.9 预算精确闭环。
+S2-3（steady 20 GB+ 平稳）与 S2-4（前缀缓存）尚未启动。
 
 ### Stage 3 —— API/功能对齐与成熟度（长尾；两条关键）
 

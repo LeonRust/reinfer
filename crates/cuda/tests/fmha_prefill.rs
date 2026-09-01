@@ -780,11 +780,7 @@ mod gpu {
                     .collect::<Vec<_>>()
                     .join(" ")
             };
-            println!(
-                "  seq={seq}: fmha-leg top5 [{}]  dense-leg top5 [{}]",
-                topk(&la),
-                topk(&lb)
-            );
+            println!("  seq={seq}: fmha-leg top5 [{}]  dense-leg top5 [{}]", topk(&la), topk(&lb));
             assert!(
                 worst_ad <= gate,
                 "seq={seq}: prefill-end logits drift {worst_ad:.3e} (at b={b_at_worst:.4e}) > gate {gate:.3e}"
@@ -870,8 +866,7 @@ mod gpu {
                 la.len()
             );
             assert_eq!(
-                n_bad,
-                0,
+                n_bad, 0,
                 "seq={seq}: fused QKV diverges from separated beyond D7 GEMM tier \
                  (worst |a-b| {worst_abs:.2e} at max|a,b| {max_mag:.2e})"
             );

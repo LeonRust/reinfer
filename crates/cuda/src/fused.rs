@@ -333,15 +333,7 @@ impl FusedDecodeKernels {
                    nslabs: u32,
                    col_off: i32|
          -> PlanRow {
-            PlanRow {
-                a,
-                b,
-                partials,
-                n: n as i32,
-                k: k as i32,
-                nslabs: nslabs as i32,
-                col_off,
-            }
+            PlanRow { a, b, partials, n: n as i32, k: k as i32, nslabs: nslabs as i32, col_off }
         };
         // Multi-kernel block offsets per plan: each plan's segment is
         // ncols*nslabs tiles, and the kernel decodes its tile as
@@ -369,8 +361,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_k, pk, nk, l0.k.k as usize, b_q as i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_k, pk, nk, l0.k.k as usize, b_q as i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(pl.k.a as *const u16, pl.k.b as *const u16, seg, n, k, nslabs, col_off)
@@ -378,8 +369,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_v, pv, nv, l0.v.k as usize, b_k as i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_v, pv, nv, l0.v.k as usize, b_k as i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(pl.v.a as *const u16, pl.v.b as *const u16, seg, n, k, nslabs, col_off)
@@ -387,8 +377,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_o, po, h, l0.o.k as usize, 0i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_o, po, h, l0.o.k as usize, 0i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(pl.o.a as *const u16, pl.o.b as *const u16, seg, n, k, nslabs, col_off)
@@ -396,8 +385,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_g, pg, ffn, l0.gate.k as usize, 0i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_g, pg, ffn, l0.gate.k as usize, 0i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(
@@ -412,8 +400,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_u, pu, ffn, l0.up.k as usize, b_g as i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_u, pu, ffn, l0.up.k as usize, b_g as i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(pl.up.a as *const u16, pl.up.b as *const u16, seg, n, k, nslabs, col_off)
@@ -421,8 +408,7 @@ impl FusedDecodeKernels {
                     std::mem::size_of::<PlanRow>(),
                 )
             });
-            let (nslabs, seg, n, k, col_off) =
-                (nslabs_d, pd, h, l0.down.k as usize, 0i32);
+            let (nslabs, seg, n, k, col_off) = (nslabs_d, pd, h, l0.down.k as usize, 0i32);
             bytes.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
                     &row(
@@ -528,10 +514,8 @@ impl FusedDecodeKernels {
         let _guard = CtxGuard::set_current(self.dev)?;
         let t_v: *const PlanRow = table;
         let n_v: i32 = nplans as i32;
-        let mut args: [*mut c_void; 2] = [
-            (&t_v as *const *const PlanRow) as *mut c_void,
-            (&n_v as *const i32) as *mut c_void,
-        ];
+        let mut args: [*mut c_void; 2] =
+            [(&t_v as *const *const PlanRow) as *mut c_void, (&n_v as *const i32) as *mut c_void];
         unsafe { launch_rows(self.p1, stream, self.dev, grid, 256, args.as_mut_ptr()) }
     }
 
@@ -628,10 +612,8 @@ impl FusedDecodeKernels {
         let _guard = CtxGuard::set_current(self.dev)?;
         let t_v: *const PlanRow = table;
         let n_v: i32 = 3;
-        let mut args: [*mut c_void; 2] = [
-            (&t_v as *const *const PlanRow) as *mut c_void,
-            (&n_v as *const i32) as *mut c_void,
-        ];
+        let mut args: [*mut c_void; 2] =
+            [(&t_v as *const *const PlanRow) as *mut c_void, (&n_v as *const i32) as *mut c_void];
         unsafe { launch_rows(self.p2_gu_d, stream, self.dev, grid, 256, args.as_mut_ptr()) }
     }
 

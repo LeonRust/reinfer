@@ -190,10 +190,9 @@ pub struct FmhaKernels {
     /// launch safe, and layers within a call share one set (no per-layer
     /// preflight). `RefCell` — the launch path only holds `&self`;
     /// single-threaded use.
-    primed:
-        std::cell::RefCell<
-            std::collections::HashSet<(u32, u32, u32, u32, u32, usize, usize, usize, usize, usize)>,
-        >,
+    primed: std::cell::RefCell<
+        std::collections::HashSet<(u32, u32, u32, u32, u32, usize, usize, usize, usize, usize)>,
+    >,
 }
 
 /// 读 vendored 头树全部文件（相对路径 → 内容），按字典序。
@@ -273,9 +272,7 @@ impl FmhaKernels {
         // kSmemV, f16).
         let mut variants = Vec::new();
         for (id, (bm, bn, warps)) in
-            [(128u32, 128u32, 4u32), (128, 128, 8), (128, 64, 4), (256, 128, 8)]
-                .iter()
-                .enumerate()
+            [(128u32, 128u32, 4u32), (128, 128, 8), (128, 64, 4), (256, 128, 8)].iter().enumerate()
         {
             let v = format!("fmha_v{id}");
             let sym = |mn: &str, k: &str| -> Result<KernelFn, LaunchError> {
@@ -303,8 +300,12 @@ impl FmhaKernels {
             // attribute — drop the variant instead of failing the load
             // (pick()/bench then just see a shorter table).
             let mut ok = true;
-            for s in [variant.mn_even_k_even, variant.mn_even_k_odd, variant.mn_odd_k_even,
-                      variant.mn_odd_k_odd] {
+            for s in [
+                variant.mn_even_k_even,
+                variant.mn_even_k_odd,
+                variant.mn_odd_k_even,
+                variant.mn_odd_k_odd,
+            ] {
                 if let Err(e) = super::jit::set_max_dynamic_smem(s, variant.smem) {
                     eprintln!(
                         "reinfer-cuda: FMHA variant v{id} ({bm}x{bn}x128, {warps} warps) \
@@ -519,10 +520,7 @@ impl FmhaKernels {
         d: u32,
         smem_override: Option<u32>,
     ) -> Result<(), LaunchError> {
-        let variant = self
-            .variants
-            .get(variant_idx)
-            .ok_or(LaunchError::Fatal)?;
+        let variant = self.variants.get(variant_idx).ok_or(LaunchError::Fatal)?;
         // S1-7 preflight. On a fresh CUDA context, the first 98304-smem
         // FMHA launch against a fresh buffer set deterministically
         // corrupts the last Q block: even MN — the whole second Q block of
@@ -560,19 +558,7 @@ impl FmhaKernels {
         let first = self.primed.borrow_mut().insert(key);
         if first {
             self.launch_batched_prefill_variant_smem(
-                dev,
-                0,
-                q,
-                k,
-                v,
-                o,
-                lse,
-                seqlen,
-                batch,
-                heads,
-                kv_heads,
-                d,
-                None,
+                dev, 0, q, k, v, o, lse, seqlen, batch, heads, kv_heads, d, None,
             )?;
             self.stream.synchronize()?;
         }

@@ -448,12 +448,18 @@ fn status_message(st: blas::cublasStatus_t) -> &'static str {
 
 /// JIT m=1 GEMM unit: the `gemv_m1_f16f32` / `gemv_m1_f16f32_reduce`
 /// kernel pair loaded via the standard JitCache pipeline (probe -> key ->
-/// build_once -> load -> kernel).
+/// build_once -> load -> kernel), plus the S2-B+ batched pair
+/// (`gemv_mb_f16f32` / `gemv_mb_f16f32_reduce`, same cubin — the batch
+/// decode step's m=B projections; per-row bit-identical to the m=1 pair).
 #[derive(Debug)]
 pub struct Jgemm {
     lib: JLib,
     kernel: KernelFn,
     kernel_reduce: KernelFn,
+    /// S2-B+: batched (m=B) phase-1 kernel — one launch over B rows.
+    kernel_batch: KernelFn,
+    /// S2-B+: batched (m=B) phase-2 kernel.
+    kernel_batch_reduce: KernelFn,
     dev: u32,
     /// Slab-partials scratch (phase 1 output / phase 2 input), sized
     /// n*nslabs*4 on demand. Mutex: `launch` takes `&self` (the engine
@@ -482,7 +488,17 @@ impl Jgemm {
         let lib = JLib::from_bytes(bytes)?;
         let kernel = lib.kernel("gemv_m1_f16f32")?;
         let kernel_reduce = lib.kernel("gemv_m1_f16f32_reduce")?;
-        Ok(Self { lib, kernel, kernel_reduce, dev, partials: Mutex::new(None) })
+        let kernel_batch = lib.kernel("gemv_mb_f16f32")?;
+        let kernel_batch_reduce = lib.kernel("gemv_mb_f16f32_reduce")?;
+        Ok(Self {
+            lib,
+            kernel,
+            kernel_reduce,
+            kernel_batch,
+            kernel_batch_reduce,
+            dev,
+            partials: Mutex::new(None),
+        })
     }
 
     /// Raw cubin library handle — the S1-3 graph declaration path takes the
@@ -543,8 +559,8 @@ impl Jgemm {
             // DeviceBuffer::alloc needs a current context (launch sets the
             // same guard before allocating).
             let _guard = CtxGuard::set_current(self.dev)?;
-            let buf =
-                DeviceBuffer::alloc(DeviceId::new(self.dev), bytes).map_err(|_| LaunchError::Fatal)?;
+            let buf = DeviceBuffer::alloc(DeviceId::new(self.dev), bytes)
+                .map_err(|_| LaunchError::Fatal)?;
             *slot = Some((bytes, buf));
         }
         Ok(slot.as_ref().expect("just ensured").1.as_ptr() as *mut f32)
@@ -634,5 +650,90 @@ impl Jgemm {
         ];
         // SAFETY: same pointer contracts as above.
         unsafe { launch_rows(self.kernel_reduce, stream, self.dev, ncols, 256, args2.as_mut_ptr()) }
+    }
+
+    /// S2-B+: batched m-row launch — C[m x n] = A[m x k] x B[k x n] in ONE
+    /// two-phase launch (the batch decode step's projections; the engine
+    /// routes its m=B GEMMs here when this unit is loaded, else cublas).
+    ///
+    /// Contract (fixed, not a `GemmPlan` — the batch path has no plans):
+    /// `a` is [m x k] f16 row-major (request rows contiguous, ld = k), `b`
+    /// is the shared [k x n] f16 row-major weight matrix (ld = n), `c` is
+    /// [m x n] f32 row-major — the engine's batch scratch layout, mirroring
+    /// `gemm1r`'s cublas call with OP_N/OP_N. `m` rows with the SAME (n, k)
+    /// geometry and weight matrix.
+    ///
+    /// Numerics: per-row arithmetic is byte-for-byte `gemm_m1_f16f32`'s
+    /// (same slab split via `shape`, same stride-4 k walk, same fixed
+    /// reduction trees) — row r is bit-identical to the m=1 path given the
+    /// same A row and B matrix, so the batch step's GEMM surface matches
+    /// the single-request path bitwise. Deterministic.
+    ///
+    /// The shared slab-partials scratch grows to m*n*nslabs (layout
+    /// [m][nslabs][n] — row r's chunk at offset r*nslabs*n; the m=1 kernels
+    /// use the same buffer from offset 0, so both paths coexist).
+    ///
+    /// # Safety
+    /// Same contract as every engine kernel launch: `a`/`b`/`c` are valid
+    /// device pointers of the declared dtype/sizes for this context; the
+    /// stream is valid.
+    pub fn launch_batch(
+        &self,
+        stream: &CudaStream,
+        a: *const u16,
+        b: *const u16,
+        c: *mut f32,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), LaunchError> {
+        let _guard = CtxGuard::set_current(self.dev)?;
+        let (ncols, nslabs) = self.shape(n as c_int, k as c_int);
+        // Phase-1 partial scratch [m][nslabs][n] — same slot as the m=1
+        // path (grows monotonically; the stream serializes the launches).
+        let partials_v = self.ensure_partials(n * m, nslabs)?;
+        // C3 discipline (jit.rs header): kernelParams entries must be
+        // addresses of LOCAL variables — no inline conversion chains.
+        let a_v: *const u16 = a;
+        let b_v: *const u16 = b;
+        let m_v: c_int = m as c_int;
+        let n_v: c_int = n as c_int;
+        let k_v: c_int = k as c_int;
+        let nslabs_v: c_int = nslabs as c_int;
+        let mut args1: [*mut c_void; 7] = [
+            (&a_v as *const *const u16) as *mut c_void,
+            (&b_v as *const *const u16) as *mut c_void,
+            (&partials_v as *const *mut f32) as *mut c_void,
+            (&m_v as *const c_int) as *mut c_void,
+            (&n_v as *const c_int) as *mut c_void,
+            (&k_v as *const c_int) as *mut c_void,
+            (&nslabs_v as *const c_int) as *mut c_void,
+        ];
+        let grid1 = m as u32 * ncols * nslabs;
+        // SAFETY: `a`/`b` valid (caller contract); `partials_v` valid for
+        // m*n*nslabs*4 bytes (just ensured); locals for params.
+        unsafe { launch_rows(self.kernel_batch, stream, self.dev, grid1, 256, args1.as_mut_ptr())? };
+        let c_v2: *mut f32 = c;
+        let m_v2: c_int = m as c_int;
+        let n_v2: c_int = n as c_int;
+        let nslabs_v2: c_int = nslabs as c_int;
+        let mut args2: [*mut c_void; 5] = [
+            (&partials_v as *const *mut f32) as *mut c_void,
+            (&c_v2 as *const *mut f32) as *mut c_void,
+            (&m_v2 as *const c_int) as *mut c_void,
+            (&n_v2 as *const c_int) as *mut c_void,
+            (&nslabs_v2 as *const c_int) as *mut c_void,
+        ];
+        // SAFETY: same pointer contracts as above.
+        unsafe {
+            launch_rows(
+                self.kernel_batch_reduce,
+                stream,
+                self.dev,
+                m as u32 * ncols,
+                256,
+                args2.as_mut_ptr(),
+            )
+        }
     }
 }

@@ -13,6 +13,8 @@ reinfer-tokenizer = { workspace = true }  # run：tokenizer.json → BPE
 reinfer-safetensors = { workspace = true } # run：模型文件读取（权重组经 cuda engine）
 reinfer-samplers = { workspace = true }   # run：采样链（llm-samplers 薄封装）
 reinfer-kernels = { workspace = true }    # run/serve：SamplerChain/LogitsView（006-2 T3E 接线）
+reinfer-scheduler = { workspace = true }  # serve：S2-D 调度器（Req 状态机/准入/select_batch/确定性）
+reinfer-memory = { workspace = true }     # serve：S2-C KV 段池（KvSegmentPool/KvGeometry/预算）
 reinfer-ascend = { workspace = true, optional = true }
 dotenvy = { workspace = true }   # 启动读取 .env（开发测试环境；无文件静默跳过）
 clap = { version = "4", features = ["derive"] }   # CLI 解析（契约 v2.5 定稿：clap derive）

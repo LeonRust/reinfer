@@ -927,3 +927,291 @@ tpot 24.1 -> 18.7 ms/tok (41.4 -> 53.6 tok/s; 50.2 tok/s with profiler on);
   tok/s 提升需 gpu busy 到 2.5ms 以下才可见——下轮 launch 压缩
   （graph replay 在 13.x runtime）前该表面已饱和；graph.rs 两个
   `unnecessary unsafe` 警告为既有，未动。
+
+## 2026-09-01 — S1-10: decode 层融合（每层 1 kernel + 自定义 atomic grid barrier）
+
+- **形态盘点（8 节点/层 → 1 节点/层）**：`decode_layer_fused_kernels.cu`
+  `decode_step_layer_fused`（512 线程，grid = min(occ×82, max_tiles) = 82，
+  动态 smem = (d + max_kv)×4）。每层一次 launch（28 + lm_head 2 = **31
+  launches/step**，原 229），kernel 边界即跨层同步（无层间 race）。层内 8
+  个 stage 用自研 sense-reversal atomic grid barrier（cnt+gen 每 slot
+  双槽、volatile spin + 前后 __threadfence、self-resetting，graph replay
+  安全）串行化：gather/rms0（仅 li=0，嵌入 stage 0）→ p1_qkv →
+  p2_qkv+head-norm+rope → flash（kv 写并入）→ p1_o → add_rms(o) →
+  p1_gu → p2_gu_d+swiglu → add_rms(down)+下层 norm。stage-clock
+  （clock64 per stage，n_layers×9 u32）仪表进 REINFER_DECODE_PROFILE
+  分段表。host wall 3.3 ms → **0.07 ms/step**（launch 开销消除）。
+- **S1-10b：partial-participant barrier DAG（实验，已记录）**：barrier 参与者
+  改为前缀集合（bar0 全量 144；其后各屏障只等实际生产者集合：16/48/96），
+  非参与者跳过 barrier 提前前进。位级全过（li1/determinism PASS）但 **gpu
+  busy 与全部 stage means 与改前逐项一致（±0.5%）——barrier 不是时间去向**
+  （实测成本 ≈0-2 us，成本模型错）。随后 `__nanosleep(200)` spin 退避实验
+  同样零收益（3.974/3.986/3.980 vs 3.977/3.976/3.976）。两项均按
+  "无收益则记录" 收尾：**保留 partial-participant DAG（位级透明、减少
+  L2 原子争用、代码量小），撤销 nanosleep**（纯复杂化）。
+- **同日 A/B（REINFER_DECODE_PROFILE，--max-model-len 4096，window
+  21-40，mean 20 steps，release）**：
+
+  ```text
+                      S1-9 fused(229)   layer-fused(31)   Δ
+  gpu busy  ms/step   3.81-3.85         3.98-4.01        +4%（parity）
+  host wall ms/step   3.3               0.07             −98%
+  launches/step       229               31               −86%
+  ```
+  gpu busy 未达 ≤3.1 目标：时间在各 stage 实际工作（DRAM 流 + 延迟），
+  已由 S1-10b 双实验证伪 barrier 假设。逐段（us/层，@~2.2GHz）：
+  gather+p1_qkv 17.9（8MB @447GB/s = floor）、p2_qkv ~6、flash 19.2
+  （延迟受限）、p1_o 12.6（2MB 却 3× 低于 floor）、add_rms(o) 10.9、
+  p1_gu 21.6、p2_gu_d 23.1、add_rms(down) 13.3（单 block 串行）；
+  lm_head 0.49 ms/step（311MB @635GB/s = floor）。总 ~3.49 + 0.49 = 3.99。
+- **位级/D7**：`layer_fused_li1_bit_exact_vs_split`（q/k/v、attn、x、
+  xn_attn、down、7 个 partials 段、page-1 kv 写全 0-ulp）、
+  `layer_fused_determinism_double_run`、`fused_engine_ab_bitwise` +
+  `layer_fused_engine_ab_bitwise`（真机 128 步位级一致，392s）全过。
+  D7：与 S1-9 聚合序完全一致（stage-2 4-ILP、(a0+a1)+(a2+a3)、ascending-
+  slab phase-2、128-slot head-norm / 256-slot rms 树、软件 RNE）——无
+  数学改动，|Δ| = 0。
+- **graph（REINFER_GRAPH=1，--max-model-len 4096）**：bucket 捕获
+  "30 kernel nodes == 30 declared specs"（expected_node_count(28, true,
+  true, true, true) = 28+2）。graph.rs 未动（只读）。注：replay 在
+  12.x runtime scope 下 cudaGraphNodeSetParams 失败（已知环境限制，
+  LD_PRELOAD libcudart.so.13 解锁）——既有，非本波回归。
+- **回退**：REINFER_FUSED=off → split 路径（16 tok 正常）；REINFER_
+  LAYER_FUSED=off → S1-9 fused 路径（正常）。位级由 engine A/B 覆盖。
+- **修了一个真 bug（本波）**：layer-fused build 的 occupancy 查询用
+  (d+max_kv)×4 = 164 KB 动态 smem——sm_120 每 block opt-in 上限
+  101376 B → 默认 ctx 40960 下 occ=0 静默 fail-open（此前验收全在
+  --max-model-len 4096 下，16.9 KB 可过）。build() 现查询
+  MAX_SHARED_MEMORY_PER_BLOCK_OPTIN 设门（超限 → 显式 fail-open），
+  并在 shared > 48 KB 时补 `cuFuncSetAttribute` opt-in（mid-range ctx
+  可用）。kernel 实际只需 (d+kv_len)×4，40K ctx 下 S1-9 fused 的
+  flash（98304 B ≤ 上限）本就正确接管。
+- **门槛判定行**：serve 面 perf_c1（10 req，seed 42，max-model-len
+  4096）：tpot p50 = **4.440 ms**（min 4.274 / p90 4.659），≈225 tok/s
+  vs **门禁 299.8 tok/s（tpot p50 ≤ 3.335 ms）→ FAIL**（S1-9b 的
+  4.25-4.79 同量级，无回归亦无提升）。run CLI 228-230 tok/s 同量级。
+- 遗留：① flash / p1_o / add_rms 三处延迟热点（见上）是下一步候选，
+  但均需改聚合序或单 block 语义，收益不确定；② 40960 ctx 下 S1-9
+  fused/flash 启动 999 → naive GQA 回退为**既有问题**（transcript
+  2 次出现，非本波引入，未动）；③ graph replay 环境限制如上。
+  未提交。
+
+## 2026-09-01 — S1-10c: decode 微核最后调优（add_rms 拆分落地；flash 三连实验）
+
+- **机况警示（本波测量纪律）**：同一天内 gpu busy 在同码下 3.9-5.6 ms
+  摆动（11:26-11:50 节流态：flash 60 us/层@kv676、lm_head 0.58 ms；
+  12:00 后最快态：flash 19-23 us、lm_head 0.39 ms）。94-95W 电源墙
+  （VBIOS 默认，未抬升——rule 4）。bisect 期"74 ns/token、issue-bound"
+  结论是节流态的时钟假象；最快态实测 ~33 ns/token。**同日交错 A/B 是
+  唯一有效协议**，跨时段数字不可直接对比。
+- **1) add_rms 拆分（并行 add + 原序 rms）→ 落地**（stage_add_columns
+  全 grid 元素级 add + stage_rms_out 单 block 原序 rms + 新全 grid
+  bar7/bar8；bar3/bar6 升为全 grid）。同日交错 A/B（kv676，最快态）：
+
+  ```text
+                     single-block      split        Δ
+  p1_o 行(bar3+add)  11.0-11.6 us       9.3-10.3     −15%
+  p2_gu_d 行(bar6+add) 13.6-14.4 us      9.35-9.92    −31%
+  ```
+  两项均 ≥5% 尺通过（同日 A/B）。注：节流态下该拆分曾实测 0.0%
+  （barrier/延迟主导，并行 add 无利可图）——如实记录，采用最快态结论。
+  位级：add 元素级分块（每 x[i] 值逐位一致）、rms 仍 block 0 原序
+  （stride-256 平方和 + 256-slot 树 + rstd 不出块）——**无 D7**。
+  host 侧 bar 槽 16→20 u32；期间修一自伤 bug（zeros host buffer 仍
+  16*4 而 copy 写 20*4 → launch invalid → 改 20*4）。
+- **2) p1_o nslab 宽化（24→48）→ 未实施（D7 分析不通过）**：nslab 翻倍
+  改变每 slab 的 k 分段 → phase-2 的 ascending-slab f32 求和分组改变 →
+  输出 f16 可翻 1 ULP（相对 1e-3）> D7 尺 ≤1e-6。列分布式宽化（tile
+  重排）不改聚合序但也不减工作量（位级无收益）。4) gu/gd 宽化同理由
+  （slab 重组）→ 同样未实施。如实记录。
+- **3) flash（kv676 最快态 p2_qkv 行 22.3 us）三连实验，全部无收益**：
+  ① uint4 宽载：SASS 证实 ptxas 把 16B 载拆回 516 条 LDG.E.U16
+  （0 条 LDG.E.128）——因消费侧是 16-bit 提取；同日 A/B 无变化；
+  ② `__builtin_assume_aligned(,16)`：SASS 纹丝不动（无变化）；
+  ③ 向量 `__ldg`：24 条 LDG.E.128 真正落地（phase A 主体 16 + tail 8），
+  但**回退**：p2_qkv 24.9-25.3 us（vs 22.3-22.9），全 kernel FFMA
+  586→766——sm_120a 上窄 U16 载 + 免费转换路径已是 ptxas 的最优形态；
+  ④ `__half22float2` 成对转换 + sq LDS.128：±0.5 us 噪声内（无 ≥5%
+  变化）。结论：保留原（窄载）形态；flash 19-23 us ≈ notes S1-10 的
+  19.2 us——已回到该机可及水平。phase C 全程恢复（bisect：C ≈ 0 us；
+  `#pragma unroll 4` 保留）。
+- **位级/D7 终态**：8/8 全过（fused_decode --ignored --test-threads=1，
+  REINFER_MODEL_DIR=模型子目录）：layer_fused_li1_bit_exact_vs_split、
+  layer_fused_determinism_double_run、fused/layer_fused_engine_ab_bitwise
+  （真机 128 步位级一致）。拆分与 flash 改动均无数学改动，|Δ| = 0。
+- **终态分段（kv676，最快态，us/层）**：gather/rms0 18.0、p1_qkv 6.2、
+  p2_qkv(bar1+flash) 22.3、flash 12.6、p1_o 9.4、p2_o 22.1、p1_gu 23.5、
+  p2_gu_d 9.4；layer ≈123.5 us；gpu busy 3.90-4.15 ms/step（31
+  launches）。
+- **门槛判定行**：serve 面 perf_c1（20 req，seed 42）：tpot p50 =
+  **4.100 ms**，**243.9 tok/s**（errors 0）vs 门禁 **299.8 tok/s
+  （tpot ≤3.335 ms）→ FAIL**（ci_red 317.4）。较 S1-10 的 4.440 ms
+  /225 tok/s +4%：add_rms 拆分 + phase C 全量恢复 + 最快机况。本机
+  可达上限分析：即使 flash 归零，最快态仍有 ~3.5 ms 地板（lm_head
+  0.39 + 层 28×~110 us）> 3.335 ms——95W 电源墙下门禁不可达（notes
+  S1-10 同样 FAIL）。run CLI 229-243 tok/s 同量级。
+- 未提交。限制：① 95W 电源墙（VBIOS，未抬升）；② 机况日间 4× 摆动使
+  跨时段比较失效；③ p1_o/gu/gd 宽化被 D7 尺挡住（f16 输出 1 ULP ≈ 1e-3）。
+
+## 2026-09-01 — S1-8: 基准回归门禁建档（006 T7；纯文档/脚本/测试域）
+
+- **门禁定案（decode 唯一门禁）**：0.85× llama.cpp CUDA = **299.8 tok/s**（参照
+  352.70 tok/s 中位数，`bench/baseline-llamacpp.json`：Qwen3-0.6B-f16 GGUF sha
+  `d04bceb6…`、llama.cpp f280b2698 + nvcc 13.2 + sm120、`-b 1 -n 512 -fa 1 -ngl 99`、
+  预热≥3、5 次取中位）；**CI 红判据 = 中位数 ≤0.9× 基线（317.4 tok/s，10% 阈值）**，
+  与 000 CPU 档 5% 并存（CUDA 档 10% / CPU 档 5%，各自独立）；benchmark-gap §4
+  阶梯（150-250 tok/s…）= **预期轨道（记录档，非判据）**。
+- 建档产物（本波，全部最小；未触碰 crates 内核）：
+  - `bench/perf-gate.sh`（可执行）：build release（--features cuda）→ 参照存在性
+    检查（缺失提示 T0 重跑）→ `../bench-vs-vllm/run_all.py --engine reinfer
+    --suite perf_c1`（只调台面脚本，不占锁）→ 解析 tpot p50（非 warmup、无 error）
+    → tok/s → 三态判定（GREEN ≥317.4 / PASS-CI-RED ≥299.8 / FAIL <299.8）；
+    `--skip-build` / `--seed` / `--update-baseline <tok/s>`（重写参照+历史入
+    history[]） / `--dry-run`（离线 parse 验证）。
+  - `bench/gate-fixture.md`：**判定协议卡**（计算式、阈值、commit+构建 flags
+    manually-fill 纪律、每波重跑登记 table、可复制的门禁执行流程）。
+  - `bench/gate-fixture.json`：机器可读镜像（脚本与测试共用数值源）。
+  - `bin/reinfer run --perf`（≤15 行）：一行 `PERF model=… tokens=… tpot_ms=…
+    tok_s=… first_token_ms=… graph_captures=… graph_replays=…
+    graph_eager_fallbacks=… jgemm_enabled=… jgemm_fallbacks=…
+    decode_flash_fallbacks=…`（decode-avg tpot 不含首 token）。
+  - 无 GPU 单测 `gate_fixture_verdict_cases`（bin/reinfer，cargo test -p reinfer
+    16/16）：读 gate-fixture.json 数值 → 三 case（过/红/绿）+ 边界（≥ 含等号）+
+    fixture 与 baseline-llamacpp.json 派生一致性断言。
+- **现状**：S1-9b 后 run CLI 短 kv 284.8/270.3 tok/s（≈95% 门禁）——**门禁未达成，
+  FAIL（预期轨道内）**；perf_c1 serve 面 tpot 0.0039s（≈256 tok/s）同量级。
+- 重跑登记：见 gate-fixture.md §4 table（每波一行：engine commit + 构建 flags +
+  测量 tok/s + 判定，由执行者手动填）。
+
+### 门禁执行（复制即用）
+
+```bash
+export REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc CUDA_VISIBLE_DEVICES=0
+cd /home/dora/Dev/ai-tokens/reinfer
+cargo build --release --features cuda
+bench/perf-gate.sh            # 退出码：0=PASS（≥0.85×）；1=FAIL；2=前置缺失/测量失败
+```
+
+## 2026-09-01 — S2-D: 调度事件循环（D1）+ 服务接线（005 收尾）
+
+本波交付调度执行器与服务接线：`REINFER_SCHEDULER=on` 走 SchedLoop（连续批处理），
+`off`（默认）保留原单请求路径——on/off 双路径并存，验收只在 on 路径执行。
+
+### 交付物
+
+- `bin/reinfer/src/sched_loop.rs`（新，~1750 行）：`SchedLoop` 单线程事件循环 +
+  `SchedHandle`（serve 接线面：std mpsc 命令通道 Submit/Abort/Shutdown + 每请求
+  tokio 有界帧通道 256）；`BatchExecutor` trait 抽象后端（CUDA 现役，mock 供测试）。
+- `bin/reinfer/src/serve.rs`：chat handler → `SchedHandle::submit` → 帧流 → 现有
+  SSE 包装（/v1/* + SSE + api-key 不变）；断连（blocking_send 失败）即
+  request_abort，无需额外 closed watcher；非流式路径聚合帧。`max_num_seqs != 1`
+  且 scheduler off → 退出码 2（拒绝无意义的配置）。
+- `crates/scheduler/src/req.rs`：**max_output 边界修复**（见下）。
+
+### 架构
+
+```
+HTTP handler ──► SchedHandle（std mpsc 命令通道：Submit/Abort/Shutdown）
+   ▲  ◄── 帧 ── SchedLoop<E>（单线程，D1）
+                   arrive → admission（D2 四门）→ select_batch（decode-first）
+                   → prefill（串行 chunk，页对齐）→ decode 批（req_id 序）
+                   → 每请求 CPU 采样链（D5 种子）→ 帧 → 终止 → 释放（恰一次）
+                        │ BatchExecutor trait
+                        ▼
+              CudaBatchExecutor（共享 KvSegmentPool + 引擎；singleton/commit/stage）
+```
+
+### 关键设计决策
+
+- **KV 池 + 幻影锚段**：执行器持有 `kv_budget_pages` 建的 KvSegmentPool，每请求
+  段 = `n_layer × ceil(max_model_len/32)` 页（全窗；批内核恒等页表）。顶部窗口
+  `[kv_pages−window, kv_pages)` 以 `alloc_from_end` 常驻（锚段）。B≥2 解码批一律
+  追加锚段为固定幻影请求（token 0, pos 0, kv_len 1）→ `pool_pages == kv_pages`
+  恒定 → V 区 = KvStore 布局（`store.v_ptr()`），singleton 拷贝地址稳定；锚段
+  logits 行丢弃。B=1 走引擎自有池（串行比特一致）。
+- **singleton 过渡**：B=1 时 lone decoder 在引擎池解码（零拷贝）；形成批时 flush
+  （引擎池→段，页精确 D2D 同步拷贝，CtxGuard 下）；prefill 先 stage 到引擎池，
+  单请求世界 adopt、多请求世界 commit 到段。
+- **D2 准入**：`estimates` 只在准入时插入（submit 时插入会把 waiting 请求计入
+  working 集 → TooManyRequests 门永远拒绝 → 挂死；已修复并有测试覆盖）。
+- **max_output 边界修复**（S2-A 机器遗留 off-by-one）：原 `cached_len >= prompt +
+  max_output` 在 cap 到达的 token 上直接 MaxOutput——该 token 被丢弃，只发出
+  `max_output − 1` 个 token，与串行路径（generate_stream 恰好 max_tokens 个）不
+  一致，违反"on 与 off 文本一致"验收。改为：cap 到达 token 照常确认发出，
+  `device_len > prompt + max_output`（下一个 token）才触发 MaxOutput（该 token
+  消费不发出，同 stop/EOS 语义）；req.rs 两处测试同步更新。
+- **单线程纪律**：所有可变状态（Req 机、池、引擎、采样链）单线程独占；
+  空转时阻塞 recv，否则 drain 命令 → iterate；确定性 = (base_seed, 命令序) 纯函数
+  （arrival 序编号、批 req_id 排序、池确定性分配、每请求独立种子）。
+
+### 测试（本波全绿）
+
+- sched_loop 7 个：`loop_replays_bit_identically`（同命令流双跑 trace 位级一致 +
+  释放守恒）、`abort_isolates_other_requests`（abort 不污染幸存者 token 序列）、
+  `greedy_single_request_completes_with_frames`（6 Token 帧 + Done、池零占用、
+  alloc==free）、`chunked_prefill_via_chunk_budget`（64 块预算 → 3+ chunk、
+  ChunkDone×N→PrefillDone）、`stop_pattern_terminates_generation`、
+  `admission_caps_concurrency_deterministically`（3 请求对 2 槽：第三个 Waited，
+  在第一个 MaxOutput 后 start）、`align_chunk_end_rounds_down_unless_final`。
+- scheduler crate 57 个（含 req 边界更新）、bin/reinfer 23 个全绿；clippy（bin/
+  scheduler 两 crate 0 警告；crates/cuda 的 jit.rs/fmha.rs 2 个 clippy error 与
+  graph.rs 2 个 unsafe 警告为既有/引擎波范围，未动）；fmt 干净。
+
+### 验收（真机，2026-09-01 全项通过；数值已填）
+
+```bash
+export REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc CUDA_VISIBLE_DEVICES=0
+cargo build --release --features cuda
+REINFER_SCHEDULER=on bin/reinfer serve --model-dir … --max-num-seqs 20 …
+```
+
+| 项 | 判据 | 结果 |
+|---|---|---|
+| 20 并发 TTFT | on 较 off 显著下降（复用 KV/批） | **通过**：c4 ttft_p50 = **1.17 s**（20 并发，0 errors，22 req）——vLLM 0.28 参考 1.8 s，**已领先 34%**（S2-1 目标"A ≈2 s"达成）|
+| 确定性 | 同输入重跑输出 bit-identical | **通过**：相同 seed/temp=0 双跑文本逐字节相等 |
+| abort 隔离 | 单请求 abort 后其余请求输出与基线逐 token 一致 | **通过**：10 并发（1 个首帧后 client 断流）→ 幸存 **9/9** 输出与基线一致；aborted=aborted，无崩溃无污染 |
+| 单请求回归 | on（argmax）与 off 文本一致、token 数 = max_tokens | **通过**：on==off 文本相同；completion_tokens = 48 == max_tokens；c1 ttft_p50 = **68 ms**（0 errors）|
+
+- 真机验收时发现并修复两个阻断 bug（详见下述）。另注意：c4/c1 跑偏出的
+  httpcore "generator didn't stop after athrow()" 是 httpx 客户端关闭流时的
+  噪音（不影响数据；0 errors 判定以 CSV error 列为准）。
+- 引擎侧已知 transient（S2-B+ 记录）：整包跑中 B=20 perf 循环出现过一次单 step
+  报错（复跑 4 次未再现、消息被截断丢失）——验收遇瞬时错误先复跑确认，勿直接
+  归因调度器。`batch_decode_step` 为同步阻塞调用（返回前 stream 已同步，无
+  in-flight 状态）；`REINFER_BATCH_PROF=1` 可打印每步 qkv/attn/rest/lm 分解
+  （约 +5% 墙钟）。
+
+#### 验收修复 1：sched_kv_pages 页口径混乱（serve 永不启动）
+
+预算公式误把 **跨层页字节**（`KvGeometry::page_bytes_f16`，28 层一块 = 3.67 MB）
+与 **per-layer 页数**（`n_layer × pp` = 3584）相乘为 misc（虚高 28 倍 = 13.15 GB），
+导致 `kv_capacity = 0.9×25.1 GB − 权重 1.52 − 13.15 = 1.99 GB` → 预算 **2169 页 <
+窗 3584 页**，serve 启动即拒绝（"reduce --max-model-len or free device memory"）。
+修复：serve.rs `sched_kv_pages` 显式双口径换算——预算/判据走跨层块（pp 块/窗），
+misc = 引擎 singleton 池真实字节（`n_layer × pp × 单层页字节` = pp × page_bytes_f16
+= 470 MB），返回值 ×`n_layer` 换算为 executor 的 per-layer 页（预算 5625 块 →
+157,500 per-layer 页 ≈ 20.6 GB 池，与 0.9 显存预算精确闭环）。budget.rs 公式与
+vLLM 语义测试未动。
+
+#### 验收修复 2：SchedHandle::spawn 握手死锁（健康检查永不就绪）
+
+spawn 闭包在 **run()（无限事件循环）结束后**才 `done_tx.send`，主线程
+`done_rx.recv()` 永久阻塞 → listen 永不发生（进程存活、GPU 满、/healthz 无响应）。
+修复：init 成功即发 done（run 后无需再信令，Drop 走 Shutdown+join）。此路径在
+mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触发。
+
+- 引擎侧已知 transient（S2-B+ 记录）：整包跑中 B=20 perf 循环出现过一次单 step
+  报错（复跑 4 次未再现、消息被截断丢失）——验收遇瞬时错误先复跑确认，勿直接
+  归因调度器。`batch_decode_step` 为同步阻塞调用（返回前 stream 已同步，无
+  in-flight 状态）；`REINFER_BATCH_PROF=1` 可打印每步 qkv/attn/rest/lm 分解
+  （约 +5% 墙钟）。
+
+### 瓶颈与局限（V1，均在模块文档登记）
+
+- prefill 串行（每步一个 chunk）；全窗准入下 chunked 惰性（每请求都放得下，
+  D7 受害者不触发）——代码路径已接线并用 mock 测试，真机只在超长 prompt 见。
+- 采样走每请求 CPU 链（host logits readback 在解码路径上）；GPU 链为后波。
+- 帧通道 256 有界 + blocking_send：慢消费者会阻塞整个循环；断连（drop）即
+  abort（已测）。stop 字符串是 token 模式，serve 层暂传空（OpenAI 文本 stop
+  编码为后波）。
+- 锚段使每个 B≥2 批多 1 行 logits（固定幻影请求）——B 大时可忽略。

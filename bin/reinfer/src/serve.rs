@@ -58,6 +58,7 @@ mod backend {
     use super::*;
     use crate::Verbosity;
     use crate::pipeline::{GenParams, generate_stream};
+    use crate::sched_loop::{SchedFrame, SubmitRequest};
     use axum::response::sse::{Event as SseEvent, KeepAlive};
     use axum::{
         Router,
@@ -69,7 +70,7 @@ mod backend {
     use reinfer_tokenizer::Tokenizer;
     use std::{
         net::SocketAddr,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
@@ -77,8 +78,13 @@ mod backend {
     };
     use tokio_stream::StreamExt as _;
     struct AppState {
-        engine: Mutex<reinfer_cuda::engine::Engine>,
-        tokenizer: Tokenizer,
+        /// Serial-path engine (REINFER_SCHEDULER=off); None on the
+        /// scheduler path (the loop thread owns the device).
+        engine: Option<Mutex<reinfer_cuda::engine::Engine>>,
+        /// S2-D scheduler loop handle (REINFER_SCHEDULER=on); None on the
+        /// serial path.
+        sched: Option<Arc<crate::sched_loop::SchedHandle>>,
+        tokenizer: Arc<Tokenizer>,
         eos: Option<u32>,
         model_id: String,
         max_len: usize,
@@ -88,7 +94,11 @@ mod backend {
 
     /// 同步入口（main 调）：服务阻断运行。
     pub fn run_sync(args: ServeArgs, vlog: &Verbosity) -> i32 {
-        if args.max_num_seqs != 1 {
+        // S2-D: REINFER_SCHEDULER=on routes requests through the scheduler
+        // loop, which owns the device — max-num-seqs > 1 becomes meaningful
+        // (admission caps concurrency). The serial path stays max-num-seqs=1.
+        let sched_on = crate::sched_loop::scheduler_env_on();
+        if !sched_on && args.max_num_seqs != 1 {
             eprintln!(
                 "reinfer: serve: V1 仅支持 --max-num-seqs=1（串行），收到 {}",
                 args.max_num_seqs
@@ -150,36 +160,89 @@ mod backend {
                 return 2;
             }
         };
+        // Tokenizer 不可 Clone（S2-D 需跨线程 share）→ Arc（auto-deref，调用面不变）
+        let tokenizer = Arc::new(tokenizer);
 
-        // CUDA 引擎装载（服务开始前完成；单实例）
+        // CUDA 引擎装载（服务开始前完成；单实例）。S2-D：scheduler 开启时
+        // 设备由循环线程持有（context + engine + 共享 KV 池），主线程不碰。
         use reinfer_core::DeviceId;
-        use reinfer_cuda::{CudaContext, CudaStream};
         let dev_idx = args.device.unwrap_or(0);
-        let ctx = match CudaContext::init(DeviceId::new(dev_idx)) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("reinfer: serve: cuda init (device {dev_idx}): {e}");
-                return 2;
+        let (engine_slot, sched_slot) = if sched_on {
+            // S2-D: derive the shared KV pool budget, then spawn the loop —
+            // the init closure runs CudaContext::init + engine load + pool
+            // alloc (incl. the anchor window) on the loop thread, blocking,
+            // so any init failure surfaces here before we listen.
+            let kv_pages = match sched_kv_pages(&dir, &cfg, max_len, dev_idx) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("reinfer: serve: scheduler KV budget: {e}");
+                    return 2;
+                }
+            };
+            let sched_cfg = crate::sched_loop::SchedLoopConfig {
+                base_seed: crate::sched_loop::base_seed_env(),
+                vocab: cfg.vocab_size,
+                dev: dev_idx,
+                n_layer: cfg.n_layer,
+                block_len: crate::sched_loop::BLOCK_LEN,
+                max_model_len: max_len,
+                kv_pages,
+                max_num_seqs: args.max_num_seqs,
+                chunk_size: max_len, // V1: single-chunk prefill per request
+                max_steps: 0,
+                detok: {
+                    let tok = Arc::clone(&tokenizer);
+                    Arc::new(move |ids: &[u32]| tok.decode_all(ids))
+                },
+            };
+            let window = sched_cfg.window_pages();
+            let admit_cap = sched_cfg.admit_cap();
+            let dir_c = dir.clone();
+            let handle = match crate::sched_loop::SchedHandle::spawn(move || {
+                crate::sched_loop::CudaBatchExecutor::load(dev_idx, &dir_c, max_len, kv_pages)
+                    .map(|exec| (exec, sched_cfg))
+            }) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("reinfer: serve: scheduler spawn: {e}");
+                    return 2;
+                }
+            };
+            if vlog.at(1) {
+                eprintln!(
+                    "reinfer: serve: scheduler on (REINFER_SCHEDULER): kv_pages={kv_pages}, window={window}, admit_cap={admit_cap}"
+                );
             }
-        };
-        let _stream = CudaStream::new(ctx.device_id()).expect("stream");
-        let arch = reinfer_cuda::arch::resolve_arch().expect("arch");
-        let engine = match reinfer_cuda::engine::Engine::load(
-            ctx.device_id().clone(),
-            &arch,
-            Some(std::env::temp_dir().join("reinfer-jit-dense")),
-            &dir,
-            max_len,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("reinfer: serve: engine load: {e}");
-                return 2;
+            (None, Some(Arc::new(handle)))
+        } else {
+            use reinfer_cuda::{CudaContext, CudaStream};
+            let ctx = match CudaContext::init(DeviceId::new(dev_idx)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("reinfer: serve: cuda init (device {dev_idx}): {e}");
+                    return 2;
+                }
+            };
+            let _stream = CudaStream::new(ctx.device_id()).expect("stream");
+            let arch = reinfer_cuda::arch::resolve_arch().expect("arch");
+            let engine = match reinfer_cuda::engine::Engine::load(
+                ctx.device_id().clone(),
+                &arch,
+                Some(std::env::temp_dir().join("reinfer-jit-dense")),
+                &dir,
+                max_len,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("reinfer: serve: engine load: {e}");
+                    return 2;
+                }
+            };
+            if vlog.at(1) {
+                eprintln!("reinfer: serve: engine loaded (arch={arch}, ctx={max_len})");
             }
+            (Some(Mutex::new(engine)), None)
         };
-        if vlog.at(1) {
-            eprintln!("reinfer: serve: engine loaded (arch={arch}, ctx={max_len})");
-        }
         let model_id = args.served_model_name.clone().unwrap_or_else(|| args.model.clone());
         let api_key = args.api_key.clone();
 
@@ -194,7 +257,8 @@ mod backend {
         }
 
         let state = Arc::new(AppState {
-            engine: Mutex::new(engine),
+            engine: engine_slot,
+            sched: sched_slot,
             tokenizer,
             eos,
             max_len,
@@ -299,6 +363,72 @@ mod backend {
         }
     }
 
+    /// S2-D：调度器共享 KV 池预算。镜像 vLLM gpu_memory_utilization=0.9：
+    /// 设备显存 − 权重 − 引擎 singleton 池（Engine::load 恒分配一整窗的
+    /// per-layer KV 页），按 90% 利用率建池；不足一个窗口即拒绝启动。
+    ///
+    /// ## 页口径换算（2026-09-01 修复）
+    ///
+    /// `kv_budget_pages` 是 vLLM 口径：页 = 一个 block_len 块、**跨所有层**
+    /// （`page_bytes_f16`），窗口 = `ceil(max_len/block_len)` 块。而
+    /// `CudaBatchExecutor`/`KvStore`/`KvSegmentPool` 用引擎口径：页 =
+    /// **单层**一 block（页表 `li*pp + j`），窗口 = `n_layer × pp` 页。
+    /// 此前两者混用（misc 虚高 28×、判据无量纲、返回值少 28×）→ 预算
+    /// 2169 < 窗 3584 假报错。此处显式换算：blocks（预算）↔ per-layer
+    /// pages（executor），数值由几何恒等 `pp × page_bytes_f16 ==
+    /// n_layer×pp × per-layer-page-bytes` 保证一致。
+    fn sched_kv_pages(
+        dir: &Path,
+        cfg: &reinfer_arch::llama::LlamaConfig,
+        max_len: usize,
+        dev_idx: u32,
+    ) -> Result<usize, String> {
+        use reinfer_memory::budget::{KvBudgetInput, KvGeometry, kv_budget_pages};
+        let info = reinfer_cuda::CudaContext::device_info(dev_idx)
+            .map_err(|e| format!("device info (dev {dev_idx}): {e}"))?;
+        let geom = KvGeometry {
+            n_layer: cfg.n_layer,
+            kv_heads: cfg.kv_heads,
+            head_dim: cfg.head_dim,
+            block_len: crate::sched_loop::BLOCK_LEN,
+        };
+        let pp = max_len.div_ceil(geom.block_len); // blocks per window (跨层口径)
+        // 引擎 singleton 池（Engine::load 恒分配 n_layer×pp per-layer 页）的
+        // 字节占用 = pp × page_bytes_f16（两者几何恒等，见上文）。
+        let misc_bytes = geom.n_layer as u64
+            * pp as u64
+            * (geom.block_len * geom.kv_heads * geom.head_dim * 2 * 2) as u64; // per-layer 页 × 单层页字节（K+V）
+        let input = KvBudgetInput {
+            mem_total_bytes: info.total_mem,
+            weights_bytes: dir_bytes(dir),
+            graph_pool_bytes: 0, // graph pool grows lazily; utilization headroom covers it
+            misc_bytes,
+            utilization: 0.9,
+        };
+        let pages_blocks = kv_budget_pages(&input, &geom) as usize;
+        if pages_blocks < pp {
+            return Err(format!(
+                "KV budget {pages_blocks} blocks < one window ({pp}) — reduce --max-model-len or free device memory"
+            ));
+        }
+        // 换算为 executor per-layer 页数（KvStore/KvSegmentPool/锚段口径）。
+        Ok(pages_blocks * geom.n_layer)
+    }
+
+    /// 模型目录文件总字节（权重在设备侧的占用）。
+    fn dir_bytes(dir: &Path) -> u64 {
+        let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+        rd.flatten()
+            .map(|e| {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    dir_bytes(&e.path())
+                } else {
+                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
     // ---------------- handlers ----------------
 
     async fn healthz() -> axum::Json<serde_json::Value> {
@@ -333,139 +463,28 @@ mod backend {
     }
 
     /// 统一完成端（chat=true：messages → chat 模板渲染；否则 prompt 文本直编码）。
+    /// S2-D：REINFER_SCHEDULER=on 时交调度器循环（sched_completion），否则走
+    /// 原串行单请求路径（max-num-seqs=1，行为不变）。
     async fn completion_impl(st: Arc<AppState>, body: serde_json::Value, chat: bool) -> Response {
-        // ---- prompt 构造与 encode（模板渲染在阻塞前完成） ----
-        let (prompt_text, parse_special) = if chat {
-            let messages = match body.get("messages").and_then(|m| m.as_array()) {
-                Some(a) if !a.is_empty() => a,
-                _ => {
-                    return openai_err(
-                        StatusCode::BAD_REQUEST,
-                        "must provide non-empty `messages`",
-                        "invalid_request_error",
-                        "messages",
-                        "",
-                    )
-                    .into_response();
-                }
-            };
-            let prompt = match crate::pipeline::render_chat_template(&st.model_dir, messages) {
-                Ok(Some(text)) => text,
-                Ok(None) => messages
-                    .last()
-                    .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                    .unwrap_or("")
-                    .to_string(),
-                Err(e) => {
-                    eprintln!(
-                        "reinfer: serve: chat template render failed ({e}); using raw content"
-                    );
-                    messages
-                        .last()
-                        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-                        .unwrap_or("")
-                        .to_string()
-                }
-            };
-            (prompt, true)
-        } else {
-            match body.get("prompt").and_then(|p| p.as_str()) {
-                Some(p) => (p.to_string(), false),
-                None => {
-                    return openai_err(
-                        StatusCode::BAD_REQUEST,
-                        "must provide `prompt`",
-                        "invalid_request_error",
-                        "prompt",
-                        "",
-                    )
-                    .into_response();
-                }
-            }
+        if st.sched.is_some() {
+            return sched_completion(&st, body, chat).await;
+        }
+        let parsed = match parse_completion(&st, body, chat) {
+            Ok(p) => p,
+            Err(r) => return r,
         };
-
-        let ids = match st.tokenizer.encode(&prompt_text, parse_special) {
-            Ok(v) => v,
-            Err(e) => {
-                return openai_err(
-                    StatusCode::BAD_REQUEST,
-                    &format!("encode: {e}"),
-                    "invalid_request_error",
-                    "prompt",
-                    "",
-                )
-                .into_response();
-            }
-        };
-
-        // ---- 采样参数（OpenAI 请求体面；缺省 = OpenAI 工程表） ----
-        let f = |k: &str| body.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
-        let i = |k: &str| body.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
-        let params = GenParams {
-            temperature: f("temperature").unwrap_or(1.0),
-            top_p: f("top_p").filter(|p| *p != 1.0),
-            top_k: i("top_k"),
-            repeat_penalty: None, // OpenAI 无该参数；服务缺省 1.0（不惩罚）
-            seed: body.get("seed").and_then(|v| v.as_u64()),
-        };
-        let max_tokens = i("max_tokens").unwrap_or(256) as u32;
-        if max_tokens == 0 {
-            return openai_err(
-                StatusCode::BAD_REQUEST,
-                "max_tokens must be > 0",
-                "invalid_request_error",
-                "max_tokens",
-                "",
-            )
-            .into_response();
-        }
-        if params.temperature < 0.0 || params.temperature > 2.0 {
-            return openai_err(
-                StatusCode::BAD_REQUEST,
-                "temperature must be in [0, 2]",
-                "invalid_request_error",
-                "temperature",
-                "",
-            )
-            .into_response();
-        }
-        if let Some(p) = params.top_p
-            && (p < 0.0 || p > 1.0)
-        {
-            return openai_err(
-                StatusCode::BAD_REQUEST,
-                "top_p must be in [0, 1]",
-                "invalid_request_error",
-                "top_p",
-                "",
-            )
-            .into_response();
-        }
-        if ids.len() + max_tokens as usize > st.max_len {
-            return openai_err(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "maximum context length exceeded: prompt_tokens={} + max_tokens={} > ctx={}",
-                    ids.len(),
-                    max_tokens,
-                    st.max_len
-                ),
-                "invalid_request_error",
-                "context_length",
-                "context_length_exceeded",
-            )
-            .into_response();
-        }
-        // logprobs 面（OpenAI 语义）：logprobs=true → 每 token 主 logp；top_logprobs → top-k
-        let want_logprobs = body.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false);
-        let top_logprobs = i("top_logprobs").unwrap_or(0).min(5);
-        let lp_top_n = if want_logprobs { top_logprobs.max(1) } else { 0 };
-        let want_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        let CompletionReq {
+            ids,
+            params,
+            max_tokens,
+            lp_top_n,
+            want_stream,
+            id,
+            model,
+            prompt_tokens,
+        } = parsed;
         let eos_id = st.eos;
-
-        let id = completion_id(&st);
-        let model = st.model_id.clone();
-        let prompt_tokens = ids.len();
+        let want_logprobs = lp_top_n > 0;
 
         if want_stream {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -476,9 +495,14 @@ mod backend {
             let params_c = params.clone();
             let stream_obj = if chat { "chat.completion.chunk" } else { "text_completion.chunk" };
             let stream_obj_c = stream_obj.to_string();
-            let lp_off = if want_logprobs { lp_top_n } else { 0 };
+            let lp_off = lp_top_n;
             let _ = tokio::task::spawn_blocking(move || {
-                let mut engine = st2.engine.lock().unwrap();
+                let mut engine = st2
+                    .engine
+                    .as_ref()
+                    .expect("serial engine (REINFER_SCHEDULER off)")
+                    .lock()
+                    .unwrap();
                 let stat = generate_stream(
                     &mut engine,
                     &st2.tokenizer,
@@ -558,7 +582,8 @@ mod backend {
         let ids_c = ids.clone();
         let params_c = params.clone();
         let task = tokio::task::spawn_blocking(move || {
-            let mut engine = st2.engine.lock().unwrap();
+            let mut engine =
+                st2.engine.as_ref().expect("serial engine (REINFER_SCHEDULER off)").lock().unwrap();
             let mut det: Vec<crate::pipeline::TokenOut> = Vec::new();
             let stat = generate_stream(
                 &mut engine,
@@ -631,6 +656,334 @@ mod backend {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": stat.tokens,
                 "total_tokens": prompt_tokens + stat.tokens,
+            },
+        });
+        axum::Json(payload).into_response()
+    }
+
+    /// 请求体 → 生成请求（serial 与 scheduler 路径共用解析；错误即 OpenAI 面）。
+    fn parse_completion(
+        st: &AppState,
+        body: serde_json::Value,
+        chat: bool,
+    ) -> Result<CompletionReq, Response> {
+        // ---- prompt 构造与 encode（模板渲染在阻塞前完成） ----
+        let (prompt_text, parse_special) = if chat {
+            let messages = match body.get("messages").and_then(|m| m.as_array()) {
+                Some(a) if !a.is_empty() => a,
+                _ => {
+                    return Err(openai_err(
+                        StatusCode::BAD_REQUEST,
+                        "must provide non-empty `messages`",
+                        "invalid_request_error",
+                        "messages",
+                        "",
+                    ));
+                }
+            };
+            let prompt = match crate::pipeline::render_chat_template(&st.model_dir, messages) {
+                Ok(Some(text)) => text,
+                Ok(None) => messages
+                    .last()
+                    .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                    .unwrap_or("")
+                    .to_string(),
+                Err(e) => {
+                    eprintln!(
+                        "reinfer: serve: chat template render failed ({e}); using raw content"
+                    );
+                    messages
+                        .last()
+                        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                        .unwrap_or("")
+                        .to_string()
+                }
+            };
+            (prompt, true)
+        } else {
+            match body.get("prompt").and_then(|p| p.as_str()) {
+                Some(p) => (p.to_string(), false),
+                None => {
+                    return Err(openai_err(
+                        StatusCode::BAD_REQUEST,
+                        "must provide `prompt`",
+                        "invalid_request_error",
+                        "prompt",
+                        "",
+                    ));
+                }
+            }
+        };
+
+        let ids = match st.tokenizer.encode(&prompt_text, parse_special) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(openai_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("encode: {e}"),
+                    "invalid_request_error",
+                    "prompt",
+                    "",
+                ));
+            }
+        };
+
+        // ---- 采样参数（OpenAI 请求体面；缺省 = OpenAI 工程表） ----
+        let f = |k: &str| body.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+        let i = |k: &str| body.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let params = GenParams {
+            temperature: f("temperature").unwrap_or(1.0),
+            top_p: f("top_p").filter(|p| *p != 1.0),
+            top_k: i("top_k"),
+            repeat_penalty: None, // OpenAI 无该参数；服务缺省 1.0（不惩罚）
+            seed: body.get("seed").and_then(|v| v.as_u64()),
+        };
+        let max_tokens = i("max_tokens").unwrap_or(256) as u32;
+        if max_tokens == 0 {
+            return Err(openai_err(
+                StatusCode::BAD_REQUEST,
+                "max_tokens must be > 0",
+                "invalid_request_error",
+                "max_tokens",
+                "",
+            ));
+        }
+        if params.temperature < 0.0 || params.temperature > 2.0 {
+            return Err(openai_err(
+                StatusCode::BAD_REQUEST,
+                "temperature must be in [0, 2]",
+                "invalid_request_error",
+                "temperature",
+                "",
+            ));
+        }
+        if let Some(p) = params.top_p
+            && (p < 0.0 || p > 1.0)
+        {
+            return Err(openai_err(
+                StatusCode::BAD_REQUEST,
+                "top_p must be in [0, 1]",
+                "invalid_request_error",
+                "top_p",
+                "",
+            ));
+        }
+        if ids.len() + max_tokens as usize > st.max_len {
+            return Err(openai_err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "maximum context length exceeded: prompt_tokens={} + max_tokens={} > ctx={}",
+                    ids.len(),
+                    max_tokens,
+                    st.max_len
+                ),
+                "invalid_request_error",
+                "context_length",
+                "context_length_exceeded",
+            ));
+        }
+        // logprobs 面（OpenAI 语义）：logprobs=true → 每 token 主 logp；top_logprobs → top-k
+        let want_logprobs = body.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false);
+        let top_logprobs = i("top_logprobs").unwrap_or(0).min(5);
+        let lp_top_n = if want_logprobs { top_logprobs.max(1) } else { 0 };
+        let want_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let id = completion_id(st);
+        let model = st.model_id.clone();
+        let prompt_tokens = ids.len();
+
+        Ok(CompletionReq {
+            ids,
+            params,
+            max_tokens,
+            lp_top_n,
+            want_stream,
+            id,
+            model,
+            prompt_tokens,
+        })
+    }
+
+    /// 解析后的完成请求（serial 与 scheduler 共用面）。
+    struct CompletionReq {
+        ids: Vec<u32>,
+        params: GenParams,
+        max_tokens: u32,
+        lp_top_n: usize,
+        want_stream: bool,
+        id: String,
+        model: String,
+        prompt_tokens: usize,
+    }
+
+    /// S2-D：scheduler 路径（REINFER_SCHEDULER=on）。submit 到调度循环，帧经
+    /// 有界 channel（256）回流 → SSE（流式）或聚合（非流式）。断连（客户端
+    /// drop receiver）→ 循环侧 blocking_send 失败 → 仅 abort 该请求——无需
+    /// 额外 disconnect watcher；共享池与其它请求互不污染。
+    async fn sched_completion(st: &AppState, body: serde_json::Value, chat: bool) -> Response {
+        let parsed = match parse_completion(st, body, chat) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
+        let handle = match st.sched.as_ref() {
+            Some(h) => Arc::clone(h),
+            None => {
+                return openai_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "scheduler not enabled",
+                    "server_error",
+                    "",
+                    "scheduler_off",
+                )
+                .into_response();
+            }
+        };
+        let token = st.id_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SchedFrame>(256);
+        if let Err(e) = handle.submit(SubmitRequest {
+            ids: parsed.ids,
+            params: parsed.params,
+            eos: st.eos,
+            max_tokens: parsed.max_tokens as usize,
+            stop: vec![], // stop 字符串暂不编码（与串行路径一致；记录，后续面）
+            logprobs_top_n: parsed.lp_top_n,
+            token,
+            tx,
+        }) {
+            return openai_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e,
+                "server_error",
+                "",
+                "generation_failed",
+            )
+            .into_response();
+        }
+        let object = if chat { "chat.completion" } else { "text_completion" };
+        let stream_obj = if chat { "chat.completion.chunk" } else { "text_completion.chunk" };
+        let prompt_tokens = parsed.prompt_tokens;
+        let lp_off = parsed.lp_top_n;
+        if parsed.want_stream {
+            let id = parsed.id;
+            let model = parsed.model;
+            let is_chat = chat;
+            let tok = Arc::clone(&st.tokenizer);
+            let frames = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |frame| {
+                let data = match frame {
+                    SchedFrame::Token { delta, out } => {
+                        let mut choice = if is_chat {
+                            serde_json::json!({ "index": 0, "delta": { "content": delta }, "finish_reason": None::<String> })
+                        } else {
+                            serde_json::json!({ "index": 0, "text": delta, "finish_reason": None::<String> })
+                        };
+                        if lp_off > 0
+                            && let Some(o) = out
+                        {
+                            let lp_val = serde_json::json!({ "content": [lp_json(&o, lp_off, &tok)] });
+                            let ch = choice.as_object_mut().unwrap();
+                            if is_chat {
+                                ch["delta"]["logprobs"] = lp_val;
+                            } else {
+                                ch["logprobs"] = lp_val;
+                            }
+                        }
+                        serde_json::json!({
+                            "id": id,
+                            "object": stream_obj,
+                            "model": model,
+                            "choices": [choice],
+                        })
+                        .to_string()
+                    }
+                    SchedFrame::Done { stopped_by_eos, tokens, prompt_tokens: pt } => {
+                        serde_json::json!({
+                            "id": id,
+                            "object": stream_obj,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                if is_chat { "delta" } else { "text" }: {},
+                                "finish_reason": if stopped_by_eos { "stop" } else { "length" },
+                            }],
+                            "usage": {
+                                "prompt_tokens": pt,
+                                "completion_tokens": tokens,
+                                "total_tokens": pt + tokens,
+                            },
+                        })
+                        .to_string()
+                    }
+                    SchedFrame::Error { message } => serde_json::json!({
+                        "error": { "message": message, "type": "server_error", "param": "", "code": "generation_failed" },
+                    })
+                    .to_string(),
+                };
+                Ok::<_, std::convert::Infallible>(SseEvent::default().data(data))
+            });
+            // 循环在 Done/Error 帧后必 drop sender（终止即清场）→ 通道 EOF 后再补
+            // "[DONE]"（与串行路径的 finish + [DONE] 顺序一致）。
+            let stream = frames.chain(tokio_stream::once(Ok::<_, std::convert::Infallible>(
+                SseEvent::default().data("[DONE]"),
+            )));
+            return Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        }
+
+        // stream=false：聚合帧（Token→文本；Done→usage/终止；Error→500）。
+        let mut text = String::new();
+        let mut det: Vec<crate::pipeline::TokenOut> = Vec::new();
+        let mut finish: Option<(bool, usize)> = None;
+        let mut err: Option<String> = None;
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                SchedFrame::Token { delta, out } => {
+                    text.push_str(&delta);
+                    if let Some(o) = out {
+                        det.push(o);
+                    }
+                }
+                SchedFrame::Done { stopped_by_eos, tokens, .. } => {
+                    finish = Some((stopped_by_eos, tokens));
+                    break;
+                }
+                SchedFrame::Error { message } => {
+                    err = Some(message);
+                    break;
+                }
+            }
+        }
+        if let Some(message) = err {
+            return openai_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &message,
+                "server_error",
+                "",
+                "generation_failed",
+            )
+            .into_response();
+        }
+        let (stopped_by_eos, completion_tokens) = finish.unwrap_or((false, 0));
+        let mut choice = if chat {
+            serde_json::json!({ "index": 0, "message": { "role": "assistant", "content": text },
+            "finish_reason": if stopped_by_eos { "stop" } else { "length" } })
+        } else {
+            serde_json::json!({ "index": 0, "text": text,
+            "finish_reason": if stopped_by_eos { "stop" } else { "length" } })
+        };
+        if lp_off > 0 {
+            choice["logprobs"] = serde_json::json!({
+                "content": det.iter().map(|o| lp_json(o, lp_off, &st.tokenizer)).collect::<Vec<_>>()
+            });
+        }
+        let payload = serde_json::json!({
+            "id": parsed.id,
+            "object": object,
+            "created": now_unix(),
+            "model": parsed.model,
+            "choices": [choice],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         });
         axum::Json(payload).into_response()

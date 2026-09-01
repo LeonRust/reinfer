@@ -11,7 +11,8 @@ use reinfer_kernels::{CpuSamplerChain, RngState, SamplerChain, SamplerParams, se
 use reinfer_tokenizer::Tokenizer;
 
 /// 由已采样 logits 计算 TokenOut（log-softmax 归一；top 默认 5）。
-fn token_out(logits: &[f32], token: u32, top_n: usize) -> TokenOut {
+/// pub(crate)：S2-D 调度器循环（sched_loop）复用。
+pub(crate) fn token_out(logits: &[f32], token: u32, top_n: usize) -> TokenOut {
     let mut maxv = f32::NEG_INFINITY;
     for &v in logits {
         if v > maxv {

@@ -2,6 +2,10 @@
 //! split sequences they replace (real machine), plus the engine A/B
 //! (REINFER_FUSED on vs off).
 //!
+//! S1-10: the per-layer persistent kernel (decode_layer_fused_kernels.cu,
+//! stages 0..8 in ONE launch) — kernel-level bit-exact diff vs the split
+//! sequence and the engine A/B (REINFER_LAYER_FUSED on vs off).
+//!
 //! Gates:
 //!   1. fused_layer_bit_exact_vs_split — one full layer through the fused
 //!      sequence (p1 multi + p2_qkv + the fused flash [kv write +
@@ -15,12 +19,23 @@
 //!      The fused partials must match the single-plan
 //!      `gemv_m1_f16f32` outputs exactly — that is the p1_multi
 //!      contract (the p1_o phase-1 included).
-//!   2. fused_determinism_double_run — two fused layer runs from
-//!      identical inputs are bit-identical (no atomics / no nondeterminism).
-//!   3. fused_engine_ab_bitwise — engine-level: REINFER_FUSED=on vs off,
-//!      16 + 128 greedy decode tokens: per-step logits bit-identical,
-//!      identical greedy text; the fused engine is deterministic across
-//!      two separate loads (bit-level).
+//!   2. layer_fused_bit_exact_vs_split — the same reference: the S1-10
+//!      persistent kernel (one launch: stage 0 gather + rms0 [li==0,
+//!      embed row 0 = the x input row, identity gather] + stages 1..8)
+//!      vs the split sequence on a fresh bufs pair: every output and
+//!      every phase-1 partials segment bit-identical. The stage-8 norm
+//!      output exercises the same rms code path as the stage-5 output
+//!      (xn is one buffer in the engine, so the intermediate ffn-normed
+//!      value is transient — the engine A/B gate covers the wiring).
+//!   3. fused_determinism_double_run + layer_fused_determinism_double_run
+//!      — two fused / layer-fused runs from identical inputs are
+//!      bit-identical (no atomics / no nondeterminism).
+//!   4. fused_engine_ab_bitwise + layer_fused_engine_ab_bitwise —
+//!      engine-level: REINFER_FUSED on vs off and REINFER_LAYER_FUSED on
+//!      vs off (both with REINFER_FUSED=on): 16 + 128 greedy decode
+//!      tokens: per-step logits bit-identical, identical greedy text;
+//!      the fused / layer-fused engine is deterministic across two
+//!      separate loads (bit-level).
 //!
 //! Run (real machine; nvcc 13.2 — the sm_120a JIT rule):
 //! ```text
@@ -40,9 +55,10 @@ mod gpu {
     use reinfer_cuda::decode::DecodeKernels;
     use reinfer_cuda::diff::DiffKernels;
     use reinfer_cuda::engine::{DecodeGemmPlans, DenseKernels, Engine, LayerGemmPlans};
-    use reinfer_cuda::fused::FusedDecodeKernels;
+    use reinfer_cuda::fused::{FusedDecodeKernels, FusedGeom};
     use reinfer_cuda::gemm::{GemmPlan, Jgemm};
     use reinfer_cuda::jit::{CtxGuard, JLib, KernelFn, launch_rows};
+    use reinfer_cuda::layer_fused::{LayerFusedKernels, LayerFusedSpec};
     use reinfer_cuda::{CudaContext, CudaEvent, CudaStream};
     use reinfer_jit::compile::{compile_cubin, gencode_flags};
     use reinfer_jit::{JitCache, JitKey, KernelSource, probe_toolchain_for_arch};
@@ -206,8 +222,13 @@ mod gpu {
     struct LayerBufs {
         xn: DeviceBuffer,   // the q/k/v/gate/up projection input (layer input)
         attn: DeviceBuffer, // the o-projection input (engine: attention output)
-        x_s: DeviceBuffer,  // split residual stream
-        x_f: DeviceBuffer,  // fused residual stream
+        // Embed table row 0 = the x input row: the S1-10 stage-0 gather
+        // (li==0, token 0) copies it over x — an identity copy, so the
+        // layer kernel's stage 0 runs without disturbing the residual
+        // stream input.
+        embed: DeviceBuffer,
+        x_s: DeviceBuffer, // split residual stream
+        x_f: DeviceBuffer, // fused residual stream
         xn_ffn_s: DeviceBuffer,
         xn_ffn_f: DeviceBuffer,
         xn_attn_s: DeviceBuffer,
@@ -240,9 +261,15 @@ mod gpu {
         v16_f: DeviceBuffer,
         // kv caches (identical random pre-fill; the flash kernels write
         // the current step's slot) + the per-step kv_len/page-table
-        // buffers; attn_f is the fused flash's attention output.
+        // buffers; attn_f is the fused flash's attention output. kv_f is
+        // TWO pages (both prefilled with the SAME random page) so the
+        // layer kernel's li=1 run reads/writes the second page — the
+        // engine's per-layer kv region.
         kv_s: DeviceBuffer,
         kv_f: DeviceBuffer,
+        // Two-page identity page table ([0, 1]): the li=1 layer kernel
+        // reads pages[li] = 1 as its base page.
+        pages2: DeviceBuffer,
         lens: DeviceBuffer,
         pages: DeviceBuffer,
         attn_f: DeviceBuffer,
@@ -284,7 +311,11 @@ mod gpu {
         let attn_norm = r16(H, &mut seed);
         // Random kv-cache pre-fill (identical on both paths; the flash
         // kernels overwrite slot KV_LEN - 1 with the current step's k/v).
+        // kv_f holds TWO identical pages: the li=1 layer-kernel run reads
+        // page 1 with the same pre-fill the split reference reads on
+        // page 0.
         let kv_fill = r16(BLOCK_LEN * KVK * 2, &mut seed);
+        let kv_fill2 = [&kv_fill[..], &kv_fill[..]].concat();
         // The fused and split paths need separate input copies: the
         // residual stream x is mutated in place by both paths.
         let d_xn = upl(dev, &bytes_u16(&xn));
@@ -301,6 +332,7 @@ mod gpu {
         LayerBufs {
             xn: d_xn,
             attn: d_attn,
+            embed: upl(dev, &bytes_u16(&x)),
             x_s: d_x_s,
             x_f: d_x_f,
             xn_ffn_s: a16(H),
@@ -334,9 +366,10 @@ mod gpu {
             k16_f: a16(KVK),
             v16_f: a16(KVK),
             kv_s: upl(dev, &bytes_u16(&kv_fill)),
-            kv_f: upl(dev, &bytes_u16(&kv_fill)),
+            kv_f: upl(dev, &bytes_u16(&kv_fill2)),
             lens: upl(dev, &(KV_LEN as u32).to_le_bytes()),
             pages: upl(dev, &0u32.to_le_bytes()),
+            pages2: upl(dev, &[0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()),
             attn_f: a16(NQK),
             p_q: part(NQK, H),
             p_k: part(KVK, H),
@@ -353,11 +386,9 @@ mod gpu {
     fn fabricate_plans(b: &LayerBufs) -> DecodeGemmPlans {
         let a16p = |buf: &DeviceBuffer| buf.as_ptr() as *const u16;
         let c32p = |buf: &DeviceBuffer| buf.as_ptr() as *mut f32;
-        let plan = |a: &DeviceBuffer,
-                    b: &DeviceBuffer,
-                    c: &DeviceBuffer,
-                    n: usize,
-                    k: usize| GemmPlan::row_major_f16(a16p(a), a16p(b), c32p(c), 1, n, k);
+        let plan = |a: &DeviceBuffer, b: &DeviceBuffer, c: &DeviceBuffer, n: usize, k: usize| {
+            GemmPlan::row_major_f16(a16p(a), a16p(b), c32p(c), 1, n, k)
+        };
         let q = plan(&b.xn, &b.q_w, &b.c_q, NQK, H);
         let k = plan(&b.xn, &b.k_w, &b.c_k, KVK, H);
         let v = plan(&b.xn, &b.v_w, &b.c_v, KVK, H);
@@ -371,6 +402,38 @@ mod gpu {
             // the real lm_head has nslabs = 1 by the same formula).
             lm_head: plan(&b.xn, &b.d_w, &b.c_d, 60000, H),
         }
+    }
+
+    /// Two-layer fabricated plans (identical shapes): the li=1 layer-
+    /// kernel run needs its own 7-row block at table + 7 and a two-layer
+    /// geometry (n_layers == 2 for the stage_ts slots). `b1` provides the
+    /// layer-0 rows (unused by the li=1 launch, needed for the geometry),
+    /// `b2` the layer-1 rows the kernel actually runs.
+    fn fabricate_plans2(b1: &LayerBufs, b2: &LayerBufs) -> DecodeGemmPlans {
+        let a16p = |buf: &DeviceBuffer| buf.as_ptr() as *const u16;
+        let c32p = |buf: &DeviceBuffer| buf.as_ptr() as *mut f32;
+        let plan = |a: &DeviceBuffer, b: &DeviceBuffer, c: &DeviceBuffer, n: usize, k: usize| {
+            GemmPlan::row_major_f16(a16p(a), a16p(b), c32p(c), 1, n, k)
+        };
+        let g1 = LayerGemmPlans {
+            q: plan(&b1.xn, &b1.q_w, &b1.c_q, NQK, H),
+            k: plan(&b1.xn, &b1.k_w, &b1.c_k, KVK, H),
+            v: plan(&b1.xn, &b1.v_w, &b1.c_v, KVK, H),
+            o: plan(&b1.attn, &b1.o_w, &b1.c_o, H, NQK),
+            gate: plan(&b1.xn, &b1.g_w, &b1.c_g, FFN, H),
+            up: plan(&b1.xn, &b1.u_w, &b1.c_u, FFN, H),
+            down: plan(&b1.down_f, &b1.d_w, &b1.c_d, H, FFN),
+        };
+        let g2 = LayerGemmPlans {
+            q: plan(&b2.xn, &b2.q_w, &b2.c_q, NQK, H),
+            k: plan(&b2.xn, &b2.k_w, &b2.c_k, KVK, H),
+            v: plan(&b2.xn, &b2.v_w, &b2.c_v, KVK, H),
+            o: plan(&b2.attn, &b2.o_w, &b2.c_o, H, NQK),
+            gate: plan(&b2.xn, &b2.g_w, &b2.c_g, FFN, H),
+            up: plan(&b2.xn, &b2.u_w, &b2.c_u, FFN, H),
+            down: plan(&b2.down_f, &b2.d_w, &b2.c_d, H, FFN),
+        };
+        DecodeGemmPlans { layers: vec![g1, g2], lm_head: plan(&b2.xn, &b2.d_w, &b2.c_d, 60000, H) }
     }
 
     /// Full fused layer run (the 8 fused launches, mirroring the engine's
@@ -391,13 +454,9 @@ mod gpu {
         // Plan table built over THIS buffer set — the table rows hold
         // device pointers into `b`, so a run on another bufs pair must
         // rebuild the table (the gate-2 determinism pair is separate).
-        fused
-            .build_plans(ctx.device_id(), jgemm, &fabricate_plans(b))
-            .unwrap();
+        fused.build_plans(ctx.device_id(), jgemm, &fabricate_plans(b)).unwrap();
         let g = fused.geom();
-        fused
-            .launch_p1(stream, g.tables, 3, g.grid_qkv[0])
-            .unwrap();
+        fused.launch_p1(stream, g.tables, 3, g.grid_qkv[0]).unwrap();
         fused
             .launch_p2_qkv(
                 stream,
@@ -436,15 +495,15 @@ mod gpu {
                 b.kv_f.as_ptr() as *const u16,
                 b.lens.as_ptr() as *const u32,
                 b.attn_f.as_ptr() as *mut u16,
-                1,                     // b
-                16,                    // qh
-                D as u32,              // d
-                BLOCK_LEN as u32,      // block_len
-                2,                     // kv_ratio
-                8,                     // kv_heads
-                BLOCK_LEN as u32,      // max_kv (one page)
-                1,                     // total_pages
-                1,                     // identity page table
+                1,                // b
+                16,               // qh
+                D as u32,         // d
+                BLOCK_LEN as u32, // block_len
+                2,                // kv_ratio
+                8,                // kv_heads
+                BLOCK_LEN as u32, // max_kv (one page)
+                1,                // total_pages
+                1,                // identity page table
                 b.k16_f.as_ptr() as *const u16,
                 b.v16_f.as_ptr() as *const u16,
             )
@@ -458,9 +517,7 @@ mod gpu {
         // b.attn == b.attn_f, so the o phase-1 reads input bits
         // identical to the engine's fused path, where the flash out IS
         // the o plan input).
-        fused
-            .launch_p1(stream, unsafe { g.tables.add(3) }, 1, g.grid_o[0])
-            .unwrap();
+        fused.launch_p1(stream, unsafe { g.tables.add(3) }, 1, g.grid_o[0]).unwrap();
         fused
             .launch_p2_add_rms(
                 stream,
@@ -475,15 +532,11 @@ mod gpu {
             .unwrap();
         // gate/up phase-1 — reads xn (p2_o's ffn-normed x), the split
         // path's read point
-        fused
-            .launch_p1(stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0])
-            .unwrap();
+        fused.launch_p1(stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0]).unwrap();
         // merged gate/up phase-2 + cast-SiLU-GLU + down phase-1 (rows g,
         // u, d at table.add(4)); writes down_f and the down partials,
         // block-local, identical arithmetic to the split p2_gu + p1_d.
-        fused
-            .launch_p2_gu_d(stream, unsafe { g.tables.add(4) }, g.grid_gu_p2)
-            .unwrap();
+        fused.launch_p2_gu_d(stream, unsafe { g.tables.add(4) }, g.grid_gu_p2).unwrap();
         fused
             .launch_p2_add_rms(
                 stream,
@@ -623,7 +676,7 @@ mod gpu {
                 b.k16.as_ptr() as *const u16,
                 b.v16.as_ptr() as *const u16,
                 b.kv_s.as_ptr() as *mut u16,
-                0, // phys (one page)
+                0,                   // phys (one page)
                 (KV_LEN - 1) as u32, // off
                 BLOCK_LEN as u32,
                 8, // kv_heads
@@ -701,6 +754,69 @@ mod gpu {
             .unwrap();
     }
 
+    /// One layer through the S1-10 persistent kernel: stages 0..8 in a
+    /// single launch over the plan table of the fused geometry `g` (must
+    /// be built over THIS bufs pair — the kernel reads the plan rows and
+    /// writes the shared partials segments). The kernel const addresses
+    /// `b`: x = b.x_f (the fresh residual stream — the split reference
+    /// mutated b.x_s, not b.x_f), xn = b.xn_attn_f (stage 5's ffn-normed
+    /// value is transient — one xn buffer, as in the engine), the
+    /// q/k/v/attn outputs, the kv cache (b.kv_f), and embed row 0 = the
+    /// initial x (li==0 gather: identity copy, token 0). wnext = the
+    /// attn-norm weight (stage 8 and the rms0 stage), wffn = the ffn-norm
+    /// weight (stage 5), li = 0 (exercises the gather + rms0 branch; its
+    /// xn output is transient, overwritten by stages 5/8 — the engine A/B
+    /// gate covers the rms0 → stage-1 wiring).
+    fn run_layer_fused(
+        lf: &mut LayerFusedKernels,
+        ctx: &CudaContext,
+        stream: &CudaStream,
+        b: &LayerBufs,
+        g: &FusedGeom,
+    ) {
+        let spec = LayerFusedSpec {
+            h: H,
+            nqk: NQK,
+            kvk: KVK,
+            ffn: FFN,
+            d: D,
+            q_heads: 16,
+            kv_heads: 8,
+            block_len: BLOCK_LEN,
+            max_kv: BLOCK_LEN,
+            total_pages: 1,
+            pp: 1,
+            eta: ETA,
+            eps: EPS,
+            head_norm: true,
+            embed: b.embed.as_ptr() as *const u16,
+            x: b.x_f.as_ptr() as *mut u16,
+            xn: b.xn_attn_f.as_ptr() as *mut u16,
+            q16: b.q16_f.as_ptr() as *mut u16,
+            k16: b.k16_f.as_ptr() as *mut u16,
+            v16: b.v16_f.as_ptr() as *mut u16,
+            attn: b.attn_f.as_ptr() as *mut u16,
+            kv: b.kv_f.as_ptr() as *mut u16,
+            lens: b.lens.as_ptr() as *const u32,
+            pages: b.pages.as_ptr() as *const u32,
+            wnorm0: b.attn_norm.as_ptr() as *const u16,
+        };
+        lf.build(ctx.device_id(), g, &spec).unwrap();
+        lf.launch(
+            stream,
+            g.tables,                           // layer 0 (li * 7 rows)
+            b.attn_norm.as_ptr() as *const u16, // wnext (stage 8 / rms0)
+            b.ffn_norm.as_ptr() as *const u16,  // wffn (stage 5)
+            b.q_norm.as_ptr() as *const u16,    // wq (stage 2 head norm)
+            b.k_norm.as_ptr() as *const u16,    // wk (stage 2 head norm)
+            0,                                  // li (stage 0 on)
+            1,                                  // n_layers (stage_ts slots)
+            POS,                                // rope pos
+            0,                                  // token (embed row 0)
+        )
+        .unwrap();
+    }
+
     /// Bit-exact compare of two f16 buffers.
     fn assert_u16_eq(a: &[u16], b: &[u16], tag: &str) {
         assert_eq!(a.len(), b.len(), "{tag}: len");
@@ -746,9 +862,7 @@ mod gpu {
         )
         .unwrap();
         let b = layer_bufs(dev, 0xB17E_5EEDu64);
-        fused
-            .build_plans(ctx.device_id(), &jgemm, &fabricate_plans(&b))
-            .unwrap();
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans(&b)).unwrap();
         let g = fused.geom();
 
         // Weight bytes per launch — the bandwidth bundle each kernel
@@ -758,12 +872,8 @@ mod gpu {
 
         // Warmup: settle clocks/allocations before the timed loop.
         for _ in 0..3 {
-            fused
-                .launch_p1(&stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0])
-                .unwrap();
-            fused
-                .launch_p2_gu_d(&stream, unsafe { g.tables.add(4) }, g.grid_gu_p2)
-                .unwrap();
+            fused.launch_p1(&stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0]).unwrap();
+            fused.launch_p2_gu_d(&stream, unsafe { g.tables.add(4) }, g.grid_gu_p2).unwrap();
             fused
                 .launch_p2_add_rms(
                     &stream,
@@ -789,13 +899,9 @@ mod gpu {
         let ev3 = CudaEvent::new(ctx.device_id()).unwrap();
         for i in 0..N {
             ev0.record(&stream).unwrap();
-            fused
-                .launch_p1(&stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0])
-                .unwrap();
+            fused.launch_p1(&stream, unsafe { g.tables.add(4) }, 2, g.grid_gu[0]).unwrap();
             ev1.record(&stream).unwrap();
-            fused
-                .launch_p2_gu_d(&stream, unsafe { g.tables.add(4) }, g.grid_gu_p2)
-                .unwrap();
+            fused.launch_p2_gu_d(&stream, unsafe { g.tables.add(4) }, g.grid_gu_p2).unwrap();
             ev2.record(&stream).unwrap();
             fused
                 .launch_p2_add_rms(
@@ -918,24 +1024,12 @@ mod gpu {
         // projection input)
         assert_u16_eq(&read_u16(&b.attn, NQK), &read_u16(&b.attn_f, NQK), "attn");
         // ffn norm output (o residual + ffn rms)
-        assert_u16_eq(
-            &read_u16(&b.xn_ffn_s, H),
-            &read_u16(&b.xn_ffn_f, H),
-            "xn_ffn",
-        );
+        assert_u16_eq(&read_u16(&b.xn_ffn_s, H), &read_u16(&b.xn_ffn_f, H), "xn_ffn");
         // down (gate/up reductions + swiglu)
-        assert_u16_eq(
-            &read_u16(&b.down_s, FFN),
-            &read_u16(&b.down_f, FFN),
-            "down",
-        );
+        assert_u16_eq(&read_u16(&b.down_s, FFN), &read_u16(&b.down_f, FFN), "down");
         // residual stream x (after both adds) and the attn norm output
         assert_u16_eq(&read_u16(&b.x_s, H), &read_u16(&b.x_f, H), "x");
-        assert_u16_eq(
-            &read_u16(&b.xn_attn_s, H),
-            &read_u16(&b.xn_attn_f, H),
-            "xn_attn",
-        );
+        assert_u16_eq(&read_u16(&b.xn_attn_s, H), &read_u16(&b.xn_attn_f, H), "xn_attn");
         // phase-1 partials: the multi kernel's segments vs the single-plan
         // kernel's outputs — the p1_multi contract.
         let g = fused.geom();
@@ -974,7 +1068,286 @@ mod gpu {
             &read_f32_ptr(dev, g.pd, H * g.nslabs_d as usize),
             "partials down",
         );
-        println!("fused layer: bit-exact vs split on q/k/v, attn, x, xn_ffn, xn_attn, down and all 7 phase-1 partials segments");
+        println!(
+            "fused layer: bit-exact vs split on q/k/v, attn, x, xn_ffn, xn_attn, down and all 7 phase-1 partials segments"
+        );
+    }
+
+    /// Gate 2 (S1-10): the whole layer through the single persistent
+    /// kernel vs the split sequence — every output and every phase-1
+    /// partials segment bit-identical (the p1_multi contract inside one
+    /// kernel, with the S1-9 arithmetic preserved stage by stage).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / kernel-level"]
+    fn layer_fused_bit_exact_vs_split() {
+        let (ctx, stream, arch, cache) = setup();
+        let dev = ctx.device_id().index();
+        let dense = DenseKernels::new(&arch, Some(cache.clone())).unwrap();
+        let diff = DiffKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let decode = DecodeKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let jgemm = Jgemm::new(dev, &arch, Some(cache.clone())).unwrap();
+        let gemm_lib = load_gemm_m1(&arch, Some(cache.clone()));
+        let mut fused = FusedDecodeKernels::new(
+            dev,
+            &arch,
+            Some(cache.clone()),
+            gemm_lib.kernel("gemv_m1_f16f32_reduce").unwrap(),
+        )
+        .unwrap();
+        let mut lf = LayerFusedKernels::new(dev, &arch, Some(cache)).unwrap();
+
+        // The layer arm runs on a FRESH bufs pair (same seed — identical
+        // buffers): the split reference mutates x_s / writes the o plan's
+        // input (b.attn = the split flash output, which the layer
+        // kernel's own stage 3 must reproduce bit-exactly) and the
+        // reference partials; the persistent kernel writes its own f16
+        // outputs into b.*_f and the shared partials segments.
+        let bl = layer_bufs(dev, 0x51E9u64);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &bl);
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans(&bl)).unwrap();
+        let g = fused.geom();
+        run_layer_fused(&mut lf, &ctx, &stream, &bl, g);
+        stream.synchronize().unwrap();
+
+        // q/k/v after head norm + rope
+        assert_u16_eq(&read_u16(&bl.q16, NQK), &read_u16(&bl.q16_f, NQK), "layer q16");
+        assert_u16_eq(&read_u16(&bl.k16, KVK), &read_u16(&bl.k16_f, KVK), "layer k16");
+        assert_u16_eq(&read_u16(&bl.v16, KVK), &read_u16(&bl.v16_f, KVK), "layer v16");
+        // flash attention output (the layer kernel's stage 3 vs the split
+        // flash — also the o plan input the stage-4 phase-1 read)
+        assert_u16_eq(&read_u16(&bl.attn, NQK), &read_u16(&bl.attn_f, NQK), "layer attn");
+        // down (gate/up reductions + swiglu, stage 7)
+        assert_u16_eq(&read_u16(&bl.down_s, FFN), &read_u16(&bl.down_f, FFN), "layer down");
+        // residual stream x (both adds; the layer kernel's x_f input was
+        // the fresh initial x — the stage-0 gather is an identity copy)
+        assert_u16_eq(&read_u16(&bl.x_s, H), &read_u16(&bl.x_f, H), "layer x");
+        // the attn-norm output (stage 8 — the same rms code path as
+        // stage 5's ffn-normed value, which is transient in the engine's
+        // single-xn layout and covered by the engine A/B gate)
+        assert_u16_eq(&read_u16(&bl.xn_attn_s, H), &read_u16(&bl.xn_attn_f, H), "layer xn_attn");
+        // phase-1 partials: the persistent kernel's segments vs the
+        // single-plan kernel's outputs — the p1_multi contract held
+        // inside the layer kernel.
+        assert_f32_eq(
+            &read_f32(&bl.p_q, NQK * g.nslabs_q as usize),
+            &read_f32_ptr(dev, g.pq, NQK * g.nslabs_q as usize),
+            "layer partials q",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_k, KVK * g.nslabs_k as usize),
+            &read_f32_ptr(dev, g.pk, KVK * g.nslabs_k as usize),
+            "layer partials k",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_v, KVK * g.nslabs_v as usize),
+            &read_f32_ptr(dev, g.pv, KVK * g.nslabs_v as usize),
+            "layer partials v",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_o, H * g.nslabs_o as usize),
+            &read_f32_ptr(dev, g.po, H * g.nslabs_o as usize),
+            "layer partials o",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_g, FFN * g.nslabs_g as usize),
+            &read_f32_ptr(dev, g.pg, FFN * g.nslabs_g as usize),
+            "layer partials gate",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_u, FFN * g.nslabs_g as usize),
+            &read_f32_ptr(dev, g.pu, FFN * g.nslabs_g as usize),
+            "layer partials up",
+        );
+        assert_f32_eq(
+            &read_f32(&bl.p_d, H * g.nslabs_d as usize),
+            &read_f32_ptr(dev, g.pd, H * g.nslabs_d as usize),
+            "layer partials down",
+        );
+        println!(
+            "layer-fused kernel: bit-exact vs split on q/k/v, attn, x, xn_attn, down and all 7 phase-1 partials segments (one launch, stages 0..8)"
+        );
+    }
+
+    /// Gate 1b (S1-10): the persistent kernel's li=1 run — the 2-layer
+    /// geometry: the kernel's `pages + li*pp` lands on the SECOND page,
+    /// the stage-3 kv write goes into layer 1's region, wnext/wffn/wq/wk
+    /// are layer-1 weights, x/xn carry the layer-1 state (no gather).
+    /// The kv prefill deliberately differs between the two pages (page 1
+    /// == the split reference's prefill, page 0 = a different random
+    /// page) so any page-offset slip (reading or writing the wrong page)
+    /// fails the comparison instead of being masked by identical pages.
+    /// Every output and every phase-1 partials segment must be
+    /// bit-identical to the split sequence on the same buffers.
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / kernel-level"]
+    fn layer_fused_li1_bit_exact_vs_split() {
+        let (ctx, stream, arch, cache) = setup();
+        let dev = ctx.device_id().index();
+        let dense = DenseKernels::new(&arch, Some(cache.clone())).unwrap();
+        let diff = DiffKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let decode = DecodeKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let jgemm = Jgemm::new(dev, &arch, Some(cache.clone())).unwrap();
+        let gemm_lib = load_gemm_m1(&arch, Some(cache.clone()));
+        let mut fused = FusedDecodeKernels::new(
+            dev,
+            &arch,
+            Some(cache.clone()),
+            gemm_lib.kernel("gemv_m1_f16f32_reduce").unwrap(),
+        )
+        .unwrap();
+        let mut lf = LayerFusedKernels::new(dev, &arch, Some(cache)).unwrap();
+
+        // b1 = the layer-0 rows of the two-layer plan table (geometry
+        // filler — the li=1 launch reads rows 7..13), b2 = the layer-1
+        // buffers the kernel actually runs. Same seed: identical buffers.
+        let b1 = layer_bufs(dev, 0x51E9u64);
+        let b2 = layer_bufs(dev, 0x51E9u64);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &b2);
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b2)).unwrap();
+        let g = fused.geom();
+
+        // The layer-1 kv region: a dedicated 2-page buffer — page 1 =
+        // the split reference's prefill (read back from kv_s; the split
+        // only mutated slot KV_LEN-1, which the layer kernel overwrites
+        // with the same k/v anyway), page 0 = a different random page.
+        // The layer kernel must touch page 1 only. Layout is the engine's
+        // KvStore layout: [all pages' K][all pages' V] — the kernel's
+        // v_base = total_pages*block_len*per_tok starts the V region.
+        let per_tok_kv = KVK; // kv_heads * d
+        let kv_s = read_u16(&b2.kv_s, BLOCK_LEN * per_tok_kv * 2);
+        let mut seed = 0x51E9u64 ^ 0x0BAD_5EEDu64;
+        let page_a = (0..(BLOCK_LEN * per_tok_kv * 2))
+            .map(|_| rand_f16_bits(&mut seed))
+            .collect::<Vec<u16>>();
+        let kv2: Vec<u16> = [
+            &page_a[0..BLOCK_LEN * per_tok_kv], // K0
+            &kv_s[0..BLOCK_LEN * per_tok_kv],   // K1 (kv_fill K)
+            &page_a[BLOCK_LEN * per_tok_kv..],  // V0
+            &kv_s[BLOCK_LEN * per_tok_kv..],    // V1 (kv_fill V)
+        ]
+        .concat();
+        let d_kv2 = upl(dev, &bytes_u16(&kv2));
+
+        let spec = LayerFusedSpec {
+            h: H,
+            nqk: NQK,
+            kvk: KVK,
+            ffn: FFN,
+            d: D,
+            q_heads: 16,
+            kv_heads: 8,
+            block_len: BLOCK_LEN,
+            max_kv: BLOCK_LEN,
+            total_pages: 2,
+            pp: 1,
+            eta: ETA,
+            eps: EPS,
+            head_norm: true,
+            embed: std::ptr::null(), // no gather at li > 0
+            x: b2.x_f.as_ptr() as *mut u16,
+            xn: b2.xn_attn_f.as_ptr() as *mut u16,
+            q16: b2.q16_f.as_ptr() as *mut u16,
+            k16: b2.k16_f.as_ptr() as *mut u16,
+            v16: b2.v16_f.as_ptr() as *mut u16,
+            attn: b2.attn_f.as_ptr() as *mut u16,
+            kv: d_kv2.as_ptr() as *mut u16,
+            lens: b2.lens.as_ptr() as *const u32,
+            pages: b2.pages2.as_ptr() as *const u32,
+            wnorm0: b2.attn_norm.as_ptr() as *const u16,
+        };
+        lf.build(ctx.device_id(), g, &spec).unwrap();
+        lf.launch(
+            &stream,
+            unsafe { g.tables.add(7) },          // layer-1 rows (li * 7)
+            b2.attn_norm.as_ptr() as *const u16, // wnext (stage 8)
+            b2.ffn_norm.as_ptr() as *const u16,  // wffn (stage 5)
+            b2.q_norm.as_ptr() as *const u16,    // wq (stage 2 head norm)
+            b2.k_norm.as_ptr() as *const u16,    // wk (stage 2 head norm)
+            1,                                   // li (layer 1 — no gather)
+            2,                                   // n_layers (stage_ts slots)
+            POS,                                 // rope pos
+            0,                                   // token (unused at li > 0)
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        // Same output surface as the li=0 gate: q/k/v after head norm +
+        // rope, the flash attention output, down, the residual stream x
+        // (the split's layer-1 input was the same initial x — b2.x_f was
+        // untouched by run_split), the attn-norm output, and the 7
+        // phase-1 partials segments (shared segments — same base, no
+        // offset).
+        assert_u16_eq(&read_u16(&b2.q16, NQK), &read_u16(&b2.q16_f, NQK), "li1 q16");
+        assert_u16_eq(&read_u16(&b2.k16, KVK), &read_u16(&b2.k16_f, KVK), "li1 k16");
+        assert_u16_eq(&read_u16(&b2.v16, KVK), &read_u16(&b2.v16_f, KVK), "li1 v16");
+        assert_u16_eq(&read_u16(&b2.attn, NQK), &read_u16(&b2.attn_f, NQK), "li1 attn");
+        assert_u16_eq(&read_u16(&b2.down_s, FFN), &read_u16(&b2.down_f, FFN), "li1 down");
+        assert_u16_eq(&read_u16(&b2.x_s, H), &read_u16(&b2.x_f, H), "li1 x");
+        assert_u16_eq(&read_u16(&b2.xn_attn_s, H), &read_u16(&b2.xn_attn_f, H), "li1 xn_attn");
+        assert_f32_eq(
+            &read_f32(&b2.p_q, NQK * g.nslabs_q as usize),
+            &read_f32_ptr(dev, g.pq, NQK * g.nslabs_q as usize),
+            "li1 partials q",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_k, KVK * g.nslabs_k as usize),
+            &read_f32_ptr(dev, g.pk, KVK * g.nslabs_k as usize),
+            "li1 partials k",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_v, KVK * g.nslabs_v as usize),
+            &read_f32_ptr(dev, g.pv, KVK * g.nslabs_v as usize),
+            "li1 partials v",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_o, H * g.nslabs_o as usize),
+            &read_f32_ptr(dev, g.po, H * g.nslabs_o as usize),
+            "li1 partials o",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_g, FFN * g.nslabs_g as usize),
+            &read_f32_ptr(dev, g.pg, FFN * g.nslabs_g as usize),
+            "li1 partials gate",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_u, FFN * g.nslabs_g as usize),
+            &read_f32_ptr(dev, g.pu, FFN * g.nslabs_g as usize),
+            "li1 partials up",
+        );
+        assert_f32_eq(
+            &read_f32(&b2.p_d, H * g.nslabs_d as usize),
+            &read_f32_ptr(dev, g.pd, H * g.nslabs_d as usize),
+            "li1 partials down",
+        );
+        // The stage-3 kv write: physical page 1 (li=1, pages2 = [0, 1])
+        // must hold the same k16/v16 the split's kv_write_row stored at
+        // page 0 — same slot, same values.
+        let kv2_r = read_u16(&d_kv2, 2 * BLOCK_LEN * per_tok_kv * 2);
+        let slot1 = (BLOCK_LEN + KV_LEN - 1) * per_tok_kv; // phys 1, off KV_LEN-1
+        let v_base1 = 2 * BLOCK_LEN * per_tok_kv;
+        let slot0 = (KV_LEN - 1) * per_tok_kv; // phys 0
+        let v_base0 = BLOCK_LEN * per_tok_kv;
+        assert_u16_eq(
+            &kv2_r[slot1..slot1 + per_tok_kv],
+            &kv_s[slot0..slot0 + per_tok_kv],
+            "li1 kv K write",
+        );
+        assert_u16_eq(
+            &kv2_r[v_base1 + slot1..v_base1 + slot1 + per_tok_kv],
+            &kv_s[v_base0 + slot0..v_base0 + slot0 + per_tok_kv],
+            "li1 kv V write",
+        );
+        // And page 0 must NOT hold the new k/v — a page-offset write bug
+        // would land at page-0 slot KV_LEN-1 (slot0), which still holds
+        // the different page-A prefill when the write went to page 1.
+        assert_ne!(
+            &kv2_r[slot0..slot0 + per_tok_kv],
+            &kv_s[slot0..slot0 + per_tok_kv],
+            "li1 kv write must land in page 1, not page 0"
+        );
+        println!(
+            "layer-fused li=1 kernel: bit-exact vs split on q/k/v, attn, x, xn_attn, down, all 7 phase-1 partials segments and the page-1 kv write"
+        );
     }
 
     /// Gate 2: two fused layer runs from identical inputs are
@@ -1001,43 +1374,65 @@ mod gpu {
         run_fused(&mut fused, &jgemm, &ctx, &decode, &stream, dev, &b2);
         stream.synchronize().unwrap();
 
-        assert_u16_eq(
-            &read_u16(&b1.attn_f, NQK),
-            &read_u16(&b2.attn_f, NQK),
-            "det attn",
-        );
-        assert_u16_eq(
-            &read_u16(&b1.q16_f, NQK),
-            &read_u16(&b2.q16_f, NQK),
-            "det q16",
-        );
-        assert_u16_eq(
-            &read_u16(&b1.k16_f, KVK),
-            &read_u16(&b2.k16_f, KVK),
-            "det k16",
-        );
-        assert_u16_eq(
-            &read_u16(&b1.v16_f, KVK),
-            &read_u16(&b2.v16_f, KVK),
-            "det v16",
-        );
-        assert_u16_eq(
-            &read_u16(&b1.xn_ffn_f, H),
-            &read_u16(&b2.xn_ffn_f, H),
-            "det xn_ffn",
-        );
-        assert_u16_eq(
-            &read_u16(&b1.down_f, FFN),
-            &read_u16(&b2.down_f, FFN),
-            "det down",
-        );
+        assert_u16_eq(&read_u16(&b1.attn_f, NQK), &read_u16(&b2.attn_f, NQK), "det attn");
+        assert_u16_eq(&read_u16(&b1.q16_f, NQK), &read_u16(&b2.q16_f, NQK), "det q16");
+        assert_u16_eq(&read_u16(&b1.k16_f, KVK), &read_u16(&b2.k16_f, KVK), "det k16");
+        assert_u16_eq(&read_u16(&b1.v16_f, KVK), &read_u16(&b2.v16_f, KVK), "det v16");
+        assert_u16_eq(&read_u16(&b1.xn_ffn_f, H), &read_u16(&b2.xn_ffn_f, H), "det xn_ffn");
+        assert_u16_eq(&read_u16(&b1.down_f, FFN), &read_u16(&b2.down_f, FFN), "det down");
         assert_u16_eq(&read_u16(&b1.x_f, H), &read_u16(&b2.x_f, H), "det x");
+        assert_u16_eq(&read_u16(&b1.xn_attn_f, H), &read_u16(&b2.xn_attn_f, H), "det xn_attn");
+        println!("fused layer: two runs bit-identical (deterministic)");
+    }
+
+    /// Gate 3 (S1-10): two persistent-kernel layer runs from identical
+    /// inputs are bit-identical (determinism — the grid barriers must
+    /// not leak run-order effects).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / determinism"]
+    fn layer_fused_determinism_double_run() {
+        let (ctx, stream, arch, cache) = setup();
+        let dev = ctx.device_id().index();
+        let dense = DenseKernels::new(&arch, Some(cache.clone())).unwrap();
+        let diff = DiffKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let decode = DecodeKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let jgemm = Jgemm::new(dev, &arch, Some(cache.clone())).unwrap();
+        let gemm_lib = load_gemm_m1(&arch, Some(cache.clone()));
+        let mut fused = FusedDecodeKernels::new(
+            dev,
+            &arch,
+            Some(cache.clone()),
+            gemm_lib.kernel("gemv_m1_f16f32_reduce").unwrap(),
+        )
+        .unwrap();
+        let mut lf = LayerFusedKernels::new(dev, &arch, Some(cache)).unwrap();
+
+        let b1 = layer_bufs(dev, 0xD37u64);
+        let b2 = layer_bufs(dev, 0xD37u64);
+        // Per pair: the split reference (initializes b.attn — the o
+        // plan's input — and the reference partials), then the layer
+        // kernel over that pair's plan table (the plan rows and the
+        // kernel const hold pointers into the pair's buffers).
+        for b in [&b1, &b2] {
+            run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, b);
+            fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans(b)).unwrap();
+            let g = fused.geom();
+            run_layer_fused(&mut lf, &ctx, &stream, b, g);
+        }
+        stream.synchronize().unwrap();
+
+        assert_u16_eq(&read_u16(&b1.q16_f, NQK), &read_u16(&b2.q16_f, NQK), "det layer q16");
+        assert_u16_eq(&read_u16(&b1.k16_f, KVK), &read_u16(&b2.k16_f, KVK), "det layer k16");
+        assert_u16_eq(&read_u16(&b1.v16_f, KVK), &read_u16(&b2.v16_f, KVK), "det layer v16");
+        assert_u16_eq(&read_u16(&b1.attn_f, NQK), &read_u16(&b2.attn_f, NQK), "det layer attn");
+        assert_u16_eq(&read_u16(&b1.down_f, FFN), &read_u16(&b2.down_f, FFN), "det layer down");
+        assert_u16_eq(&read_u16(&b1.x_f, H), &read_u16(&b2.x_f, H), "det layer x");
         assert_u16_eq(
             &read_u16(&b1.xn_attn_f, H),
             &read_u16(&b2.xn_attn_f, H),
-            "det xn_attn",
+            "det layer xn_attn",
         );
-        println!("fused layer: two runs bit-identical (deterministic)");
+        println!("layer-fused: two runs bit-identical (deterministic)");
     }
 
     // -----------------------------------------------------------------------
@@ -1045,17 +1440,22 @@ mod gpu {
     // -----------------------------------------------------------------------
 
     const FUSED_ENV: &str = "REINFER_FUSED";
+    const LAYER_FUSED_ENV: &str = "REINFER_LAYER_FUSED";
 
     fn model_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(std::env::var("REINFER_MODEL_DIR").expect("REINFER_MODEL_DIR"))
     }
 
-    /// Load the engine with REINFER_FUSED set to `value` (read once at
-    /// load; the process env is ours — tests must run single-threaded).
-    fn load(fused_value: &str) -> Engine {
+    /// Load the engine with REINFER_FUSED=`fused_value` and
+    /// REINFER_LAYER_FUSED=`layer_value` (both read once at load; the
+    /// process env is ours — tests must run single-threaded).
+    fn load_pair(fused_value: &str, layer_value: &str) -> Engine {
         // SAFETY (test-only): --test-threads=1 keeps the env mutation
         // single-threaded; the value is read once at Engine::load.
-        unsafe { std::env::set_var(FUSED_ENV, fused_value) };
+        unsafe {
+            std::env::set_var(FUSED_ENV, fused_value);
+            std::env::set_var(LAYER_FUSED_ENV, layer_value);
+        }
         let ctx = CudaContext::init(DeviceId::new(0)).expect("ctx");
         let dev = ctx.device_id();
         let stream = CudaStream::new(dev).expect("stream");
@@ -1068,6 +1468,12 @@ mod gpu {
             4096,
         )
         .expect("engine load")
+    }
+
+    /// `load_pair` with REINFER_LAYER_FUSED=off (the S1-9 fused path —
+    /// the default is on, so the off arm must be explicit).
+    fn load(fused_value: &str) -> Engine {
+        load_pair(fused_value, "off")
     }
 
     fn tokenizer() -> Tokenizer {
@@ -1161,6 +1567,46 @@ mod gpu {
         assert_bitwise(&l_on, &l_off, "fused on/off");
         println!(
             "fused A/B: {} decode steps bit-identical; text {:?}",
+            t_on.len(),
+            tok.decode_all(&t_on)
+        );
+    }
+
+    /// Gate 4 (S1-10): engine A/B — REINFER_LAYER_FUSED=on (the single
+    /// per-layer persistent kernel) vs off (the S1-9 eight-kernel fused
+    /// path), both with REINFER_FUSED=on: 16 + 128 greedy decode tokens,
+    /// per-step logits bit-identical and identical text; the layer-fused
+    /// engine is deterministic across two separate loads (bit-level).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / engine-ab"]
+    fn layer_fused_engine_ab_bitwise() {
+        let tok = tokenizer();
+        let ids = tok.encode("Hello", false).expect("encode");
+        assert!(!ids.is_empty());
+
+        // A: layer-fused — two separate loads must produce bit-identical
+        // steps.
+        let mut eng_a1 = load_pair("on", "on");
+        let (l1, t1) = run(&mut eng_a1, &ids, 16);
+        drop(eng_a1);
+        let mut eng_a2 = load_pair("on", "on");
+        let (l2, t2) = run(&mut eng_a2, &ids, 16);
+        assert_eq!(t1, t2, "layer-fused determinism: identical 16-token text");
+        assert_bitwise(&l1, &l2, "layer-fused determinism");
+        drop(eng_a2);
+
+        // B: the S1-9 fused reference arm (REINFER_LAYER_FUSED=off).
+        let mut eng_off = load_pair("on", "off");
+        let (l_off, t_off) = run(&mut eng_off, &ids, 128);
+        drop(eng_off);
+        let mut eng_on = load_pair("on", "on");
+        let (l_on, t_on) = run(&mut eng_on, &ids, 128);
+        drop(eng_on);
+
+        assert_eq!(t_on, t_off, "layer on/off must produce identical text");
+        assert_bitwise(&l_on, &l_off, "layer on/off");
+        println!(
+            "layer-fused A/B: {} decode steps bit-identical; text {:?}",
             t_on.len(),
             tok.decode_all(&t_on)
         );

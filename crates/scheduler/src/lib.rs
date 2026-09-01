@@ -21,6 +21,8 @@
 //!   per-request chunk budget in policy order.
 //! - [`policy`] — waiting-queue ordering (FCFS / LPM, D3) and the D7 victim
 //!   order; resume (preempted) requests always outrank new arrivals.
+//! - [`radix`] — the token-prefix KV cache front-end (spec 016 P3-01):
+//!   page-aligned trie lookups, budget LRU eviction, pure CPU (no CUDA).
 //! - [`stop`] — incremental stop-pattern matching over the generated token
 //!   stream (longest-prefix partial match state, spec D8).
 //! - [`rng`] — the deterministic per-request RNG (design report D5):
@@ -36,6 +38,7 @@
 pub mod admission;
 pub mod batch;
 pub mod policy;
+pub mod radix;
 pub mod replay;
 pub mod req;
 pub mod rng;

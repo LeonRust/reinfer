@@ -115,6 +115,7 @@ use reinfer_scheduler::admission::{
 };
 use reinfer_scheduler::batch::{DecodingReq, WaitingReq, select_batch};
 use reinfer_scheduler::policy::SchedulePolicy;
+use reinfer_scheduler::radix::{PrefixHit, TokenRadixCache};
 use reinfer_scheduler::replay::{Event, TraceEntry};
 use reinfer_scheduler::req::{ConfirmEvent, Req, ReqId, ReqState};
 use reinfer_scheduler::rng::splitmix64;
@@ -184,6 +185,32 @@ pub trait BatchExecutor: Send {
     /// Prefill `ids` into the engine pool (flushing the current singleton
     /// first). The engine pool afterwards holds the staged chunk.
     fn prefill(&mut self, ids: &[u32]) -> Result<(), ExecError>;
+    /// P3-01/016 r2 D3: prefix-cache hit prefill — a single sequential path
+    /// (flush the singleton, copy the cached prefix run into the engine pool,
+    /// decode-step the remaining suffix tokens one at a time; each step's
+    /// attention reads `[0, pos+1]` including the copied prefix — the FMHA
+    /// batch prefill is context-blind, so hits must not use it). Afterwards
+    /// the engine pool holds the full prompt KV; the loop adopts the
+    /// singleton with `adopt_singleton(id, seg, 0, prompt_len)` (no copy —
+    /// the pool is already complete).
+    fn prefill_prefix_hit(&mut self, hit: PrefixHit, ids_suffix: &[u32]) -> Result<(), ExecError>;
+    /// P3-01/016 r2 D2: refill the first `prefix_pages` pages of `seg` into
+    /// the cache on a **normal Done release** — per-layer `ref_` on the
+    /// prefix run, then free the whole segment (the prefix pages drop 2 → 1
+    /// = cache-owned, the suffix pages drop to 0 = back to the pool).
+    /// Infallible on the host side. Abort/preempt release MUST keep using
+    /// plain `free_segment` (their segments are unreliable — review #4).
+    ///
+    /// **Flush first** (review #2, the real fix): a B=1 world keeps the
+    /// request's KV in the engine pool — the segment is only materialized
+    /// when it is adopted/committed/flushed. If `id` is the current
+    /// singleton, its KV must be copied into `seg` BEFORE the prefix run
+    /// is refilled, or the cache would hold never-written pages.
+    fn refill_prefix(&mut self, id: ReqId, seg: KvSegment, prefix_pages: u32);
+    /// P3-01/016 D2: release one cached run's pool references (LRU eviction
+    /// callback — the front-end's `Evicted` list; per-layer unref, mirror of
+    /// `refill_prefix`).
+    fn unref_prefix(&mut self, base_page: u32, pages: u32);
     /// Commit the staged chunk to `seg`: tokens `[start, start + len)` are
     /// copied from the engine pool into the segment at page offset
     /// `start / block_len`.
@@ -244,6 +271,8 @@ pub struct SchedLoopConfig {
     pub max_steps: usize,
     /// Detokenization (delta-text frames) — the loop is tokenizer-agnostic.
     pub detok: Arc<dyn Fn(&[u32]) -> String + Send + Sync>,
+    /// P3-01/016: prefix-cache page budget (per-layer pages; 0 = cache off).
+    pub prefix_cache_pages: u64,
 }
 
 impl SchedLoopConfig {
@@ -402,6 +431,29 @@ pub fn base_seed_env() -> u64 {
     std::env::var("REINFER_SEED").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
 }
 
+/// `REINFER_PREFIX_CACHE` switch: off for "0"/"off"/"false"/"no", on
+/// otherwise (default on with the scheduler — 016 r2).
+pub fn prefix_cache_env_on() -> bool {
+    std::env::var("REINFER_PREFIX_CACHE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+        .unwrap_or(true)
+}
+
+/// Prefix-cache page budget (per-layer pages): `REINFER_PREFIX_CACHE_PAGES`
+/// if set, else 10% of `kv_pages` (≥ 1); 0 when the cache is off.
+/// `minimum` — usually `MIN_BLOCKS` per entry — is only validated by the
+/// cache front-end (an entry that exceeds the budget is rejected at refill).
+pub fn prefix_cache_pages_env(kv_pages: usize, enabled: bool) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    std::env::var("REINFER_PREFIX_CACHE_PAGES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| ((kv_pages as u64) * 10) / 100)
+        .max(1)
+}
+
 // ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
@@ -468,12 +520,19 @@ pub struct SchedLoop<E: BatchExecutor> {
     trace: Vec<TraceEntry>,
     dispatched: u64,
     returned: u64,
+    /// P3-01/016: prefix cache front-end (None = disabled). Owned here, used
+    /// on the single thread; the executor performs the pool ops.
+    cache: Option<TokenRadixCache>,
+    cache_hits: usize,
+    cache_refills: usize,
 }
 
 impl<E: BatchExecutor> SchedLoop<E> {
     /// New loop over the given executor and configuration.
     fn new(exec: E, cfg: SchedLoopConfig, cmd_rx: std_mpsc::Receiver<SchedCmd>) -> Self {
+        let cache_pages = cfg.prefix_cache_pages;
         Self {
+            cache: (cache_pages > 0).then(|| TokenRadixCache::new(cache_pages)),
             cfg,
             exec,
             cmd_rx,
@@ -491,6 +550,8 @@ impl<E: BatchExecutor> SchedLoop<E> {
             trace: Vec::new(),
             dispatched: 0,
             returned: 0,
+            cache_hits: 0,
+            cache_refills: 0,
         }
     }
 
@@ -803,9 +864,40 @@ impl<E: BatchExecutor> SchedLoop<E> {
                 s => unreachable!("prefill assignment to {s:?}"),
             }
             self.dispatched += (end - start) as u64;
+            // P3-01/016 r2 D3: prefix-cache hit for the FIRST chunk of a
+            // Waiting request (start == 0; chunked continuations stay on the
+            // full path). The hit short-circuits the staged chunk into the
+            // engine pool directly (copy the cached prefix run + decode-step
+            // the suffix), then falls into the usual confirm/commit/adopt
+            // flow unchanged — the engine pool afterwards holds the whole
+            // chunk (adopt copies nothing, commit copies page-exact).
+            // Accounting: the hit prefix tokens are NOT recomputed by this
+            // request; `dispatched` counts them anyway (they were produced
+            // by the earlier request that filled the cache) — the
+            // dispatch/return conservation check stays balanced, and the
+            // cache's own pages are covered by the pool-refcount
+            // conservation (asserted separately in tests).
+            let mut cache_hit = false;
+            // v1: a hit only when the WHOLE prompt is a single chunk
+            // (`end == prompt.len()` — final chunks are never rounded);
+            // chunked continuations stay on the full path (their hit
+            // coverage vs. chunk accounting is a v2 concern).
+            if start == 0 && end == self.meta[&id].prompt.len() {
+                if let Some(c) = &self.cache
+                    && let Some(hit) = c.lookup(&self.meta[&id].prompt)
+                {
+                    let suffix = &self.meta[&id].prompt[hit.key_len..end];
+                    if let Err(e) = self.exec.prefill_prefix_hit(hit, suffix) {
+                        self.request_abort(id, Some(&format!("prefix hit: {e}")));
+                        continue;
+                    }
+                    self.cache_hits += 1;
+                    cache_hit = true;
+                }
+            }
             // Stage the chunk into the engine pool (short serial work),
-            // then confirm.
-            if let Err(e) = self.exec.prefill(&self.meta[&id].prompt[start..end]) {
+            // then confirm. (Skipped on a hit — already staged.)
+            if !cache_hit && let Err(e) = self.exec.prefill(&self.meta[&id].prompt[start..end]) {
                 self.request_abort(id, Some(&format!("prefill: {e}")));
                 continue;
             }
@@ -948,14 +1040,73 @@ impl<E: BatchExecutor> SchedLoop<E> {
         let out = self.reqs[&id].output_tokens() as f64;
         self.ema.update(out);
         self.estimates.remove(&id);
+        // P3-01/016 r2 D2: ONE release point for the cache refill (only the
+        // normal Done path; abort/preempt keep plain `free_segment` — their
+        // segments are unreliable, review #4). The refill itself flushes
+        // the request's singleton (a B=1 world keeps its KV in the engine
+        // pool; a refilled-but-never-flushed segment would poison the next
+        // cache hit — review #2). `drop_singleton` stays for the paths
+        // that do not refill (cache off / cache declined).
         if let Some(seg) = self.segs.remove(&id) {
-            self.exec.free_segment(seg);
+            self.refill_prefix_release(seg, id);
+        } else {
+            self.exec.drop_singleton(id);
         }
-        self.exec.drop_singleton(id);
         self.remove_from_decoding(id);
         self.remove_from_waiting(id);
         self.token_ids.retain(|_, v| *v != id);
         self.meta.remove(&id);
+    }
+
+    /// P3-01/016 r2 D2: refill decision on a normal Done release (called
+    /// only from `terminal` — the single cache refill point; abort and
+    /// preempt keep plain `free_segment`). Order matters:
+    ///
+    /// ```text
+    /// L  = floor(prompt_len / block_len)            // page-aligned blocks
+    /// L < MIN_BLOCKS (or 0)         → free(seg)
+    /// same aligned key present      → copy/copied…  → free(seg) + touch(key)
+    ///                                  (review #3: no ref_ — the old entry
+    ///                                   already owns the pool references)
+    /// new key                       → insert(key, base, L):
+    ///                                  Ok(evicted)  → unref evicted runs,
+    ///                                  then refill_prefix(seg, L) → refs +
+    ///                                  free (infallible host-side)
+    ///                                  Err          → free(seg)
+    /// ```
+    fn refill_prefix_release(&mut self, seg: KvSegment, id: ReqId) {
+        let Some(c) = self.cache.as_mut() else {
+            self.exec.free_segment(seg);
+            return;
+        };
+        let prompt = &self.meta[&id].prompt;
+        let L = prompt.len() / self.cfg.block_len;
+        if L == 0 || L < reinfer_scheduler::radix::MIN_BLOCKS {
+            self.exec.free_segment(seg);
+            return;
+        }
+        let aligned = L * self.cfg.block_len;
+        let key = &prompt[..aligned];
+        if c.lookup(key).map(|h| h.key_len == aligned).unwrap_or(false) {
+            // 同键（review #3）：不 ref_ ——先看树是否已有该精确键;裸 free，
+            // 旧 entry 的 recency 用 touch 刷新（新键的 insert 才 ref）。
+            self.exec.free_segment(seg);
+            c.touch(key);
+            return;
+        }
+        match c.insert(key, seg.base_page as u32, L as u32) {
+            Ok(evicted) => {
+                for e in evicted {
+                    self.exec.unref_prefix(e.base_page, e.pages);
+                }
+                self.exec.refill_prefix(id, seg, L as u32);
+                self.cache_refills += 1;
+            }
+            Err(e) => {
+                eprintln!("reinfer: sched: prefix-cache refill declined: {e:?}");
+                self.exec.free_segment(seg);
+            }
+        }
     }
 
     /// Abort a live request (`frame` = Some → push an Error frame first;
@@ -1268,6 +1419,71 @@ impl BatchExecutor for CudaBatchExecutor {
         Ok(())
     }
 
+    fn prefill_prefix_hit(&mut self, hit: PrefixHit, ids_suffix: &[u32]) -> Result<(), ExecError> {
+        // 016 r2 D3: one sequential path — flush first (a stale singleton
+        // must be committed BEFORE its pool pages are overwritten — review
+        // #6), copy the cached prefix run (pool K/V, per-layer `li*pp`
+        // stride, exactly like copy_engine_to_pool's inverse layout), then
+        // decode-step the suffix tokens: each step writes its KV slot at
+        // `prefix_tokens + i` and its attention reads the full window
+        // `[0, pos+1]` (T1a tests: full-prefix copies are bit-identical to
+        // all-write runs; partial copies are NOT — untested prefix slots
+        // would be read as garbage by layer 0, so the copy must cover
+        // `[0, prefix_tokens)` completely, which the hit's page-aligned run
+        // does by construction).
+        self.flush_singleton()?;
+        let prefix_tokens = hit.key_len;
+        let prefix_pages = hit.pages as usize;
+        let run = KvSegment { base_page: hit.base_page as usize, n_pages: prefix_pages };
+        self.copy_pool_to_engine(run, 0, prefix_pages)?;
+        for (i, &tok) in ids_suffix.iter().enumerate() {
+            let pos = prefix_tokens + i;
+            self.engine
+                .step(tok, pos, pos + 1)
+                .map_err(|e| ExecError::Engine(format!("prefix-hit step: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn refill_prefix(&mut self, id: ReqId, seg: KvSegment, prefix_pages: u32) {
+        // 016 r2 #2 (the real fix): a B=1 world keeps the request's KV in
+        // the engine pool — the segment is only materialized on flush/
+        // commit. Flush the singleton FIRST (page-exact, same direction as
+        // `flush_singleton`) so the refilled prefix holds written KV.
+        if let Some(s) = self.singleton.take().filter(|s| s.id == id) {
+            if let Err(e) = self.copy_engine_to_pool(seg, 0, s.kv_len.div_ceil(self.block_len)) {
+                // Cannot happen under normal execution (D2D under CtxGuard);
+                // regardless, release the whole segment and skip the cache.
+                eprintln!("reinfer: sched: refill flush failed: {e} — plain release");
+                self.pool.free(seg);
+                return;
+            }
+        }
+        if prefix_pages == 0 {
+            self.pool.free(seg);
+            return;
+        }
+        // 016 r2 D2: the cache's per-layer run is `(base + li*pp, +L)` —
+        // take one reference per layer BEFORE freeing the segment (the
+        // prefix pages drop 2→1, the suffix pages 1→0 back to the pool).
+        for li in 0..self.n_layer {
+            self.pool.ref_(KvSegment {
+                base_page: seg.base_page + li * self.pp,
+                n_pages: prefix_pages as usize,
+            });
+        }
+        self.pool.free(seg);
+    }
+
+    fn unref_prefix(&mut self, base_page: u32, pages: u32) {
+        for li in 0..self.n_layer {
+            self.pool.unref(KvSegment {
+                base_page: (base_page as usize) + li * self.pp,
+                n_pages: pages as usize,
+            });
+        }
+    }
+
     fn commit_stage(&mut self, seg: KvSegment, start: usize, len: usize) -> Result<(), ExecError> {
         self.copy_engine_to_pool(seg, start / self.block_len, len.div_ceil(self.block_len))
     }
@@ -1387,6 +1603,11 @@ mod tests {
         segs: Map<usize, Vec<u32>>,
         /// Singleton fiction: (id, seg, kv_len).
         singleton: Option<(ReqId, KvSegment, usize)>,
+        /// P3-01/016: prefix-hit adoption marker — set by
+        /// `prefill_prefix_hit` (the engine-pool fiction already holds the
+        /// full prompt KV), consumed by `adopt_singleton(start=0)`.
+        cache_adopt: Option<usize>,
+        cache_hits: usize,
         allocs: usize,
         frees: usize,
     }
@@ -1399,6 +1620,8 @@ mod tests {
                 staged: None,
                 segs: Map::new(),
                 singleton: None,
+                cache_adopt: None,
+                cache_hits: 0,
                 allocs: 0,
                 frees: 0,
             }
@@ -1437,6 +1660,22 @@ mod tests {
             Ok(())
         }
 
+        fn prefill_prefix_hit(
+            &mut self,
+            hit: PrefixHit,
+            ids_suffix: &[u32],
+        ) -> Result<(), ExecError> {
+            // Engine-pool fiction: the full prompt KV is present (the hit
+            // run was "copied", the suffix "decoded") — nothing staged; the
+            // loop adopts the singleton with start=0 immediately.
+            self.flush();
+            assert!(self.staged.is_none(), "one staged chunk at a time");
+            assert!(self.cache_adopt.is_none(), "unconsumed cache adopt");
+            self.cache_adopt = Some(hit.key_len + ids_suffix.len());
+            self.cache_hits += 1;
+            Ok(())
+        }
+
         fn commit_stage(
             &mut self,
             seg: KvSegment,
@@ -1458,6 +1697,15 @@ mod tests {
             start: usize,
             len: usize,
         ) -> Result<(), ExecError> {
+            // P3-01/016: a prefix hit staged nothing — the engine-pool
+            // fiction already holds the full prompt KV; skip the staged
+            // assert (nothing was staged) and take the singleton as-is.
+            if let Some(kv_len) = self.cache_adopt.take() {
+                assert_eq!(kv_len, start + len, "hit adopt length == prompt");
+                assert_eq!(start, 0, "hit adopt starts at 0");
+                self.singleton = Some((id, seg, kv_len));
+                return Ok(());
+            }
             let staged = self.staged.take().expect("a staged chunk to adopt");
             assert_eq!(staged.len(), len);
             if start > 0 {
@@ -1490,6 +1738,34 @@ mod tests {
             Ok(out)
         }
 
+        fn refill_prefix(&mut self, id: ReqId, seg: KvSegment, prefix_pages: u32) {
+            // 016 r2 #2: flush the singleton fiction first (mirrors the
+            // real executor: B=1 KV lives in the engine pool). When the
+            // terminal drop_singleton already ran, this is a no-op — the
+            // fresh guarded release below then also holds (a flushed-then-
+            // dropped singleton is invisible; segments must be refilled
+            // with materialized KV only, so the loop's flush-on-refill
+            // path guarantees it).
+            if let Some((sid, sseg, kv_len)) = self.singleton.take().filter(|s| s.0 == id) {
+                debug_assert_eq!(sseg.base_page, seg.base_page);
+                let s = self.segs.get_mut(&seg.base_page).expect("singleton segment live");
+                assert!(s.len() <= kv_len, "flush cannot overshoot");
+                s.extend(std::iter::repeat(0u32).take(kv_len - s.len()));
+            }
+            // Mock segments are laid out as one continuous run (no layer
+            // interleave), so the prefix run is a single ref_ — the
+            // refcount distribution (prefix 2→1, suffix→0) is identical to
+            // the real per-layer run sequence in aggregate.
+            self.frees += 1;
+            assert!(self.segs.remove(&seg.base_page).is_some(), "refill of an unknown segment");
+            self.pool.ref_(KvSegment { base_page: seg.base_page, n_pages: prefix_pages as usize });
+            self.pool.free(seg);
+        }
+
+        fn unref_prefix(&mut self, base_page: u32, pages: u32) {
+            self.pool.unref(KvSegment { base_page: base_page as usize, n_pages: pages as usize });
+        }
+
         fn pool_stats(&self) -> KvPoolStats {
             self.pool.stats()
         }
@@ -1510,6 +1786,7 @@ mod tests {
             detok: Arc::new(|ids: &[u32]| {
                 ids.iter().map(|t| format!("T{t}")).collect::<Vec<_>>().join("")
             }),
+            prefix_cache_pages: 0, // off by default in tests; hit tests enable it
         }
     }
 
@@ -1821,5 +2098,105 @@ mod tests {
         assert_eq!(align_chunk_end(100, 100, 32), 100, "final chunk untouched");
         assert_eq!(align_chunk_end(5, 5, 32), 5, "short prompt untouched");
         assert_eq!(align_chunk_end(130, 120, 32), 120, "end capped at the prompt");
+    }
+
+    // ------------------------------------------------------------------
+    // P3-01/016: prefix-cache loop integration (mock executor)
+    // ------------------------------------------------------------------
+
+    /// 016 r2 D2/D3: one same-prompt request refills the cache; the next
+    /// identical request takes the hit path (`prefill_prefix_hit` +
+    /// adopt(start=0)) and complete conserving the pool (the cache keeps
+    /// exactly `L` prefix pages, everything else returns).
+    /// Drain a request's frames until the Done; returns the token count.
+    /// The frame channel must stay alive on the sending side (a dropped
+    /// receiver is the disconnect-abort path).
+    fn drain_done(frx: &mut tokio::sync::mpsc::Receiver<SchedFrame>) -> usize {
+        let mut n = 0;
+        loop {
+            match frx.blocking_recv() {
+                Some(SchedFrame::Token { .. }) => n += 1,
+                Some(SchedFrame::Done { .. }) => return n,
+                Some(SchedFrame::Error { message }) => panic!("request errored: {message}"),
+                None => panic!("channel closed before Done"),
+            }
+        }
+    }
+
+    /// Serve-style single-loop run: the loop lives on its own thread (one
+    /// cache for its lifetime); the test thread submits and drains.
+    fn loop_runner(
+        c: SchedLoopConfig,
+    ) -> (std_mpsc::Sender<SchedCmd>, std::thread::JoinHandle<(SchedOutcome, MockExecutor)>) {
+        let (tx, rx) = std_mpsc::channel::<SchedCmd>();
+        let h =
+            std::thread::spawn(move || SchedLoop::new(MockExecutor::new(200, 16), c, rx).finish());
+        (tx, h)
+    }
+
+    #[test]
+    fn prefix_cache_hit_refills_and_reuses() {
+        let mut c = cfg(16, 200, 2);
+        c.prefix_cache_pages = 16; // budgets ≫ L pages
+        c.chunk_size = 128; // single-chunk prefill (serve V1: chunk_size = max_model_len)
+        let prompt = (0..100).collect::<Vec<u32>>(); // L = floor(100/32) = 3 blocks
+        let (tx, h) = loop_runner(c);
+        // Request 1 (cold): refills the cache — L=3 pages stay owned.
+        let (_, mut frx1) = submit(&tx, prompt.clone(), 8, greedy());
+        drain_done(&mut frx1);
+        // Request 2 (warm): same prompt → the hit path.
+        let (_, mut frx2) = submit(&tx, prompt.clone(), 8, greedy());
+        drain_done(&mut frx2);
+        drop(tx);
+        let (out, exec) = h.join().unwrap();
+        assert_eq!(exec.cache_hits, 1, "the second request hits the cache");
+        assert_eq!(exec.pool.in_use(), 3, "cache owns exactly L pages, no leak");
+        assert_eq!(out.dispatched, out.returned, "dispatch/return conservation");
+        assert!(
+            out.trace.iter().any(|e| matches!(e.event, Event::MaxOutput | Event::Eos)),
+            "both requests terminate"
+        );
+        drop(frx1);
+        drop(frx2);
+    }
+
+    /// 016 r2 review #3 regression: same-key releases (identical prompts
+    /// after the first) must NOT accumulate references — an unbounded run
+    /// of same-prompt requests keeps `in_use == L` forever.
+    #[test]
+    fn prefix_cache_same_key_does_not_leak() {
+        let mut c = cfg(16, 200, 2);
+        c.prefix_cache_pages = 16;
+        c.chunk_size = 128; // single-chunk prefill (hits require one chunk)
+        let prompt = (0..100).collect::<Vec<u32>>();
+        let (tx, h) = loop_runner(c);
+        let mut frxs = Vec::new();
+        for _ in 0..5 {
+            let (_, mut frx) = submit(&tx, prompt.clone(), 8, greedy());
+            drain_done(&mut frx);
+            frxs.push(frx);
+        }
+        drop(tx);
+        let (_, exec) = h.join().unwrap();
+        assert_eq!(exec.cache_hits, 4, "requests 2..5 all hit");
+        assert_eq!(exec.pool.in_use(), 3, "steady state: L pages, no leak");
+        drop(frxs);
+    }
+
+    /// 016 r2 D2: abort release must NOT refill (plain free, no cache
+    /// growth) — an aborted request's segment is unreliable.
+    #[test]
+    fn prefix_cache_abort_does_not_refill() {
+        let mut c = cfg(16, 200, 2);
+        c.prefix_cache_pages = 16;
+        let prompt = (0..100).collect::<Vec<u32>>();
+        let (tx, h) = loop_runner(c);
+        let (tok, frx) = submit(&tx, prompt, 3, greedy());
+        let _frx = frx; // keep the receiver alive — the Abort command drives it
+        tx.send(SchedCmd::Abort { token: tok }).unwrap();
+        drop(tx);
+        let (_, exec) = h.join().unwrap();
+        assert_eq!(exec.cache_hits, 0);
+        assert_eq!(exec.pool.in_use(), 0, "no cached pages after the abort release");
     }
 }

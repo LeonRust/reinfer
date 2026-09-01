@@ -16,7 +16,17 @@
 //!   page table (li) = b + li*pp_req + j          (j in 0..pp_req)
 //! ```
 //!
-//! with `pp_req = ceil(req_len / block_len)`. The per-request page tables
+//! with `pp_req = ceil(req_len / block_len)`. **NOTE (2026-09-01)**: the
+//! *current* scheduler allocates every request segment at the **full window**
+//! size (`n_layer × ceil(max_kv/block_len)`, see bin/reinfer sched_loop
+//! `alloc_segment` → `window_pages()`), so the layer stride in practice is
+//! the full-window `pp` — every segment carries layered "tail holes"
+//! (pp − pp_req unused pages per layer). This module's suggestion below is
+//! the prospective per-request-len mapping (a future refinement); do not
+//! implement against `pp_req` while consumers compute layer offsets with
+//! the full-window `pp` (the identity table `li*pp + j` contract).
+//!
+//! The per-request page tables
 //! replace the engine's static identity table; `kv_write` then receives
 //! `phys = seg_base + li*pp_req + lp` per (request, layer) — the wiring is
 //! the scheduler-executor wave's job (this crate only hands out segments).
@@ -290,8 +300,7 @@ impl KvSegmentPool {
         }
         // First run (from the back) that fits — the anchor prefers the very
         // end of the pool.
-        let Some((idx, _)) =
-            self.free.iter().enumerate().rev().find(|(_, r)| r.len >= n_pages)
+        let Some((idx, _)) = self.free.iter().enumerate().rev().find(|(_, r)| r.len >= n_pages)
         else {
             return Err(MemoryError::OutOfPages { need: n_pages, free: self.free_count() });
         };

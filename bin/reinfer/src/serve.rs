@@ -194,6 +194,12 @@ mod backend {
                     let tok = Arc::clone(&tokenizer);
                     Arc::new(move |ids: &[u32]| tok.decode_all(ids))
                 },
+                // 016 r2: prefix cache (P3-01 v1) — on by default;
+                // REINFER_PREFIX_CACHE_PAGES overrides the 10%-of-pool budget.
+                prefix_cache_pages: crate::sched_loop::prefix_cache_pages_env(
+                    kv_pages,
+                    crate::sched_loop::prefix_cache_env_on(),
+                ),
             };
             let window = sched_cfg.window_pages();
             let admit_cap = sched_cfg.admit_cap();

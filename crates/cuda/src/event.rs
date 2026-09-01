@@ -1,7 +1,10 @@
 //! CUDA 事件（L1 T2；feature `cuda` 门控）。
 //!
-//! 事件以 `CU_EVENT_BLOCKING_SYNC` 创建：默认 `CU_EVENT_DISABLE_TIMING`
-//! 事件调用 `cudaEventSynchronize` 不会阻塞 CPU——见 009 评审 B#4。
+//! 事件以 `cudaEventBlockingSync` 创建：`cudaEventSynchronize` 阻塞 CPU 至
+//! 本事件完成；**未设** `cudaEventDisableTiming` → 事件记录计时，`elapsed_ms`
+//! 可用（S1-2 decode 步 profile 探针的基础原语——event.rs 常量此前误用
+//! 运行时 API 值 0x2（= `cudaEventDisableTiming`），导致计时不可用、
+//! 阻塞语义从未生效；按 13.2 头文件 `driver_types.h` 修正为 0x1）。
 //! `Drop` 兜底 = 先 `synchronize`（**仅等待本事件**，非设备级全同步）再 `destroy`。
 
 use cudarc::runtime::sys;
@@ -10,8 +13,9 @@ use reinfer_core::DeviceId;
 use crate::error::{LaunchError, event_query_status, from_runtime_error};
 use crate::stream::CudaStream;
 
-/// `CU_EVENT_BLOCKING_SYNC = 0x2`（cudarc sys 未导出 CUDA 头常量，本地定义；源自 cudaEventCreateWithFlags 文档）。
-pub const CU_EVENT_BLOCKING_SYNC: u32 = 0x2;
+/// `cudaEventBlockingSync = 0x1`（cudarc sys 未导出 CUDA 头常量，本地定义；
+/// 值源 `driver_types.h`——0x2 为 `cudaEventDisableTiming`，勿混用）。
+pub const CU_EVENT_BLOCKING_SYNC: u32 = 0x1;
 
 /// 事件（记录在流上、轮询/阻塞其完成）。
 #[derive(Debug)]
@@ -45,6 +49,19 @@ impl CudaEvent {
     /// 非阻塞完成态：`Ok(true)` 已完成 / `Ok(false)` 未完成（600 特判）/ `Err` 真错误（白名单）。
     pub fn query(&self) -> Result<bool, LaunchError> {
         event_query_status(unsafe { sys::cudaEventQuery(self.raw) } as i32)
+    }
+
+    /// 本事件到 `end` 的流上耗时（毫秒）。两个事件必须已 record 到同一流
+    /// （或同一流依赖链）且均已完成；`end` 必须晚于 `self`。计时可用性：
+    /// 事件以 `CU_EVENT_BLOCKING_SYNC` 创建（未设 `CU_EVENT_DISABLE_TIMING`），
+    /// 故 elapsed 有效——S1-2 decode 步 profile 探针的基础原语。
+    pub fn elapsed_ms(&self, end: &CudaEvent) -> Result<f32, LaunchError> {
+        let mut ms: f32 = 0.0;
+        // SAFETY: 两个事件句柄有效且已 record（驱动侧校验先后关系）。
+        unsafe { sys::cudaEventElapsedTime(&mut ms, self.raw, end.raw) }
+            .result()
+            .map_err(from_runtime_error)?;
+        Ok(ms)
     }
 
     /// 所属设备。
@@ -101,5 +118,17 @@ mod ffi_tests {
         evt.record(&stream).expect("record");
         stream.synchronize().expect("sync stream");
         drop(evt); // BlockingSync 兜底同步 + 销毁，不挂起
+    }
+
+    #[test]
+    fn elapsed_between_two_recorded_events() {
+        let (_ctx, stream) = setup();
+        let a = CudaEvent::new(DeviceId::new(0)).expect("event a");
+        let b = CudaEvent::new(DeviceId::new(0)).expect("event b");
+        a.record(&stream).expect("record a");
+        b.record(&stream).expect("record b");
+        stream.synchronize().expect("sync stream");
+        let ms = a.elapsed_ms(&b).expect("elapsed");
+        assert!(ms >= 0.0, "elapsed must be non-negative, got {ms}");
     }
 }

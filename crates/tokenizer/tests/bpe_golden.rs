@@ -28,12 +28,8 @@ fn bpe_encode_matches_goldens_100() {
 
     for item in doc["items"].as_array().unwrap() {
         let text = item["text"].as_str().unwrap();
-        let expect_ids: Vec<u32> = item["ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap() as u32)
-            .collect();
+        let expect_ids: Vec<u32> =
+            item["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
         let got_ids = tok.encode(text, false).unwrap();
         assert_eq!(got_ids, expect_ids, "encode mismatch for {text:?}");
         // decode roundtrip must reproduce the text (llama-side too).

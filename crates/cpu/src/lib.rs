@@ -88,7 +88,8 @@ pub fn generate(
 ) -> Result<Generation, RunError> {
     if temperature != 0.0 {
         return Err(RunError::UnsupportedDtype(
-            "temperature > 0 sampling not wired (record: 012 sampler host pipeline lies ahead)".into(),
+            "temperature > 0 sampling not wired (record: 012 sampler host pipeline lies ahead)"
+                .into(),
         ));
     }
 

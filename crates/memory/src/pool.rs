@@ -111,10 +111,7 @@ impl PagePool {
     pub fn alloc_tokens(&mut self, tokens: usize) -> Result<PageTable, MemoryError> {
         let pages_needed = tokens.div_ceil(self.block_slots);
         if pages_needed > self.free.len() {
-            return Err(MemoryError::OutOfPages {
-                need: pages_needed,
-                free: self.free.len(),
-            });
+            return Err(MemoryError::OutOfPages { need: pages_needed, free: self.free.len() });
         }
         let mut pages = Vec::with_capacity(pages_needed);
         for _ in 0..pages_needed {
@@ -205,10 +202,7 @@ mod tests {
     #[test]
     fn out_of_pages_errors() {
         let mut pool = PagePool::new(BlockLen::B16, 1);
-        assert_eq!(
-            pool.alloc_tokens(32),
-            Err(MemoryError::OutOfPages { need: 2, free: 1 })
-        );
+        assert_eq!(pool.alloc_tokens(32), Err(MemoryError::OutOfPages { need: 2, free: 1 }));
     }
 
     #[test]

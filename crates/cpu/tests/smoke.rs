@@ -1,6 +1,6 @@
 //! 007 T2 / 014 T9 smoke: CPU 全链路（REINFER_MODEL_GGUF env 注入）。
 #![allow(clippy::unwrap_used)]
-use reinfer_cpu::{generate, Model};
+use reinfer_cpu::{Model, generate};
 use reinfer_gguf::GgufReader;
 use reinfer_tokenizer::Tokenizer;
 

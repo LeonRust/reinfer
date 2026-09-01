@@ -138,6 +138,37 @@ extern "C" __global__ void rope_neox_f16(unsigned short* __restrict__ x,
     }
 }
 
+// Batched half-split RoPE (NEOX) with optional element scale — one block per
+// head row. Replaces the q_heads+kv_heads per-head `rope_neox_f16` launches
+// plus the separate `scale_f16` pass (S1-2 launch-count wave): per layer the
+// decode step drops 32 rope launches + 1 scale launch to 2 launches.
+//
+// Bit-identical to the original two-pass sequence:
+//   rope writes f32_to_hbits(v1); scale reads hbits_to_f32(that) * scale and
+//   rounds again — the fused kernel applies exactly that rounding order
+//   (round rope result to f16, widen, multiply, round to f16). For scale=1.0
+//   (k heads are not scaled) the f16 rounding is idempotent, so the result
+//   is bit-identical to plain rope.
+extern "C" __global__ void rope_heads_f16(unsigned short* __restrict__ x,
+                                          int heads, int half, int pos,
+                                          float eta, float scale) {
+    int p = threadIdx.x;
+    if (p >= half) {
+        return;
+    }
+    int row = blockIdx.x;
+    unsigned short* xr = x + (size_t)row * 2 * half;
+    // Same theta formula as rope_neox_f16 (full-dimension frequency denominator).
+    float theta = (float)pos * powf(eta, -2.f * (float)p / (2.f * (float)half));
+    float c = cosf(theta), s = sinf(theta);
+    float a = hbits_to_f32(xr[p]);
+    float b = hbits_to_f32(xr[p + half]);
+    float v1 = a * c - b * s;
+    float v2 = a * s + b * c;
+    xr[p] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v1)) * scale);
+    xr[p + half] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v2)) * scale);
+}
+
 // out = out + x（f16 bits；残差加——x 为 attn/ffn 输出，out 为层跳线）。
 extern "C" __global__ void add_f16_to_f16(unsigned short* __restrict__ out,
                                           const unsigned short* __restrict__ x,
@@ -147,6 +178,23 @@ extern "C" __global__ void add_f16_to_f16(unsigned short* __restrict__ out,
         return;
     }
     float v = hbits_to_f32(out[i]) + hbits_to_f32(x[i]);
+    out[i] = f32_to_hbits(v);
+}
+
+// Fused f32 -> f16 cast + residual add: out[i] = out[i] + f16(x[i]).
+// Replaces the `cast_f32_to_f16` (diff_kernels.cu) + `add_f16_to_f16`
+// two-launch sequence at the o-projection and ffn residuals (S1-2 wave).
+//
+// Bit-identical: the cast kernel writes f32_to_hbits(x[i]); the add kernel
+// computes f32_to_hbits(hbits_to_f32(out[i]) + hbits_to_f32(that)) — the
+// fused kernel evaluates the same expression with the same rounding order.
+extern "C" __global__ void add_cast_f16(unsigned short* __restrict__ out,
+                                        const float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float v = hbits_to_f32(out[i]) + hbits_to_f32(f32_to_hbits(x[i]));
     out[i] = f32_to_hbits(v);
 }
 
@@ -163,6 +211,88 @@ extern "C" __global__ void swiglu_f16(const unsigned short* __restrict__ gate,
     float u = hbits_to_f32(up[i]);
     float silu = g / (1.f + expf(-g));
     out[i] = f32_to_hbits(silu * u);
+}
+
+// ---------------------------------------------------------------------------
+// S1-4: fused FFN micro-kernels (006-2 T4 ②①) — bit-identical replacements
+// for the split sequences they replace (the same f16 round/widen/round
+// ordering order, by construction):
+//   - fused_cast_swiglu_f16: cast_f32_to_f16(gate) + cast_f32_to_f16(up) +
+//     swiglu_f16 -> one launch (3 -> 1); the gate/up GEMM f32 outputs come
+//     in, the f16 SiLU-GLU product goes out (the two f16 intermediate
+//     buffers are skipped).
+//   - fused_add_rms_f16: add_cast_f16 + rms_norm_row_f16 -> one launch
+//     (2 -> 1) for the o-projection residual followed by the FFN RMSNorm;
+//     the residual stream x is still updated in place (the ffn down
+//     residual add re-reads it later in the layer).
+// ---------------------------------------------------------------------------
+
+// Fused f32 -> f16 cast + SiLU-GLU: out[i] = f16(silu(g16) * u16), where
+// g16/u16 are the RNE f16 roundings of the gate/up GEMM outputs. Replaces
+// cast_f32_to_f16 (gate), cast_f32_to_f16 (up), swiglu_f16 (3 launches ->
+// 1). Bit-identical: the casts write f32_to_hbits(x); swiglu reads those
+// bits widened to f32, computes silu(g)*u in f32 and rounds once — the
+// fused kernel evaluates the same expression with the same rounding order.
+extern "C" __global__ void fused_cast_swiglu_f16(const float* __restrict__ gate,
+                                                 const float* __restrict__ up,
+                                                 unsigned short* __restrict__ out,
+                                                 int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float g = hbits_to_f32(f32_to_hbits(gate[i]));
+    float u = hbits_to_f32(f32_to_hbits(up[i]));
+    float silu = g / (1.f + expf(-g));
+    out[i] = f32_to_hbits(silu * u);
+}
+
+// Fused residual add + RMSNorm row (single block 256; n <= 1024):
+//   x[i] = f16(f32(x[i]) + f16(c[i]))   (in place — same bits as add_cast)
+//   out[i] = f16(f32(x'[i]) * rsqrtf(mean(x'^2) + eps) * w[i])   (same as rms)
+// Replaces add_cast_f16 + rms_norm_row_f16 (2 launches -> 1). Bit-identical:
+// each element's f16-rounded sum is cached in registers, so the mean-square
+// pass and the normalize pass read exactly the stored f16 bits, in the same
+// per-thread iteration order as the split kernels.
+extern "C" __global__ void fused_add_rms_f16(unsigned short* __restrict__ x,
+                                             const float* __restrict__ c,
+                                             unsigned short* __restrict__ out,
+                                             const unsigned short* __restrict__ w,
+                                             int n, float eps) {
+    int tid = threadIdx.x;
+    __shared__ float s_sh[256];
+    // Fused sum with the f16 rounding of the add_cast write (round addend to
+    // f16, add in f32, round the sum to f16); keep the widened f16 values for
+    // the rms passes (identical to the rms kernel re-reading the stored bits).
+    float v[4]; // n <= 1024, 256 threads -> at most 4 elements per thread
+    int cnt = 0;
+    for (int i = tid; i < n; i += 256) {
+        float sum = hbits_to_f32(x[i]) + hbits_to_f32(f32_to_hbits(c[i]));
+        unsigned short v16 = f32_to_hbits(sum);
+        x[i] = v16;
+        v[cnt++] = hbits_to_f32(v16);
+    }
+    float s = 0.f;
+    for (int k = 0; k < cnt; ++k) {
+        s += v[k] * v[k];
+    }
+    s_sh[tid] = s;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) {
+            s_sh[tid] += s_sh[tid + st];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float mean_sq = s_sh[0] / (float)n;
+        s_sh[0] = rsqrtf(mean_sq + eps);
+    }
+    __syncthreads();
+    float rstd = s_sh[0];
+    for (int i = tid, k = 0; i < n; i += 256, ++k) {
+        out[i] = f32_to_hbits(v[k] * rstd * hbits_to_f32(w[i]));
+    }
 }
 
 // KV 行写：把当前 token 的 K 行（[kv_heads*d]）与 V 行写进页布局。
@@ -203,4 +333,43 @@ extern "C" __global__ void gather_row(const unsigned short* __restrict__ src,
     if (i < n) {
         dst[i] = src[(size_t)row * n + i];
     }
+}
+
+// ---------------------------------------------------------------------------
+// 014 S0-3b: parity-f32 criterion tier — f32 variants of the dense small
+// kernels (activations in f32; weights are the f16-valued tensors expanded to
+// f32 at load, so the values match the f16 channel bit for bit).
+// ---------------------------------------------------------------------------
+
+// embed 行拷贝（f32 目的；src 为 parity 档 f32 embed）。
+extern "C" __global__ void gather_row_f32(const float* __restrict__ src,
+                                          float* __restrict__ dst,
+                                          int row, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[(size_t)row * n + i];
+    }
+}
+
+// 元素缩放：x[i] *= scale（f32；注意力 score 的 1/sqrt(d) 缩放点）。
+extern "C" __global__ void scale_f32(float* __restrict__ x, int n, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = x[i] * scale;
+    }
+}
+
+// SiLU-GLU：out[i] = silu(gate[i]) * up[i]（f32；与 swiglu_f16 同数学）。
+extern "C" __global__ void swiglu_f32(const float* __restrict__ gate,
+                                      const float* __restrict__ up,
+                                      float* __restrict__ out,
+                                      int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float g = gate[i];
+    float u = up[i];
+    float silu = g / (1.f + expf(-g));
+    out[i] = silu * u;
 }

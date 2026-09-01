@@ -1,6 +1,9 @@
 # Plan: scheduler + OpenAI-compatible serving
 
 > Derived from specs/005-scheduler-serving/spec.md · 设计报告 D2 为进程模型依据（review 修正引用）
+> Performance baseline: docs/design/benchmark-gap-2026-08-29.md（Wave-2 targets；zh-CN 并存）
+> Note: scheduler crate 当前为空壳（2 行）；本 spec 的 continuous batching/chunked prefill/
+> token-budget admission/req_id 确定性即为 vLLM 对标件（对比门禁 P1: decode ≥85% SGLang）。
 
 ## Architecture Decisions
 
@@ -25,6 +28,7 @@
 - **D6 观测**：tick 采样 + metrics（OTel）+ tracing + collect_env。
 - **D7 抢占（重算语义）**：victim 选择 = 最新/最低优先级；释放全部块（refcount-1，共享块保留）→ 状态 `Preempted`（仅记录，无独立资源）→ 回 waiting 队首；恢复时 Prefill 从头（cached=0）；swap 换页 = RFC（event 纪律 + refcount==1 + H2D 同步要求见 RFC 初案）。
 - **D8 状态机唯一账目**：双游标（cached_len/device_len）派生 chunk；`Preempted` 为状态标记；stop 匹配在调度层做（每请求增量缓冲 + 部分匹配状态，无歧义延迟 ≤1 步）。
+- **D9 前缀缓存（prefix cache）接口边界（追加决策，2026-08-29 gap 审计——基准 G8）**：本 spec 级承诺 = **页表设计不得做成破坏前缀复用结构的形态**（防 P3-01 返工的核心约束）+ 方法签名**草稿**（非"定死"）：`lookup_prefix(ids) -> Option<Vec<PageRef>>`（键=请求 token 前缀，规范化哈希）与 `refill_prefix(ids, pages)`（页表段登记/引用）。命中后的可见性、refcount、释放沿用 D1 单线程突变 + D8 恰一次释放/共用守卫；不破坏"先分配、后释放"与 D7 重算语义（victim 长驻前缀页的 budget/refcount 口径具体化留至 P3-01——**本决策不提前承诺**）。确定性前提（补记）：「前缀命中（仅算后缀）与全量重跑（算整段）bit-identical」要求**计算部分 launch 配置一致**，且确定性测试须覆盖 warm-cache 重跑。数据/策略（Radix 树、LRU/自驱逐）= P3-01；接口经过期若 P3-01 评估不符合（如页表 v2 换型）允许以新决策修订 D9——**不做"此刻定死"承诺**。005 spec Non-Goals 的 "RadixCache(P3)" 表述与本决策兼容（接口留缝，非实现前置）。
 
 ## Module Breakdown
 

@@ -13,6 +13,7 @@ reinfer-arch = { workspace = true }
 reinfer-safetensors = { workspace = true }
 serde_json = { workspace = true }
 cudarc = { workspace = true, optional = true }
+libloading = "0.9"
 
 [features]
 default = ["cuda"]  # 跑 reinfer-cuda 即默认 CUDA；无 CUDA 工具链机器 build 本 crate 报错（不静默）

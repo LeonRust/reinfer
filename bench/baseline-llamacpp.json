@@ -1,0 +1,57 @@
+{
+  "task": "T0 llamacpp CUDA reference (0.85x gate baseline)",
+  "date": "2026-08-29",
+  "commit": "f280b26983ad0fdb705a0d9ebf0503e76f2899b0",
+  "commit_desc": "metal : per-device tuned (Q, NE) for flash-attn vec (#26570)",
+  "build": {
+    "source": "/home/dora/Dev/ai-tokens/llama.cpp",
+    "build_dir": "/home/dora/Dev/ai-tokens/bench-tmp-llamacpp/build-cuda",
+    "flags": {
+      "GGML_CUDA": "ON",
+      "CMAKE_CUDA_COMPILER": "/usr/local/cuda-13.2/bin/nvcc",
+      "CMAKE_CUDA_ARCHITECTURES": "120 (resolved to 120a)",
+      "GGML_NATIVE": "OFF",
+      "CMAKE_BUILD_TYPE": "Release",
+      "CUDAToolkit_ROOT": "/usr/local/cuda-13.2 (cublas 13.3.0.5; verified DT_NEEDED libcublas.so.13)"
+    },
+    "note": "Initial build accidentally linked cudart/cublas 12.6 (via /usr/local/cuda symlink, cmake FindCUDAToolkit cache). Rebuilt fresh with CUDAToolkit_ROOT=13.2 + preset lib vars; readelf-verified libcudart.so.13/libcublas.so.13. Runtime difference was nil (350 tok/s both ways)."
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090 Laptop GPU (sm_120a, compute capability 12.0)",
+    "vram": "23983 MiB",
+    "driver": "595.84",
+    "mem_bw": "~896 GB/s (256-bit GDDR7 @ 28 Gbps) — laptop variant, NOT desktop 1.79 TB/s",
+    "observed": "SM 1.4-1.5 GHz, mem 14001 MHz, ~95 W, util 98% during run"
+  },
+  "model": {
+    "name": "Qwen/Qwen3-0.6B",
+    "source": "~/.reinfer/models/Qwen/Qwen3-0.6B (safetensors)",
+    "gguf": "/home/dora/Dev/ai-tokens/bench-tmp-llamacpp/Qwen3-0.6B-f16.gguf",
+    "gguf_sha256": "d04bceb664d484eaf134cdbc63745f5241bea80132c458e61c9449f488fe2abc",
+    "gguf_size_bytes": 1509347584,
+    "quant": "F16",
+    "params": "751.63 M",
+    "converted_with": "convert_hf_to_gguf.py @ f280b2698, venv /home/dora/Dev/ai-tokens/bench-vs-vllm/.venv/bin/python (torch 2.13.0+cu130), --outtype f16"
+  },
+  "bench_cmd": "/home/dora/Dev/ai-tokens/bench-tmp-llamacpp/build-cuda/bin/llama-bench -m Qwen3-0.6B-f16.gguf -b 1 -n 512 -fa 1 -ngl 99 -r 5",
+  "result_tg512": {
+    "unit": "tok/s, single-stream decode (tg512, n_batch=1, flash attn, ngl=99)",
+    "r5_mean": 349.84,
+    "r5_stddev": 3.35,
+    "runs_5x_r1": [355.41, 352.70, 352.77, 352.17, 351.49],
+    "median_5": 352.70,
+    "pp512_r5": "345.17 +- 9.88 (n_batch=1 prompt = same single-token GEMM path, as expected)"
+  },
+  "sanity": {
+    "expected_band": "400-900 tok/s",
+    "measured": 352.70,
+    "verdict": "BELOW band — band assumes desktop RTX 5090 (1.79 TB/s). This machine is the Laptop variant (~896 GB/s). fp16 weights 1.50 GB/step -> BW ceiling ~596 tok/s; measured 352.70 = 59% of ceiling, consistent across 3 independent runs (349.8/350.6/350.0) and 5 single runs (spread 1.1%). Credible honest number; band is unachievable on this hardware."
+  },
+  "gate_math": {
+    "reference_tok_s": 352.70,
+    "engine_target_0_85x": 299.8,
+    "reinfer_current_single_stream": 11,
+    "gap": "27.3x speedup needed; current = 3.1% of reference"
+  },
+  "raw_output_tail": "| qwen3 0.6B F16 | 1.40 GiB | 751.63 M | CUDA | 99 | 1 | 1 | tg512 | 349.84 +- 3.35 |\nbuild: f280b2698 (10615)"
+}

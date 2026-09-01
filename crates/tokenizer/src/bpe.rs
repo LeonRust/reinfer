@@ -189,12 +189,10 @@ impl BpeTokenizer {
         tok: &serde_json::Value,
         cfg: &serde_json::Value,
     ) -> Result<Self, TokenizerError> {
-        let model = tok
-            .get("model")
-            .ok_or_else(|| TokenizerError::InvalidMetadata {
-                key: "tokenizer.json".into(),
-                why: "missing model section".into(),
-            })?;
+        let model = tok.get("model").ok_or_else(|| TokenizerError::InvalidMetadata {
+            key: "tokenizer.json".into(),
+            why: "missing model section".into(),
+        })?;
         if model.get("type").and_then(|t| t.as_str()) != Some("BPE") {
             return Err(TokenizerError::UnsupportedModel {
                 model: model
@@ -213,10 +211,8 @@ impl BpeTokenizer {
 
         // pieces 按 id 定位（缺口留空；ids 稀疏时以最大 id 为界）
         let mut pieces: Vec<String> = Vec::new();
-        let mut text_to_id_probe: Vec<(String, u64)> = vocab
-            .iter()
-            .filter_map(|(t, id)| id.as_u64().map(|i| (t.clone(), i)))
-            .collect();
+        let mut text_to_id_probe: Vec<(String, u64)> =
+            vocab.iter().filter_map(|(t, id)| id.as_u64().map(|i| (t.clone(), i))).collect();
         text_to_id_probe.sort_by_key(|(_, i)| *i);
         for (t, i) in &text_to_id_probe {
             let i = *i as usize;
@@ -246,8 +242,18 @@ impl BpeTokenizer {
             if pieces[id].is_empty() {
                 pieces[id] = content.to_string();
             }
+            // HF semantics: EVERY added_tokens entry is matched as a whole
+            // unit while tokenizing (the `special` flag only controls match
+            // normalization, not matching itself). Non-special added tokens
+            // (`<think>`/`<tool_response>` in Qwen3, etc.) must therefore be
+            // USER_DEFINED — the GGUF/llama.cpp convention for added tokens —
+            // so partition() matches them whole instead of BPE-splitting them.
+            // Splitting `<think>` changed the prompt and derailed greedy into
+            // a non-EOS loop (014 D8).
             if a.get("special").and_then(|s| s.as_bool()).unwrap_or(false) {
                 types[id] = TYPE_CONTROL;
+            } else {
+                types[id] = TYPE_USER_DEFINED;
             }
         }
 
@@ -258,10 +264,7 @@ impl BpeTokenizer {
                 m.iter()
                     .filter_map(|pr| {
                         pr.as_array().map(|p| {
-                            p.iter()
-                                .filter_map(|s| s.as_str())
-                                .collect::<Vec<&str>>()
-                                .join(" ")
+                            p.iter().filter_map(|s| s.as_str()).collect::<Vec<&str>>().join(" ")
                         })
                     })
                     .collect()
@@ -276,9 +279,7 @@ impl BpeTokenizer {
             if v.is_null() {
                 return Ok(None);
             }
-            let text = v
-                .as_str()
-                .or_else(|| v.get("content").and_then(|c| c.as_str()));
+            let text = v.as_str().or_else(|| v.get("content").and_then(|c| c.as_str()));
             let Some(text) = text else {
                 return Err(TokenizerError::InvalidMetadata {
                     key: format!("tokenizer_config.json {name}"),
@@ -674,8 +675,7 @@ fn scan_fragment(chars: &[char], pos: usize, n: usize) -> (usize, bool) {
     // A: '(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])
     if pos + 1 < n && chars[pos] == '\'' {
         let c2 = chars[pos + 1];
-        let ok2 =
-            matches!(c2, 's' | 'S' | 't' | 'T' | 'm' | 'M' | 'd' | 'D');
+        let ok2 = matches!(c2, 's' | 'S' | 't' | 'T' | 'm' | 'M' | 'd' | 'D');
         let ok3 = pos + 3 <= n
             && matches!(c2, 'r' | 'R' | 'v' | 'V' | 'l' | 'L')
             && matches!(chars[pos + 2], 'e' | 'E');
@@ -721,11 +721,7 @@ fn scan_fragment(chars: &[char], pos: usize, n: usize) -> (usize, bool) {
             k += 1;
         }
         let start = k;
-        while k < n
-            && !is_cpt_ws(chars[k])
-            && !is_cpt_letter(chars[k])
-            && !is_cpt_digit(chars[k])
-        {
+        while k < n && !is_cpt_ws(chars[k]) && !is_cpt_letter(chars[k]) && !is_cpt_digit(chars[k]) {
             k += 1;
         }
         if k > start {

@@ -22,7 +22,7 @@ mod gpu {
     use cudarc::cublas::sys as blas;
     use reinfer_core::DeviceId;
     use reinfer_cuda::gemm::{Gemm, GpuMat};
-    use reinfer_cuda::{copy, CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef};
+    use reinfer_cuda::{CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef, copy};
     use reinfer_gguf::codes::f16_to_f32;
     use reinfer_kernels::refs::matmul_ref;
     use std::ffi::c_void;
@@ -119,9 +119,13 @@ mod gpu {
         let amat = mat(a_dev.as_ptr() as *mut c_void, a_dtype, k as i32);
         let bmat = mat(b_dev.as_ptr() as *mut c_void, a_dtype, n as i32); // B^T [n x k] col-major -> leading dim = n
         let r = if compute16 {
-            blas.gemm_f16_16acc(stream, m as i32, n as i32, k as i32, &amat, &bmat, &mut cmat, 1.0, 0.0)
+            blas.gemm_f16_16acc(
+                stream, m as i32, n as i32, k as i32, &amat, &bmat, &mut cmat, 1.0, 0.0,
+            )
         } else {
-            blas.gemm_f32acc(stream, m as i32, n as i32, k as i32, &amat, &bmat, &mut cmat, 1.0, 0.0)
+            blas.gemm_f32acc(
+                stream, m as i32, n as i32, k as i32, &amat, &bmat, &mut cmat, 1.0, 0.0,
+            )
         };
         r.unwrap();
         stream.synchronize().unwrap();
@@ -173,8 +177,20 @@ mod gpu {
             let b_raw: Vec<u8> = b16.iter().flat_map(|v| v.to_le_bytes()).collect();
             let da = upl(dev, &a_raw);
             let db = upl(dev, &b_raw);
-            let got = run_gemm_f32acc(dev, &blas, &stream, m, n, k, &da, &db,
-                blas::cudaDataType_t::CUDA_R_16F, m, n, false);
+            let got = run_gemm_f32acc(
+                dev,
+                &blas,
+                &stream,
+                m,
+                n,
+                k,
+                &da,
+                &db,
+                blas::cudaDataType_t::CUDA_R_16F,
+                m,
+                n,
+                false,
+            );
             assert_rtol_atol(&got, &want, 1e-4, 1e-6);
 
             // f32-in/f32-out
@@ -185,8 +201,20 @@ mod gpu {
             let bf_raw: Vec<u8> = bf.iter().flat_map(|v| v.to_le_bytes()).collect();
             let daf = upl(dev, &af_raw);
             let dbf = upl(dev, &bf_raw);
-            let gotf = run_gemm_f32acc(dev, &blas, &stream, m, n, k, &daf, &dbf,
-                blas::cudaDataType_t::CUDA_R_32F, m, n, false);
+            let gotf = run_gemm_f32acc(
+                dev,
+                &blas,
+                &stream,
+                m,
+                n,
+                k,
+                &daf,
+                &dbf,
+                blas::cudaDataType_t::CUDA_R_32F,
+                m,
+                n,
+                false,
+            );
             assert_rtol_atol(&gotf, &wantf, 1e-4, 1e-6);
         }
 
@@ -202,8 +230,20 @@ mod gpu {
             let b_raw: Vec<u8> = b16.iter().flat_map(|v| v.to_le_bytes()).collect();
             let da = upl(dev, &a_raw);
             let db = upl(dev, &b_raw);
-            let got = run_gemm_f32acc(dev, &blas, &stream, m, n, k, &da, &db,
-                blas::cudaDataType_t::CUDA_R_16F, m, n, false);
+            let got = run_gemm_f32acc(
+                dev,
+                &blas,
+                &stream,
+                m,
+                n,
+                k,
+                &da,
+                &db,
+                blas::cudaDataType_t::CUDA_R_16F,
+                m,
+                n,
+                false,
+            );
             assert_rtol_atol(&got, &want, 1e-4, 1e-6);
         }
     }
@@ -227,8 +267,20 @@ mod gpu {
         let b_raw: Vec<u8> = b16.iter().flat_map(|v| v.to_le_bytes()).collect();
         let da = upl(dev, &a_raw);
         let db = upl(dev, &b_raw);
-        let got = run_gemm_f32acc(dev, &blas, &stream, m, n, k, &da, &db,
-            blas::cudaDataType_t::CUDA_R_16F, m, n, true);
+        let got = run_gemm_f32acc(
+            dev,
+            &blas,
+            &stream,
+            m,
+            n,
+            k,
+            &da,
+            &db,
+            blas::cudaDataType_t::CUDA_R_16F,
+            m,
+            n,
+            true,
+        );
         let mut max_rel = 0.0f32;
         let mut over_1e_1 = 0usize;
         for (g, w) in got.iter().zip(want.iter()) {
@@ -239,8 +291,7 @@ mod gpu {
             }
         }
         // 声明（r1）：16F-acc 为记录项；rel ≤1e-1 为文档声明（低于此即常态）
-        eprintln!("16F-acc record: max rel {max_rel:e}, over 1e-1: {over_1e_1}/{}",
-            got.len());
+        eprintln!("16F-acc record: max rel {max_rel:e}, over 1e-1: {over_1e_1}/{}", got.len());
         assert!(
             max_rel <= 1e-1,
             "16F-acc record: max rel {max_rel:e} — unexpected, record-sample broke declared bound"

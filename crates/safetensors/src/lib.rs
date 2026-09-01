@@ -118,11 +118,7 @@ impl<'a> SafeFile<'a> {
         let shape = v
             .get("shape")
             .and_then(|s| s.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_u64())
-                    .collect::<Vec<u64>>()
-            })
+            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect::<Vec<u64>>())
             .unwrap_or_default();
         Ok(TensorView { dtype, shape, bytes: &self.data[s..e] })
     }
@@ -194,10 +190,7 @@ mod tests {
         assert_eq!(t.dtype, StDtype::F32);
         assert_eq!(t.shape, vec![2, 2]);
         assert_eq!(t.bytes.len(), 16);
-        assert_eq!(
-            f32::from_le_bytes(t.bytes[4..8].try_into().unwrap()),
-            2.0
-        );
+        assert_eq!(f32::from_le_bytes(t.bytes[4..8].try_into().unwrap()), 2.0);
         assert!(f.tensor("x").is_err());
     }
 

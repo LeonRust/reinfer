@@ -8,7 +8,7 @@
 
 #![allow(clippy::unwrap_used)] // 测试断言崩溃即失败
 
-use reinfer_arch::llama::{from_hf_config, Architecture, RopeType};
+use reinfer_arch::llama::{Architecture, RopeType, from_hf_config};
 
 fn load() -> serde_json::Value {
     let dir = std::env::var("REINFER_MODEL_DIR").expect("REINFER_MODEL_DIR env-gated");

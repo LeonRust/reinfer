@@ -1106,6 +1106,7 @@ dependencies = [
  "reinfer-core",
  "reinfer-cuda",
  "reinfer-jit",
+ "reinfer-kernels",
  "reinfer-models",
  "reinfer-safetensors",
  "reinfer-samplers",
@@ -1156,6 +1157,7 @@ name = "reinfer-cuda"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "libloading",
  "reinfer-arch",
  "reinfer-core",
  "reinfer-gguf",
@@ -1201,7 +1203,11 @@ dependencies = [
 name = "reinfer-kernels"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "reinfer-core",
+ "reinfer-samplers",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

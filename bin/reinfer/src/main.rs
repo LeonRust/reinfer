@@ -466,7 +466,13 @@ fn cmd_run(a: RunArgs, vlog: &Verbosity) -> i32 {
         }
     };
     let max_len = a.max_model_len.unwrap_or(cfg.ctx_len);
-    let eos = cfg.eos_id;
+    // EOS 优先级：generation_config.json > config.json > 模型族兜底（014 D8）；
+    // tokenizer eos 兜底在 cmd_run_cuda 载入 tokenizer 后生效（见下）。
+    let gen_cfg: serde_json::Value = std::fs::read(dir.join("generation_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let eos = reinfer_arch::llama::resolve_eos(&cfg_val, Some(&gen_cfg), None);
 
     match a.backend {
         Backend::Ascend => {
@@ -474,7 +480,9 @@ fn cmd_run(a: RunArgs, vlog: &Verbosity) -> i32 {
             return 2;
         }
         Backend::Cpu => {
-            eprintln!("reinfer: backend=cpu not implemented yet (007 立项后接线; cuda first per user)");
+            eprintln!(
+                "reinfer: backend=cpu not implemented yet (007 立项后接线; cuda first per user)"
+            );
             return 2;
         }
         Backend::Cuda | Backend::Auto => {
@@ -497,26 +505,27 @@ fn cmd_run(a: RunArgs, vlog: &Verbosity) -> i32 {
 /// 渲染模型 chat 模板（tokenizer_config.json 的 `chat_template`；minijinja）。
 /// 返回 Ok(None) = 无模板；Err = 渲染失败（调用方回退原始 prompt）。
 #[cfg(feature = "cuda")]
-fn render_chat_template(
-    dir: &std::path::Path,
-    user_text: &str,
-) -> Result<Option<String>, String> {
+fn render_chat_template(dir: &std::path::Path, user_text: &str) -> Result<Option<String>, String> {
     let tcfg: serde_json::Value = std::fs::read(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(serde_json::Value::Null);
-    let template = tcfg
-        .get("chat_template")
-        .and_then(|v| v.as_str())
-        .ok_or("no chat_template")?
-        .to_string();
+    let template =
+        tcfg.get("chat_template").and_then(|v| v.as_str()).ok_or("no chat_template")?.to_string();
     let mut env = minijinja::Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    // minijinja 无 Python 字符串方法 startswith/endswith（Qwen3 模板依赖）；
+    // 重写为过滤器调用（`x.startswith(y)` → `x | startswith(y)`）并注册等价过滤器。
+    let template =
+        template.replace(".startswith(", " | startswith(").replace(".endswith(", " | endswith(");
+    env.add_filter("startswith", |s: String, p: String| s.starts_with(&p));
+    env.add_filter("endswith", |s: String, p: String| s.ends_with(&p));
     let tmpl = env.template_from_str(&template).map_err(|e| format!("jinja parse: {e}"))?;
     let rendered = tmpl
         .render(minijinja::value::Value::from_serialize(&serde_json::json!({
             "messages": [{ "role": "user", "content": user_text }],
-            "generation": false
+            "add_generation_prompt": true, // 与 serve 一致：追加 assistant 前缀
+            "enable_thinking": false
         })))
         .map_err(|e| format!("jinja render: {e}"))?;
     Ok(Some(rendered))
@@ -570,13 +579,7 @@ fn cmd_run_cuda(
         eprintln!("reinfer: cuda backend arch={arch}");
     }
     let cache = std::env::temp_dir().join("reinfer-jit-dense");
-    let mut engine = match Engine::load(
-        ctx.device_id(),
-        &arch,
-        Some(cache),
-        &dir,
-        max_len,
-    ) {
+    let mut engine = match Engine::load(ctx.device_id(), &arch, Some(cache), &dir, max_len) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("reinfer: engine load: {e}");
@@ -654,7 +657,7 @@ fn cmd_run_cuda(
         repeat_penalty: a.repeat_penalty,
         seed: a.seed,
     };
-    let mut n_new = 0usize;
+    let _n_new = 0usize;
     let stat = match crate::pipeline::generate_stream(
         &mut engine,
         &tokenizer,
@@ -662,12 +665,12 @@ fn cmd_run_cuda(
         &params,
         eos,
         a.max_tokens,
-        |delta| {
+        |delta, _tok| {
             print!("{delta}");
             use std::io::Write;
-            n_new += 1;
             std::io::stdout().flush().is_ok()
         },
+        0,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -678,7 +681,7 @@ fn cmd_run_cuda(
     let _ = println!();
     let first_tok = stat.first_token.map(|d| d.as_millis()).unwrap_or(0);
     let dgen = stat.elapsed;
-    let _ = &mut n_new;
+
     eprintln!(
         "reinfer: {} tokens in {:?} (≈{:.1} tok/s, first-token {}ms, model {})",
         stat.tokens,
@@ -722,8 +725,7 @@ fn cmd_list_local(a: ListArgs, vlog: &Verbosity) -> i32 {
     let mut rows: Vec<(String, u64, Option<String>, String)> = found
         .iter()
         .map(|(rel, size, repo)| {
-            let man =
-                if repo.is_empty() { Vec::new() } else { read_manifest(&dir.join(repo)) };
+            let man = if repo.is_empty() { Vec::new() } else { read_manifest(&dir.join(repo)) };
             let fname = rel.rsplit('/').next().unwrap_or(rel);
             let m = man.iter().find(|e| e.name == fname);
             (
@@ -843,7 +845,8 @@ fn cmd_download(a: DownloadArgs, vlog: &Verbosity) -> i32 {
             a.revision.as_deref().map(|r| format!("@{r}")).unwrap_or_default()
         ),
     );
-    let (mut entries, from_hf) = match list_entries(resolver.source, &a.repo, a.revision.as_deref()) {
+    let (mut entries, from_hf) = match list_entries(resolver.source, &a.repo, a.revision.as_deref())
+    {
         Ok(v) => v,
         Err(e) => {
             eprintln!("reinfer: {e:?}");
@@ -961,10 +964,8 @@ fn cmd_dry_run(
     let verify =
         if from_hf && resolver.verify == Verify::Sha256 { Verify::Size } else { resolver.verify };
     let total: u64 = targets.iter().map(|e| e.size).sum();
-    let already: Vec<bool> = targets
-        .iter()
-        .map(|e| local_hit(&target_path(dir, &a.repo, &e.name), e, verify))
-        .collect();
+    let already: Vec<bool> =
+        targets.iter().map(|e| local_hit(&target_path(dir, &a.repo, &e.name), e, verify)).collect();
     match fmt {
         Format::Table => {
             println!(
@@ -1398,7 +1399,10 @@ impl Progress {
                 if ok {
                     self.mp.remove(pb); // 完成即从活跃栈移除（折叠——全清单归 model list）
                 } else {
-                    pb.abandon_with_message(format!("{:<38} (failed)", truncate(&pb.message(), 40)));
+                    pb.abandon_with_message(format!(
+                        "{:<38} (failed)",
+                        truncate(&pb.message(), 40)
+                    ));
                     eprintln!("reinfer: {}/{} failed", idx + 1, self.total);
                 }
                 active[idx] = None;
@@ -2085,7 +2089,8 @@ mod tests {
         assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert_eq!(e.exit_code(), 2);
         // 已立项且已实现的命令：run（契约 v2.2/v2.15）
-        let r = parse(&["reinfer", "run", "Qwen/Qwen3-0.6B", "-n", "8", "-t", "1.0", "Hello"]).unwrap();
+        let r =
+            parse(&["reinfer", "run", "Qwen/Qwen3-0.6B", "-n", "8", "-t", "1.0", "Hello"]).unwrap();
         match r.command {
             Cmd::Run(x) => {
                 assert_eq!(x.model, "Qwen/Qwen3-0.6B");
@@ -2101,7 +2106,18 @@ mod tests {
             clap::error::ErrorKind::ValueValidation
         ));
         // serve 已实现（契约 v2.1/v2.5；axum）
-        let srv = parse(&["reinfer", "serve", "Qwen/Qwen3-0.6B", "--port", "9000", "--host", "127.0.0.1", "--api-key", "k"]).unwrap();
+        let srv = parse(&[
+            "reinfer",
+            "serve",
+            "Qwen/Qwen3-0.6B",
+            "--port",
+            "9000",
+            "--host",
+            "127.0.0.1",
+            "--api-key",
+            "k",
+        ])
+        .unwrap();
         match srv.command {
             Cmd::Serve(x) => {
                 assert_eq!(x.model, "Qwen/Qwen3-0.6B");

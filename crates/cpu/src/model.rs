@@ -8,17 +8,16 @@
 //! embedding OOV → RunError / `-t 0` 短路 argmax（tie-break 首个最大）。
 
 use crate::RunError;
-use reinfer_arch::llama::from_gguf_meta;
 use reinfer_arch::llama::LlamaConfig;
+use reinfer_arch::llama::from_gguf_meta;
 
-use reinfer_gguf::codes;
 use reinfer_gguf::GgufDtype;
 use reinfer_gguf::GgufReader;
+use reinfer_gguf::codes;
 
 /// 层原始权重（blob 字节——按 dtype 按需解量化）。
 #[derive(Debug)]
 pub struct LayerRaw {
-
     /// attn_norm（f16/f32 字节）
     pub attn_norm: Vec<u8>,
     /// q (prow [d*n_heads, hidden])——GGUF 布局：[out, in] 行主序
@@ -121,9 +120,7 @@ impl Model {
         for i in 0..n {
             let name = |s: &str| format!("blk.{i}.{s}");
             let get = |s: &str| -> Result<Vec<u8>, RunError> {
-                let t = reader
-                    .tensor(&name(s))
-                    .ok_or_else(|| RunError::MissingTensor(name(s)))?;
+                let t = reader.tensor(&name(s)).ok_or_else(|| RunError::MissingTensor(name(s)))?;
                 reader.tensor_data(t).map_err(RunError::Gguf)
             };
             let dt = |s: &str| -> Result<GgufDtype, RunError> {

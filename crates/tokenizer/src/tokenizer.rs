@@ -135,14 +135,13 @@ impl Tokenizer {
         tok: &serde_json::Value,
         cfg: &serde_json::Value,
     ) -> Result<Self, TokenizerError> {
-        let model = tok
-            .get("model")
-            .and_then(|m| m.get("type"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| TokenizerError::InvalidMetadata {
-                key: "tokenizer.json".into(),
-                why: "missing model.type".into(),
-            })?;
+        let model =
+            tok.get("model").and_then(|m| m.get("type")).and_then(|t| t.as_str()).ok_or_else(
+                || TokenizerError::InvalidMetadata {
+                    key: "tokenizer.json".into(),
+                    why: "missing model.type".into(),
+                },
+            )?;
         match model {
             "BPE" => Ok(Tokenizer::Bpe(Box::new(bpe::BpeTokenizer::from_hf_json(tok, cfg)?))),
             other => Err(TokenizerError::UnsupportedModel { model: other.to_string() }),

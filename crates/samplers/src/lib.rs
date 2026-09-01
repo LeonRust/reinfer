@@ -11,8 +11,8 @@
 
 use llm_samplers::prelude::*;
 use llm_samplers::types::Sampler as _; // sample_token/sampled_token_id trait
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 /// 采样参数（CLI/API 通用；缺省 = OpenAI 工程缺省：temp 1.0 之外默认无约束）。
 #[derive(Clone, Debug)]
@@ -92,10 +92,10 @@ impl Sampler {
     /// 记录最近生成 token（重复惩罚的状态喂给）。
     pub fn feed(&mut self, token: u32) {
         let mut push = |v: &mut Vec<u32>| v.push(token);
-        self.res.with_last_tokens_mut(&mut push)
+        self.res
+            .with_last_tokens_mut(&mut push)
             .expect("last_tokens resource present when constructing Sampler");
     }
-
 }
 
 /// 采样错误面。

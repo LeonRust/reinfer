@@ -12,7 +12,7 @@
 mod gpu {
     use reinfer_core::DeviceId;
     use reinfer_cuda::decode::DecodeKernels;
-    use reinfer_cuda::{copy, CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef};
+    use reinfer_cuda::{CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef, copy};
     use reinfer_gguf::codes::f16_to_f32;
 
     fn xorshift(seed: &mut u64) -> u64 {
@@ -71,10 +71,9 @@ mod gpu {
         for t in 0..kv_len as usize {
             for kk in 0..kvh as usize {
                 for i in 0..d as usize {
-                    for (base, val) in [
-                        (0usize, rand_f16_bits(&mut seed)),
-                        (1, rand_f16_bits(&mut seed)),
-                    ] {
+                    for (base, val) in
+                        [(0usize, rand_f16_bits(&mut seed)), (1, rand_f16_bits(&mut seed))]
+                    {
                         // base 0 = K 区、1 = V 区(k_region 前 log 起始)
                         let region = (total_pages * bl * kvh * d) as usize;
                         let idx = ((t * kvh as usize + kk) * d as usize) + i;
@@ -116,10 +115,12 @@ mod gpu {
         // scores 回读（head0 前 4 个 t）
         let hsc = HostBuffer::alloc(64).unwrap();
         copy(&mut MemRef::Host(&hsc), &MemRef::Device(&dsc), 64, None).unwrap();
-        let sc: Vec<f32> = unsafe { std::slice::from_raw_parts(hsc.as_ptr() as *const f32, 16).to_vec() };
+        let sc: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(hsc.as_ptr() as *const f32, 16).to_vec() };
         println!("scores first 16: {sc:?}");
         let hout = HostBuffer::alloc((qh * d * 2) as usize).unwrap();
-        copy(&mut MemRef::Host(&hout), &MemRef::Device(&dout), (qh * d * 2) as usize, None).unwrap();
+        copy(&mut MemRef::Host(&hout), &MemRef::Device(&dout), (qh * d * 2) as usize, None)
+            .unwrap();
         let out: Vec<u16> = unsafe {
             std::slice::from_raw_parts(hout.as_ptr() as *const u16, (qh * d) as usize).to_vec()
         };

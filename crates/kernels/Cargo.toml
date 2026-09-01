@@ -6,6 +6,10 @@ edition = "2024"
 publish = false
 [dependencies]
 reinfer-core = { workspace = true }
+reinfer-samplers = { workspace = true }
+fs2 = { workspace = true }         # tune.json flock 写锁（同 crates/jit 惯例）
+serde = { workspace = true }       # tune.json 序列化（workspace 既有，无新 crate）
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

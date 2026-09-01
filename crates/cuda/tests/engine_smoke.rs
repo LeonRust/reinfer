@@ -17,7 +17,7 @@
 
 mod gpu {
     use reinfer_core::DeviceId;
-    use reinfer_cuda::engine::{argmax_first, Engine, EngineError};
+    use reinfer_cuda::engine::{Engine, EngineError, argmax_first};
     use reinfer_cuda::{CudaContext, CudaStream};
     use reinfer_tokenizer::Tokenizer;
     use std::time::Instant;
@@ -97,6 +97,30 @@ mod gpu {
         let b = engine.generate(&ids, 8, eos, 0.0).expect("pass b");
         assert_eq!(a, b, "two passes must be identical (determinism)");
         println!("deterministic: {a:?}");
+    }
+
+    /// S1-2: decode-step timing anchor. Runs 40 decode tokens on the plain
+    /// eager path and prints per-step tpot / tok/s (record tier, no gate).
+    /// With REINFER_DECODE_PROFILE=1 the engine's profiler prints the
+    /// per-segment attribution table at steps 20 and 40 (the S1-1→S1-2
+    /// measurement surface; run with --nocapture to see it).
+    #[test]
+    #[ignore = "gpu.yml: l3-smoke / decode-timing"]
+    fn engine_decode_timing() {
+        let (mut engine, tokenizer, _) = load_all(&model_dir());
+        let ids = tokenizer.encode("Hello", false).expect("encode");
+        let eos = engine.config().eos_id;
+        let n = 40u32;
+        let t0 = Instant::now();
+        let out = engine.generate(&ids, n, eos, 0.0).expect("generate");
+        let dt = t0.elapsed();
+        let steps = out.len().max(1);
+        println!(
+            "decode: {steps} tokens in {dt:?} (tpot {:.1} ms/tok, ~{:.1} tok/s)",
+            dt.as_secs_f64() * 1000.0 / steps as f64,
+            steps as f64 / dt.as_secs_f64()
+        );
+        assert!(!out.is_empty());
     }
 
     #[test]

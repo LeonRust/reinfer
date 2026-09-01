@@ -768,8 +768,9 @@ mod tests {
             sha256: Some(sha256_hex(&all)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
-            .unwrap();
+        let got =
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+                .unwrap();
         let gotb = std::fs::read(&got).unwrap();
         assert_eq!(gotb.len(), 200);
         assert_eq!(gotb[..100], part[..]);
@@ -798,8 +799,9 @@ mod tests {
             sha256: Some(sha256_hex(&body)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
-            .unwrap();
+        let got =
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+                .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), body);
         assert_eq!(hits.load(Ordering::SeqCst), 0, "完成捷径不得发请求");
         let _ = std::fs::remove_dir_all(&dir);
@@ -833,8 +835,9 @@ mod tests {
             sha256: Some(sha256_hex(&expect)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
-            .unwrap();
+        let got =
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+                .unwrap();
         // 截断重下成功（起点不符→set_len(0)+从头写全量）
         assert_eq!(std::fs::read(&got).unwrap(), expect);
         let _ = std::fs::remove_dir_all(&dir);
@@ -847,9 +850,8 @@ mod tests {
     fn resume_falls_back_to_full_when_no_range() {
         let body: Vec<u8> = b"0123456789".repeat(20); // 200 B
         let full_full = body.clone();
-        let (stub, j) = Stub::spawn(move |_req| {
-            (200, String::from_utf8(full_full.clone()).unwrap(), vec![])
-        });
+        let (stub, j) =
+            Stub::spawn(move |_req| (200, String::from_utf8(full_full.clone()).unwrap(), vec![]));
         let dir = tmpdir("resumefb");
         std::fs::write(dir.join(".m.gguf.reinfer-part"), b"corrupted-old-part").unwrap();
         let entry = FileEntry {
@@ -858,8 +860,9 @@ mod tests {
             sha256: Some(sha256_hex(&body)),
             is_lfs: false,
         };
-        let got = fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
-            .unwrap();
+        let got =
+            fetch_to_temp(&stub.url("/x"), &dir, "m.gguf", Verify::Sha256, &entry, None, None)
+                .unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), body); // 旧残件被覆盖为全量
         let _ = std::fs::remove_dir_all(&dir);
         drop(stub);

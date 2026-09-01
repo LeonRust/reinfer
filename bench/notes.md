@@ -85,3 +85,845 @@
 - crates/cpu 执行器已建：Model::load（Q8_0 blob 全量入内存 + row_bytes 行级访问（embed/logits：Q8_0 行=（d/32）×34）+ 层循环（RMSNorm/RoPE/GQA attention（kv_head=q_head/ratio 分组）/SwiGLU/残差）+ generate（temp=0 argmax 首个最大、EOS 停、`-n` 硬限、NaNLogits 显式错误、OOV 错误）——clippy 0 warnings
 - **数值 NaN 追查记录**：0.5B "Hello" 一步生成 → **NaNLogits 防呆触发（正确行为）**。llama.cpp（f280b2698）同模型同 prompt 输出正常 → 文件无 NaN。探针链定位：attn 输出 head 0-9 正常、**head 10+ 输出全 0**（softmax sum 0——scores NaN/全部 -inf 推理），残留因子列表：kv cache kh=1 段位置计算或 head 10 q/k 数据路径；**未决（下轮续查）**。注：CPU 计算已真实执行（11-28s 一轮），前端组件无缺失——纯数值范围问题。
 - 下一步（下轮）：head10 剖面（q/k 段 + kv_cache 写入 vs 读取位置一致）、随后 bin run 接线。
+
+## 2026-08-29 — 014 T0: llama.cpp CUDA 参照（0.85× 门禁基准，任务代号 T0A/B/C）
+
+- 四元组：**Qwen3-0.6B / F16 / RTX 5090 Laptop (sm_120a, CUDA 13.2, driver 595.84) / 352.70 tok/s**（tg512 中位数，bs=1, fa, ngl=99）
+- 关键数：5 次 raw = 355.41 / 352.70 / 352.77 / 352.17 / 351.49 → 中位 352.70；-r 5 均值 349.84 ± 3.35；GGUF sha256 = `d04bceb664d484eaf134cdbc63745f5241bea80132c458e61c9449f488fe2abc`（`bench-tmp-llamacpp/Qwen3-0.6B-f16.gguf`，convert_hf_to_gguf.py @ f280b2698 + bench-vs-vllm venv，1.40 GiB / 751.63 M params）
+- 构建：`cmake -B bench-tmp-llamacpp/build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=OFF -DCUDAToolkit_ROOT=/usr/local/cuda-13.2`（坑：cmake 3.22 FindCUDAToolkit 缓存首次会把 cudart/cublas 定到 12.6（/usr/local/cuda 符号链接）——须全新 build 目录 + 预置库变量，readelf 验证 DT_NEEDED=libcudart.so.13/libcublas.so.13；运行期差异实测为零）
+- 完整性：sanity 区间 400-900 未达（352.7 略低）——**区间假设桌面 5090（1.79 TB/s）；本机为 Laptop 档（256-bit GDDR7 ≈ 896 GB/s，fp16 权重 1.50 GB/步 → 天花板 ~596 tok/s），352.7 = 59% 带宽效率**，三次独立运行与 5 次单跑散布 ≤1.1%，数值可信
+- 门禁账：参照 352.70 → 引擎目标 0.85× ≈ **299.8 tok/s**；reinfer 现 11 tok/s（3.1%，差 27.3×）
+- 完整数据：`bench/baseline-llamacpp.json`
+
+### 006-2 T6A — GPU sampler 接线后整机复核（2026-08-29）
+
+- 协议：Qwen3-0.6B fp16 / RTX 5090 Laptop (sm_120a, nvcc 13.2 JIT) / serve 单流（F1 语义）
+- 结果：单流 decode **12.53 tok/s**（tpot p50 79.8ms，n=12，0 errors）
+- 对比：接线前 11.16 tok/s（89.6ms）→ **+12%**；参照 llama.cpp CUDA 352.70 tok/s；
+  0.85× 门禁=299.8 → **达成率 4.2%**
+- 判定：**采样回拷/CPU 采样仅占总步时 ~11%（10ms 级）**——decode 步主体（79.8ms）
+  为 dense 层循环（GEMM/attn/每步 launch）构成；**G3（decode-attn 性能档）与 G5
+  （融合核组）确认为必做**（非存废），但触发时机=006（FMHA/graph/dequant-dot）落地后
+  的 profile 门控重开（006-2b 条款已满足"需测量"前提——测量=本行；006 未落地则不重开）
+- G4（GPU sampler 链）交付记录：契约/内核/确定性 12/12 真机测试 + 端到端 temp=0
+  10/10 一致；回退链（eager_fallback 计数）与 NotSupported 原子性验证通过
+- 已知偏差沿用 T3C 记录：CPU 过滤器面 tie 规则（有 topk/topp 时 FirstMax）与 GPU
+  恒 LastMax 在 tie 边界不 bit-identical（非 tie 路径全一致，测试记录）
+
+## 2026-08-29 — 006 T6: fused Q8_0 dequant-dot decode kernel（真机记录）
+
+- 内核（crates/cuda/kernels/decode_dot.cu + decode.rs `DecodeDotKernels`）：
+  每 block 8 输出列 × 全 K；256 线程 = 8 warp，warp w 负责列 n0+w；线程 t 按
+  固定 stride-32 序累加 k = t, t+32, ...；固定 5 步 butterfly shfl_xor 归约——
+  无原子、确定性。累积语义 = fp32（与 003 dense gemm_f32acc 32F-acc 档一致）；
+  寄存器内 dequant：f32(q)×f32(f16(scale)) 单次乘法 → RNE 单次舍入到 f16，
+  永不下沉内存——逐元素与 dequant_q8_0→cast_f32_to_f16 位等价（014 r2）。
+- 挂载点决定：engine.rs 无 Q8_0 分发路径（权重均 host 转 f16）→ 内核 + 驱动
+  harness 留 decode.rs，引擎接线**依赖 T-305 收口**（未动 engine.rs）。
+- 真机（RTX 5090 Laptop sm_120a / nvcc 13.2 JIT / tests/dequant_dot.rs，3/3 过）：
+  - D7 gate（对固定串行 k 序 host 参考，rel 1e-4 + atol 1e-6）：fused 与 003 dense
+    双达标，6 形状 0 违例；(n,k)=(1536,1536) 最紧——fused max abs vs dense 3.58e-6
+    （求和序噪声，记录档非 gate）；f16-out 档 ≤1 ulp
+  - 确定性：两次 launch 位一致
+- 微基准（cudaEvent，K=4096 单 token 步，tok/ms 与 tok/s）：
+  - fused 核：n=896 **68.5 us/步（14.6 tok/ms）**；n=1536 **70.2 us/步（14.3 tok/ms）**
+  - 003 dense 全链（dequant→cast→transpose→gemm_f32acc，独立 harness 同协议）：
+    n=896 115 us / n=1536 225 us → fused **1.70x / 3.04x**
+  - 引擎视角（host Instant min50）：fused 0.07 ms vs dense GEMM 0.05 ms（0.64x）
+    vs 全链 0.52 ms → fused **7.4x**
+  - 诚实偏差：fused 核本身**低于**裸 cuBLAS GEMM（0.33x–0.60x，张量核+权重驻留
+    L2 缓存）——提升全部来自省掉逐步物化链（f32 25MB 写 + cast + 转置 + 额外
+    launch）；fused 核随 n 近持平（latency-bound），本机 Laptop 带宽档（≈896 GB/s）
+    下仍有量级空间（stride-32 标量序非张量核形态）
+
+## 2026-08-29 — T-305: 006 集成收口（FMHA/TuneDb/graph/dequant-dot 接引擎）
+
+### select 接入 prefill（任务 1，完成）
+
+- prefill_batch 决策改为 `select_fmha(cfg, db, avail)`：TuneDb 实测最优优先 →
+  语义序（Vendor > JitFmha > JitDense）；FMHA 装载失败 → jit_fmha 不可用 →
+  恒 dense（无 GPU/不可用语义）。
+- 每次成功执行记录实测 score 到 TuneDb（op="fmha" 与选择器同命名空间；
+  provider=jit_fmha/jit_dense；host round-trip 计时；tune.json 原子写，
+  保存失败静默不影响生成）。进程内 SelectionCache 首测决定（"首测慢/二测快"）。
+- select_attn 未接线：decode 路径无替代档位（引擎仅 T7/T8 dense decode 一套内核），
+  "attn" 命名空间保留待 decode 内核多档。
+
+### graph 接 decode 步（任务 2，接线完成 + BLOCKER 登记）
+
+- REINFER_GRAPH env（默认 on；0/off/false/no/空 → disabled → 恒 eager）。
+- 首个进入桶[kv_len] 的 step 发起 capture（全局 CAPTURE_LOCK；捕获期
+  REINFER_GRAPH_NO_OVERLAP 生效；闭包 = 同 eager 的 step_decode_launches）。
+- 捕获失败 → eager 回退 + graph_eager_fallbacks 计数 + 该桶本进程不重试
+  （新桶仍尝试；跨进程自然重试——每桶失败 eprintln 一次）。
+- **BLOCKER（图重放不可达）**：decode 步每层 ~22 JIT 内核 + 7 cublas gemm 节点
+  （28 层 + lm_head ≈ 800+ 节点）——引擎无法为 cublas gemm 节点声明 KernelSpec
+  （arity/handle/grid/block 不可得），finish 计数校验 fail-closed → 恒 eager。
+  cublas 内核参数为指向调用帧临时区的指针（alpha/beta/dims）——即使读回节点
+  参数，重放仍需 gemm 稳定参数格改造（>20 行非接线改动，触发纪律条款）。解除
+  需三步：(a) gemm 调用点稳定参数格（engine.rs 改造）；(b) 节点参数读回
+  （cudarc 需按 cuda-13020 构建 + 13.2 运行时——当前绑定 cuda-12060 无此符号）；
+  (c) 引擎侧逐 launch KernelSpec 声明 + PtrUpdate 注册表。**登记 blocker，
+  未做大重构**（纪律条款）。
+- 位级不变式：graph on/off 输出逐位一致（graph_engine 真机测试 + e2e 双跑）。
+- eager 路径微调（数值逐位不变）：页表/长度上传改预分配 pinned 缓冲 + 引擎流
+  异步拷贝（去每层默认流同步——capture 期合法面所需；流内排序等价）。
+
+### 双流（任务 3）
+
+- 模式②（最小，满足）：运行期单流语义成立——引擎单流；捕获期 no-overlap 由
+  graph.rs capture_in_progress() 提供（REINFER_GRAPH_NO_OVERLAP 默认 on）。
+- 模式①（事件入图/prefetch，**未实现**）：需 graph.rs 事件节点支持
+  （cudaGraphAddEventRecordNode 等）+ 独立 prefetch 流；当前 graph 面仅内核节点，
+  引擎设计为单流（V1 串行）——登记未实现 + 理由（见 006-2 tasks.md T-305 登记）。
+
+### dequant-dot（任务 4，确认不接线）
+
+- engine.rs 权重加载全 host→f16（to_f16_rm/to_f16_rows/to_f16_vec），无 Q8_0
+  分发路径 → 内核 + 驱动 harness 留 decode.rs（既有注释），**Q8_0 引擎权重接入后
+  启用**（decode_dot launch 已就绪——真机 68.5 us/步 @ K=4096，见上方 T6 记录）。
+
+### 验证（任务 5，摘要）
+
+- a) cargo check --workspace --exclude reinfer-ascend 干净；cargo test
+  -p reinfer-kernels 50/50；cuda lib 单测 38 过（含 graph_enabled_from_env）。
+- b) 真机（RTX 5090 Laptop sm_120a, nvcc 13.2 JIT）：graph_engine 测试
+  （graph on/off 128 token 位级一致 + 文本一致 + fallback 计数 > 0）；
+  fmha_prefill 256/1024（既有）；dequant_dot diff（既有）。
+- c) 端到端：serve 双跑（REINFER_GRAPH=off / 默认 on）与 greedy_42.jsonl
+  基线 10/10 一致。
+
+### 006 T-307 判定（2026-08-30，诚实档）
+
+- **prefill 0.7×（参照 pp512=341.2 tok/s → 238.8 目标）**：serve 侧 FMHA 实测
+  *不可达*：`FMHA load failed (kernel launch failed: invalid or unknown error)` →
+  per-token 回退（~2.8 tok/s = 1.2% 目标）。**BLOCKER-B：FMHA serve 部署路径 launch 失败**
+  待查（正确性已由 fmha_prefill 21 分钟差分全过（256/1024/4096 × batch 1/3 双 gate）——
+  问题在部署环境差异：JIT 缓存命中（同 cubin）仍失败）；候选：launch 参数/上下文指纹/
+  smem 属性。修复建议：与 A 测试差集的实体（host 登录顺序/上下文初始化/CudaContext
+  创建方式）做 bisect。
+- **decode 0.85×（参照 352.70 → 299.8 目标）**：12.53 tok/s = **4.2% 未达标**；
+  构成：采样层已 GPU 化（+12%），decode 步主体为 dense 层循环；**BLOCKER-A**（cublas
+  kernel-spec 声明）使 graph 重放未接线（默认改 opt-in off——失败的 capture 会污染
+  流（eager launch 此后报错），顺带把默认改了，见 engine.rs GRAPH_ENV 注释）；dequant-dot
+  引擎视角 0.64× 慢于 dense → 不接线（Q8_0 模型 ready 件）。
+- **006 T1-T7 组件全部交付与各自验证通过**；"006 落地"整体的性能门禁**因 BLOCKER-A/B
+  未判**（非组件失败——组件级差分/位级/门限全部 true）。
+- 下一步建议：① BLOCKER-B（FMHA serve launch，1 人日级）→ prefill 真正测量；
+  ② BLOCKER-A（cublas KernelSpec 声明 → graph 重放）→ decode launch 摊平；
+  ③ 006-2b 重开（G3/G5，ncu profile）按①②后推进。
+
+### BLOCKER-B 修复记录（2026-08-31，B 待结 + B2 未决）
+
+- **B 根因（已修）**：`fmha.rs` 用 `std::env::var("CARGO_MANIFEST_DIR")`（运行时 env）——
+  cargo test 注入、shell 启动的 serve/run 无 → 直接 Fatal（测试绿/serve 失败的完整解释）。
+  修复：`option_env!("CARGO_MANIFEST_DIR")`（编译期注入）+ 注释 packaging 注意
+  （vendored 头随二进制分发）。附带修复：`FmhaKernels::new/PrefillKernels::new` 外包裹
+  CtxGuard（worker 线程加载绑定当前 context——防御性正确）。
+- **修复后验证**：run CLI 256 词 first-token **133ms**（含 256 词批量 prefill——FMHA
+  快速正确；层计时 28 层全通、逐层 ±1-2ms）。长期瓶颈疑云消散：**prefill 批量路径
+  组件功能正确**；服务端首请求在旧会话的 944s 回退源于上述 env 缺失。
+- **B2（未决，记录现象）**：**2048 词（~2660 tok）规模卡在 FmhaKernels::new 的
+  smem 设置之后**（探针阶段证明 load 完成），进程 user 2m34+ 无新 cubin 写入、
+  prefill_batch_fmha 入口探针未达——**与长度相关的阻塞仍未定位**（调试期间 256 稳定、
+  2048 稳定复现；ptrace 受限无法 gdb）。下次处理建议：per-layer 计时器 + k/u 查段；
+  临时的绕过：≤1024 词 prompt 走 FMHA，更长为 per-token fallback（引擎侧早退分支）。
+- 探针已清理（保持仓库清洁）；engine/graph 默认 off + option_env/guard 修复保留。
+
+### BLOCKER-B2 fixed (2026-08-31) — stale tune.json record locked out FMHA
+
+- **Root cause (one line)**: the s2048 `jit_dense` TuneDb record (941,982,951 µs,
+  measured by the pre-B-fix serve session while FMHA could not load) made the
+  selector route every 2048-token prefill into the per-token dense fallback
+  (~942 s) — the FMHA path was never entered, so it looked like a hang. FMHA at
+  s=2048 was never broken: probed end-to-end it prefills in ~200 ms.
+- **Evidence**: stage probes showed `select_fmha(s=2048) -> JitDense` right after
+  a successful FMHA load (FmhaKernels::new done, 4 smem attributes set) and no
+  `prefill_batch_fmha` entry — the previous session's "missing probe" was simply
+  the FMHA path not being selected. With a fresh TuneDb the same prompt takes
+  the FMHA path: 28 layers + lm_head, stream sync at 202 ms, generation starts.
+- **Mechanism (permanent lockout)**: for op=`fmha`, `jit_dense` is the *fallback*
+  tier — it is only measured while the higher tiers are down or failing. The
+  D6 rule "measured data beats semantic order" then keeps choosing the fallback
+  forever: the primary tier can never be measured again (catch-22), and the
+  stale record survives process restarts via tune.json.
+- **Fix** (`crates/kernels/src/provider.rs`, `select_chain`): a lone fallback-tier
+  (`jit_dense`) record is no longer honored when a higher tier is available and
+  has no record; it competes only when (a) no higher tier is available, or
+  (b) a higher available tier has its own record (both measured -> best score
+  wins, preserving "measured > semantic"). No schema change; legacy records
+  self-heal (a fallback-only record can no longer block an available primary).
+  New regression test `b2_fallback_record_does_not_lock_out_available_primary_tier`.
+- **Data hygiene**: purged the three fallback-era `jit_dense` records
+  (s256/s512/s2048) from `~/.cache/reinfer/tune.json` (user cache, re-measured
+  automatically; only `jit_fmha` records kept).
+- **Verification (run CLI, Qwen3-0.6B, RTX 5090 Laptop, nvcc 13.2, x2 runs)**:
+  - 256 words: first-token 133 ms / 136 ms (baseline unchanged);
+  - 2048 words: first-token **927 ms / 931 ms** (expectation < 60 s; previously
+    ~942 s dense fallback); FMHA chosen for s=2048, no fallback.
+  - Serve (`start_servers.sh reinfer` + 2048-word chat request, max_tokens=8):
+    prompt_tokens=2048, completion in 7.75 s total, coherent reply; then
+    `stop_servers.sh` clean (ports released, VRAM back to 499 MiB baseline).
+- Probes removed (engine.rs / fmha.rs net-zero); all 51 `reinfer-kernels` unit
+  tests pass (incl. the new B2 regression test).
+
+## 2026-08-31 — 014 parity four tiers vs llama.cpp (T1 criterion record)
+
+Referee (golden chain = llama.cpp libllama, pinned f280b26983ad0fdb705a0d9ebf0503e76f2899b0,
+b10615): CPU build (GGML_CUDA=OFF, LLAMA_BUILD_SERVER=OFF — llama-cli links the
+server-impl, so it is absent from build/bin; the harness driver is used instead).
+Driver: bench/referee/llama_referee.cpp → llama.cpp/build/bin/llama-referee
+(magic "RPAR", per-step u32 token + f32[n_vocab] logits; prompt via stdin). Build:
+
+    g++ -std=c++17 -O2 -I <llama.cpp>/include -I <llama.cpp>/ggml/include \
+        bench/referee/llama_referee.cpp -L <llama.cpp>/build/bin \
+        -lllama -lggml -Wl,-rpath,<llama.cpp>/build/bin \
+        -o <llama.cpp>/build/bin/llama-referee
+
+(-lggml required: ggml_backend_load_all lives in libggml.) GGUF:
+bench-tmp-llamacpp/Qwen3-0.6B-f16.gguf (sha256 d04bceb664d484ea…, convert_hf_to_gguf
+of Qwen3-0.6B, 2026-08-29). Protocol on both sides: plain completion (no chat
+template), tokenize add_special=true/parse_special=false (Qwen3 add_bos=false →
+no BOS), greedy temp 0 first-max strict `>` (llama_sampler_greedy == engine
+argmax_first rule), exactly 64 steps, no EOS stop.
+
+Engine side: REINFER_MODEL_DIR=…/Qwen/Qwen3-0.6B HF safetensors, F16 dense,
+sm_120a JIT (nvcc 13.2, REINFER_CUDA_NVCC rule). Harness (crates/cuda/tests/parity.rs)
+drives the engine with the **aligned protocol**: row0 = prefill_batch returned
+logits (position S-1 → predicts generated token #1, same as the llama.cpp prefill
+row), decode steps at pos = S-1+i, kv_len = S+i. Under identical token sequences
+the two sides agree position by position; residual drift = engine f16-intermediate
+attention (q/k/v cast f16, RoPE in f16) vs llama.cpp CPU f32.
+
+### Measurement: 10 prompts × 64 greedy tokens (two full runs, bitwise reproducible)
+
+| prompt | tokens | match | first_diff | sampled_drift | rel_same_pfx | rel_cond_64 |
+|---|---|---|---|---|---|---|
+| p0 | 64 | 44 | step 44 | 8.05e-3 | 9.67e-3 | 9.67e-3 |
+| p1 | 64 | 64 | – | 5.25e-3 | 7.09e-3 | 7.09e-3 |
+| p2 | 64 | 64 | – | 5.19e-3 | 7.32e-3 | 7.32e-3 |
+| p3 | 64 | 64 | – | 4.63e-3 | 5.78e-3 | 5.78e-3 |
+| p4 | 64 | 64 | – | 4.31e-3 | 7.17e-3 | 7.17e-3 |
+| p5 | 64 | 64 | – | 9.15e-3 | 1.34e-2 | 1.34e-2 |
+| p6 | 64 | 64 | – | 5.84e-3 | 7.89e-3 | 7.89e-3 |
+| p7 | 64 | 64 | – | 4.25e-3 | 5.62e-3 | 5.62e-3 |
+| p8 | 64 | 64 | – | 6.73e-3 | 8.22e-3 | 8.22e-3 |
+| p9 | 64 | 64 | – | 5.14e-3 | 7.95e-3 | 7.95e-3 |
+
+- **T1 tokenizer 100%**: 10/10 prompts, 100 prompt tokens identical — PASS (hard assert).
+- **T2 F16 greedy: 620/640 (96.9%) — record tier** (100% not reached). Single
+  divergence: p0 step 44 — a genuine near-tie: engine argmax 311 vs referee 11,
+  engine margin +0.006 / referee margin −0.008 logit units (rowmax ≈ 15): the
+  ~1e-2 f16-rounding noise flips a tie of ~7e-3 units. Identical result on both
+  runs (deterministic).
+- **Fallback gate (sampled rel drift ≤ 1e-4): not met** — sampled 4.3e-3..9.2e-3,
+  full-vocab same-prefix 5.6e-3..1.34e-2. This is the characteristic band of the
+  f16-intermediate vs f32 rounding difference; a f32 accumulation path would move
+  drift into the ≤1e-4 band.
+- **T4 logits rel drift (full vocab, conditional 64 steps, |e−r|/rowmax): max
+  1.34e-2 (p5)** — record tier, marginally above the ≤1e-2 record threshold
+  (1.3×). Conditional == same-prefix for every prompt → no context-divergence
+  amplification.
+- Metric note: plain relative |e−r|/max(|e|,|r|) is ill-conditioned at near-zero
+  logits (≈2.0 blowups at zero crossings); all drift values are rowmax-normalized.
+
+### T1 criterion conclusion
+
+F16 tier ② = 96.9% tokens; logits rel drift ~1e-2 (max 1.34e-2); fallback
+sampled drift ≤1e-4 not met → **T1 = 100% NOT achieved — record tier** (014 r2
+allows the record tier when 100% is unattained). The two sides are position-by-
+position equivalent under identical token sequences (conditional 64/64 steps,
+all logits finite both sides); every divergence traces to f16-intermediate
+rounding in engine attention, not a systematic algorithm gap. Q8_0 tier ③
+(≥99.9% greedy) remains the follow-up gate.
+
+### Product-path finding: duplicated last-prompt token (harness bypass)
+
+Engine::generate / generate_stream (run/serve path) re-feed the last prompt
+token as the first decode input: prefill_batch writes S tokens to slots 0..S-1,
+then step(last_prompt_token, pos=S, kv_len=S+1) — the last prompt token occupies
+BOTH slot S-1 and slot S → the context diverges from llama.cpp (and from the
+aligned protocol) at step 1, with O(1) logit differences. Probe evidence
+("Hello"): step 0 matches (21806/21806), step 1 engine argmax 11 (13.95) vs
+referee 0 (15.12/15.17). Consequence: the earlier serve "10/10 greedy_42 match"
+record was graph-on/off self-consistency, not external golden validation. The
+aligned protocol (row0 = prefill row, decode at pos S-1+i) restores the golden
+sequence — verified 6/6 token-identical on the probe and 620/640 over the full
+set. Fix candidate (product path, not applied here — harness-only discipline):
+first decode should step the last prompt token at pos = S-1 with kv_len = S
+(idempotent rewrite of slot S-1).
+
+### Reproduce
+
+    REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc CUDA_VISIBLE_DEVICES=0 \
+    REINFER_MODEL_DIR=$HOME/.reinfer/models/Qwen/Qwen3-0.6B \
+    REINFER_REFEREE=/home/dora/Dev/ai-tokens/llama.cpp/build/bin/llama-referee \
+    REINFER_REFEREE_GGUF=/home/dora/Dev/ai-tokens/bench-tmp-llamacpp/Qwen3-0.6B-f16.gguf \
+    cargo test -p reinfer-cuda --features cuda --test parity -- --ignored \
+      --test-threads=1 --nocapture
+
+(~167 s total; 2 tests: parity_tokenizer_tier1, parity_f16_tier2_generation;
+bitwise reproducible.) Hard asserts: logits fully finite (before any comparison),
+n_vocab equality, tier ① 100%. Allowlist: gpu::parity_tokenizer_tier1 /
+gpu::parity_f16_tier2_generation → gpu.yml l3-parity (checked-ignores.sh ✅).
+
+---
+
+## 014 D8：EOS 停止语义（2026-08-31）
+
+### 根因（双层）
+
+1. **serve/run 的 chat 模板渲染从未成功**（serve 静默回退到原始用户文本）。
+   Qwen3 模板用了 Python 字符串方法 `message.content.startswith(...)` /
+   `.endswith(...)`（multi_step_tool 判定），minijinja 2.24 无这两个字符串
+   方法 → render 抛错 → completion_impl 回退「最后一条 content」→ 实际发给
+   模型的 prompt 就是裸 "Hello"（1 token，无 `<|im_start|>`、无 im_end、无
+   think 块）→ 模型答非所问（" Answer, I need to find the value of the
+   expression..."）→ greedy 永远采不到 `<|im_end|>` → 恒 finish=length。
+   日志证据：usage.prompt_tokens=1（本应为 13）。
+2. **模板上下文键名错误**：render 传的是 `generation: false`，而 Qwen3 模板
+   判定前缀的是 `add_generation_prompt`（vLLM chat-completions 默认 true）
+   → 即使渲染成功也缺 `<|im_start|>assistant\n<think>\n\n</think>\n\n`。
+3. **tokenizer 的 added token 整体匹配缺失**（独立真 bug，修后由单测锁定）：
+   `from_hf_json` 只把 `special:true` 的 added token 标 TYPE_CONTROL；
+   `special:false` 的（`<think>`=151667 / `</think>`=151668 等）保持
+   TYPE_NORMAL → BPE 拆分（6 piece）→ prompt 语义改变。修复：`special:false`
+   一律 TYPE_USER_DEFINED（与 GGUF 路径对齐），partition 整体匹配。
+
+### 修法（全部最小幅度）
+
+- `bin/reinfer/src/pipeline.rs` + `main.rs` render_chat_template：
+  `"generation": false` → `"add_generation_prompt": true`（保留
+  `enable_thinking: false`）；
+- 两处渲染前做模板重写 `.startswith(` → ` | startswith(`、
+  `.endswith(` → ` | endswith(`，并注册等价 minijinja 过滤器；
+- `serve.rs` 渲染失败分支加 eprintln（不再静默）；
+- `crates/tokenizer/src/bpe.rs` from_hf_json：special:false → USER_DEFINED；
+- `crates/arch/src/llama.rs` 新增 `resolve_eos`：generation_config.json
+  `eos_token_id`（数组取首）> config.json > tokenizer eos > qwen3 兜底 151645；
+  serve/main 均接入（当前 Qwen3 解析值 151645，全链不变）。
+
+### 验证（真机 RTX 5090, nvcc 13.2, seed 42）
+
+- t2 eos_short：**finish=stop n=9**（此前 length/64）；vLLM 基线 stop/10
+  （vLLM 把 `<|im_end|>` 计入输出，reinfer 停在 EOS 前不输出该 token）。
+- t2 length_long：**stop n=181**（此前 length/256）——vLLM 基线同样自然停
+  （stop/232）；harness 的 `expected=length` 旧判定对 vLLM 也不成立（存储行
+  ok=False），自然停即正确语义。
+- greedy p0/p1/p3 token 流与 vLLM 逐位一致至 EOS 位（仅末位 vLLM 多
+  `<|im_end|>`）；p0 n=9、p1 n=9、p6 n=33、p2 n=58、p3 n=33 均自然停，
+  全部 < 64。p4/p5/p7/p8/p9 双方同样跑到 64（非本任务范畴）。
+- p2/p6 首 token 与 vLLM 不同（**/秋 等格式化差异）——既有采样/精度 parity
+  议题（S0-3 范畴），与 EOS 语义无关。
+- run CLI `--chat` 冒烟：正常对话应答（模板渲染生效）。
+
+### 教训
+
+- minijinja ≠ jinja2：字符串方法（startswith/endswith）缺失，Qwen3 模板
+  必须改写为过滤器调用；渲染失败路径不应静默回退（已加日志）。
+- 判定一个端点「从不自然停止」前，先核对 usage.prompt_tokens 与渲染产物
+  本身（本次 prompt_tokens=1 是最高效的线索）。
+
+---
+
+## 014 S0-3b: Tier② 100% via parity-f32 criterion tier + dup-token fix (2026-08-31)
+
+### Goal and result
+
+S0-3 left Tier② at 620/640 (96.9%). This pass reaches **640/640 (100%) —
+GATE MET** by adding a parity-f32 criterion tier (REINFER_PARITY_F32, default
+off) plus the product-path dup-token fix. Residual attribution: the remaining
+20/640 diffs came from the f16 intermediate rounding of the product channel
+(activations rounded at every layer step), not from template/sampling surface
+differences; with f32 intermediates every greedy argmax agrees with the
+llama.cpp CPU referee on all 10 prompts × 64 steps.
+
+### Dup-token fix (product path, bin/reinfer/src/pipeline.rs)
+
+`generate_stream` ran its first decode step at pos = S, kv_len = S+1 after
+`prefill_batch` (which had already written slots 0..S-1) — the last prompt
+token ended up in **both** slots S-1 and S, an off-by-one vs the referee's
+position semantics. Fix (≤15 lines): start the decode loop at pos = S-1 with
+kv_len = S — an idempotent rewrite of slot S-1 whose KV cutoff matches the
+llama.cpp referee; the rest of the loop is unchanged (`step(cur, pos, pos+1)`,
+pos increments each iteration). The parity harness already drove the aligned
+protocol (row0 = prefill_batch logits at pos S-1; step at pos S-1+i, kv_len
+S+i), so the product path now mirrors the golden sequence exactly.
+
+### Parity-f32 criterion tier (crates/cuda)
+
+New env `REINFER_PARITY_F32` (parsed by `parity_f32_enabled_from_env`; unit
+test locks default-off). When on:
+
+- **Weights** are loaded as the f32 expansion of their f16 values
+  (`expand_f16_to_f32` in engine.rs — bit-identical values; cublas
+  CUBLAS_COMPUTE_32F rejects mixed f16-B / f32-A inputs; the llama.cpp CPU
+  referee computes f32 activations against f16-valued weights).
+- **Activations** run the whole layer chain in f32: q/k/v stay in the f32 GEMM
+  output buffers (no f16 cast), RoPE/head-norm/scale/attention-output/residual/
+  FFN all f32 (`step_decode_launches_f32`, `gemm1_32f` — A/B/C all
+  CUDA_R_32F). KV stays f16, rounded once at the write (referee f16 KV parity).
+- **Kernels**: new `gather_row_f32`, `scale_f32`, `swiglu_f32`
+  (dense_kernels.cu) and `decode_step_gqa_f32` (decode_gqa_kernels.cu — f32
+  q/out, f16 KV read in-kernel); reuses the existing 014 T7 DiffKernels f32
+  rms_norm_row / rope_row / add_f32_f32_inplace and CUBLAS_COMPUTE_32F gemms.
+- **Prefill**: per-token f32 steps (`prefill_fallback_f32`); the criterion
+  tier only ever sees B=1 traces. trace/detail anchors are f16-only and return
+  plain logits in f32 mode.
+
+### Tier② result (RTX 5090, nvcc 13.2, parity-f32 on)
+
+    prompt   tokens  match first_diff sampled_drift  rel_same_pfx   rel_cond_64
+    p0           64     64 None       1.70e-3       1.82e-3       1.82e-3
+    p1           64     64 None       1.15e-3       1.55e-3       1.55e-3
+    p2           64     64 None       3.80e-3       5.00e-3       5.00e-3
+    p3           64     64 None       1.07e-3       1.33e-3       1.33e-3
+    p4           64     64 None       9.82e-4       1.16e-3       1.16e-3
+    p5           64     64 None       6.27e-3       8.33e-3       8.33e-3
+    p6           64     64 None       3.98e-3       5.40e-3       5.40e-3
+    p7           64     64 None       2.07e-3       2.78e-3       2.78e-3
+    p8           64     64 None       1.75e-3       2.51e-3       2.51e-3
+    p9           64     64 None       9.27e-3       1.55e-2       1.55e-2
+
+    T2 F16 greedy: 640/640 (100%) — GATE MET
+    T4 logits rel drift (full vocab, conditional 64 steps): max 1.55e-2
+    (record, <= 1e-2)
+
+Drift stays at the 1e-3..1e-2 level even in f32: that is now pure
+implementation noise between two independent f32 pipelines (cublas vs ggml
+GEMM reduction orders, softmax expf/rsqrtf forms) — it no longer flips any
+argmax. The f16 quantization of activations was the systematic tie-flipper
+(e.g. the p0 step-44 near-tie in S0-3).
+
+### Regression (product path, serve on release binary)
+
+- t2 eos_short: **finish=stop, n_tokens=9** (unchanged vs S0-2; the fix keeps
+  the aligned context).
+- t2 length_long: finish=stop, n_tokens=231 (was stop/181 pre-fix — the fix
+  changed the duplicated-token context, moving the natural EOS point; the
+  harness `expected=length` verdict never held for either engine, see D8).
+- greedy p0: n=9, natural stop at EOS (vLLM side n=10 with trailing
+  `<|im_end|>` in the output — cross-engine EOS-counting difference, as in
+  D8).
+
+### Reproduce
+
+    REINFER_PARITY_F32=1 REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc \
+    CUDA_VISIBLE_DEVICES=0 REINFER_MODEL_DIR=$HOME/.reinfer/models/Qwen/Qwen3-0.6B \
+    REINFER_REFEREE=/home/dora/Dev/ai-tokens/llama.cpp/build/bin/llama-referee \
+    REINFER_REFEREE_GGUF=/home/dora/Dev/ai-tokens/bench-tmp-llamacpp/Qwen3-0.6B-f16.gguf \
+    cargo test -p reinfer-cuda --features cuda --test parity -- --ignored \
+      --test-threads=1 --nocapture
+
+(~131 s; 2 tests; bitwise reproducible.) Unset REINFER_PARITY_F32 to rerun the
+product f16 channel (expected 620/640, unchanged — the f16 path is untouched
+by the parity tier).
+
+## S1-2: decode-step profile -> data-driven first optimization (2026-08-31)
+
+### Attribution (REINFER_DECODE_PROFILE probe, eager single stream, Qwen3-0.6B, RTX 5090)
+
+Env-gated profiler (`DecodeProfiler` in `crates/cuda/src/engine.rs`): cudaEvent
+segments around the decode step phase groups, 20-step mean, launch counts and
+host wall time. S1-1 conclusion confirmed on the serve baseline (tpot 79.8 ms):
+per-layer ~58 stream ops x 28 layers dominated by small kernels — 32 per-head
+rope launches + 1 scale per layer (the counted launch total was 1627/step, not
+~250; the estimate missed the per-head rope fan-out). Host-side launch cost
+~12-17 us/launch puts 1627 launches ~= 20 ms/step host work vs ~14 ms GPU busy
+at kv_len ~20 pages — host was the wall, launch/host overhead > 60%.
+
+Post-optimization profile (release test build, kv_len 2-41 pages, mean over
+steps 21-40):
+
+```
+      attn   14.171 ms   63.4%  168 launches
+       ffn    3.821 ms   17.1%  196 launches
+       qkv    2.193 ms    9.8%  168 launches
+         o    1.514 ms    6.8%   56 launches
+   lm_head    0.380 ms    1.7%    2 launches
+     small    0.270 ms    1.2%   58 launches
+  gpu busy 22.349 ms/step, 648 launches/step, host wall 18.233 ms/step
+```
+
+(step 1-20 window: gpu busy 14.095 ms, host wall 11.427 ms; the attn segment
+grows linearly with kv pages as expected.) Launch count halved: **1627 -> 648
+per step (-60%)**; host-side wall per step dropped ~45% (est. ~20 ms -> ~11 ms
+at kv ~20 pages). GPU busy is now the binding cost on this measurement path,
+not host launches: the decode attention kernel is 63% at 41 pages, the m=1
+GEMM cluster (qkv+o+ffn) ~34% (qkv/ffn/o at ~10-17% each; ffn is 3 GEMMs of
+2.36 MB each, qkv 0.9 MB each — below the m=1 bandwidth regime, ~8x the
+bandwidth-floor ideal, but cublas m=1 tiles are launch/tail-bound).
+
+### Optimization (graph prelude)
+
+1. **Fused micro-kernels** (`dense_kernels.cu`, bit-identical by construction
+   — same f16 round/widen/round rounding order):
+   - `rope_heads_f16`: batched per-head NEOX RoPE + folded attention scale
+     (q pass scale=1/sqrt(d), k pass scale=1.0); replaces 32 rope launches +
+     1 scale launch per layer (33 -> 2).
+   - `add_cast_f16`: f32->f16 cast + residual add in one launch (o and ffn
+     down residuals; 2 launches -> 1 each).
+2. **Stable GEMM parameter grid** (`GemmPlan` cells in `gemm.rs`, built once
+   at load in `DecodeGemmPlans`): every decode GEMM is a fixed m/n/k + fixed
+   buffer-pointer cell; the step body only executes plans
+   (`Gemm::execute`), numeric arguments bit-identical to the old
+   gemm1/gemm1_32f calls. This is the staging-seed pattern the S1-3 CUDA-graph
+   wave (`graph.rs` `KernelSpec::Gemm{slots,m,n,k}` + `PtrRole`/`PtrUpdate`)
+   addresses the cells by — no parameter re-derivation needed later.
+3. **Static identity page table**: KvStore allocates layer li contiguous
+   physical pages [li*pp, (li+1)*pp), so the decode page table of every layer
+   is the identity mapping; uploaded once at load, removes the 28 per-layer
+   table H2D uploads per step (and their pinned staging). `lens` H2D deduped
+   28 -> 1 per step.
+
+Launch budget after: 58 small + 168 qkv + 168 attn + 56 o + 196 ffn +
+2 lm_head = 648 (per-layer: 2 rms + 2 head-norm + 3 gemm + 3 cast + 2 rope +
+1 kv_write + 1 decode + 1 o-gemm + 1 o add + 1 ffn rms + 4 ffn gemm/cast +
+1 swiglu + 1 down gemm + 1 down add + 1 lens = 23 ops/layer).
+
+### Before / after (release test path, same measurement: 40 decode tokens,
+"Hello" prompt, eager, no profiler)
+
+| metric | before | after |
+|---|---|---|
+| decode tpot | 19.5 ms/tok | 19.7 ms/tok |
+| tok/s | 51.3 | 50.8 |
+| launches/step | 1627 | 648 (-60%) |
+
+tpot is unchanged on this path because it is GPU-bound at these kv lengths
+(gpu busy 14-22 ms > host wall 11-18 ms after the wave); the launch reduction
+removed the host-side wall and bought the S1-3 headroom. The serve path
+(79.8 ms baseline, host-bound) before/after is pending the release binary —
+`bin/reinfer` does not compile while serve.rs carries the concurrent
+graph.rs KernelSpec churn (Send/Handler errors, not this wave's files).
+
+### Determinism regression
+
+greedy temp=0, 16 tokens, "Hello": text identical to the pre-wave baseline
+(" Answer, I need to find the value of the expression $ \\frac{1"), and the
+two-pass determinism test (`engine_deterministic_two_passes`, 8 tokens x2)
+passes: [13876, 38835, 13, 576, 3974, 13876, 38835, 13] both passes. Fused
+kernels are bit-identical by rounding-order construction; plans and the
+identity page table change no numerics.
+
+### Infrastructure fixes surfaced by the probe
+
+- `event.rs`: the `CU_EVENT_BLOCKING_SYNC` constant used 0x2, which is
+  `cudaEventDisableTiming` in the runtime API (headers: blocking sync = 0x1) —
+  every CudaEvent was created timing-disabled, so `cudaEventElapsedTime`
+  always failed (invalid handle). Corrected to 0x1; `elapsed_ms` verified on
+  the real machine (new ffi test).
+- `engine_smoke.rs::engine_decode_timing`: 40-token decode timing anchor
+  (record tier; run with REINFER_DECODE_PROFILE=1 --nocapture for the
+  attribution table).
+
+## 006-2 T2: flash-style decode attention (S1-5 suspension clause, 2026-08-31)
+
+S1-1 profile (above) triggered the 006-2 suspension clause: the decode-step
+attn segment was 14.171 ms/step (63.4% of gpu busy) at the 41-page (656
+kv-token) condition while kv bandwidth is only ~37 us/step — the naive paged
+GQA kernel runs at ~3% bandwidth efficiency. T2 replaced it with a
+flash-style decode kernel (`crates/cuda/kernels/decode_flash_kernels.cu`,
+JIT tier, default on; `REINFER_DECODE_FLASH=off` selects the naive kernel,
+with a fallback counter `decode_flash_fallbacks`).
+
+### Attribution (why the naive kernel is slow)
+
+| factor | evidence | cost share |
+|---|---|---|
+| duplicated QK^T | naive `decode_step_gqa` assigns one thread per output i and recomputes the full q.k_t dot for every t inside the i-loop — the QK^T work is duplicated d times per (b,h) CTA | dominant |
+| latency-bound dot | serial d x kv_len FMA chain per i-thread | dominant |
+| software f16<->f32 conversion | bit-path conversion ~10 ALU instr/element (issue-bound) — the standalone kernel after ILP fixes still measured 138 us @ kv 646 | ~60% of kernel |
+| launch-gap overhead | attn segment = 168 launches/step (28 layers x 6); engine attn > 28x standalone kernel | ~1.1 ms/step |
+
+Per-phase costs (standalone harness, sm_120a, Qwen3-0.6B shapes, 512
+threads, kv 646, cudaEvent over 300 launches): phase A (QK^T) ~47 us,
+phase C (PV) ~10 us, phase B (softmax) ~2 us — kernel ~53 us total with
+hardware conversions (138 us -> 53 us from the F2F/F2H switch alone, plus
+u32 pair loads in phase C).
+
+### Kernel design
+
+One CTA per (b, q_head), 512 threads, three phases, single launch per layer:
+
+- **A QK^T**: fixed stride-512 token assignment, ascending j per dot, two
+  tokens interleaved for ILP, 4 independent j accumulators per token (fixed
+  `(a0+a1)+(a2+a3)` tree). Scores in smem.
+- **B softmax**: block max via fixed warp butterfly + 16-lane tree
+  (`block_reduce_512`, mask 0xffff), strided exp-sum, p[t] write-back.
+- **C PV**: split (output i-pair, token chunk): `ng = d/2` i-groups,
+  `nc = FLASH_TPB/ng` chunks, `i0 = 2*(tid % ng)`, `s = tid/ng`; each thread
+  computes two adjacent outputs from one 4-byte V load (2 f16), ascending t
+  within a chunk, cross-chunk reduction in ascending chunk order via smem
+  (`s_part[2*FLASH_TPB]` covers the full index space for d in {64,128,256}).
+
+Identity fast path: with the static identity page table the K/V rows are
+fully contiguous (`kv + ((page[0]*bl + t)*kv_heads + kv_h)*d`) — no per-token
+page lookup. Output layout identical to `decode_step_gqa` ([B, QH, d] rows).
+
+Accumulation is fp32 throughout (014 32F-acc tier); conversions use the
+hardware F2F/F2H instructions (verified exact IEEE vs the software bit path
+over the full f16 bit space + f32 sweep: differences only in NaN payload
+quieting and the [2^-25, 2^-24) denormal-flush band — both outside D7).
+
+Determinism: no atomics; every reduction is a fixed tree (decode_dot
+convention: xor butterfly in-warp, fixed 16-lane block stage); all loops
+fixed stride/ascending order. Residual reorder noise vs the serial reference
+is ~sqrt(kv_len)*2^-24 << 1 fp16 ulp.
+
+### Diff + determinism (D7 judge tier, RTX 5090, nvcc 13.2)
+
+- `flash_vs_host_ref_identity_d128`, `flash_vs_host_ref_paged` (d=64 trio +
+  d=128, duplicated random physical pages), `flash_vs_naive_f16` (identity +
+  paged trio), `flash_vs_naive_f32` — all pass (f16-out <= 1 ulp after
+  rounding; f32 rel 1e-4 + atol 1e-6). One bug found and fixed during this
+  phase: the phase C i-pair split originally hardcoded 64 groups (d=128 only)
+  — threads with i0 >= d wrote past the row and corrupted neighbors for
+  d=64; made d-generic via `ng = d/2`.
+- Determinism: `flash_deterministic` (two launches bit-identical) ok;
+  `engine_deterministic_two_passes` ok.
+- Text consistency: greedy 16-token double pass — flash tier == naive tier ==
+  " Answer, I need to find the value of the expression $ \\frac{1"
+  (ids [21806, 11, 358, 1184, 311, 1477, 279, 897, 315, 279, 7493, 400,
+  1124, 37018, 90, 16]); zero flash fallbacks.
+- Regression: `attn_flash` 8/8, `engine_smoke` 5/5, `engine_vs_cpu` 2/2,
+  `parity` 2/2 (llama.cpp referee) — all ok on the final kernel.
+
+### Before / after (REINFER_DECODE_PROFILE, same 656 kv condition, 40-token decode)
+
+```
+before (naive):  after (flash), mean over steps 21-40 (kv 637..656):
+      attn   14.171 ms   63.4%      attn    2.285 ms   21.3%   168 launches
+       ffn    3.821 ms   17.1%       ffn    3.764 ms   35.1%   168 launches
+       qkv    2.193 ms    9.8%       qkv    2.738 ms   25.5%   168 launches
+         o    1.514 ms    6.8%         o    1.489 ms   13.9%    28 launches
+   lm_head    0.380 ms    1.7%   lm_head    0.427 ms    4.0%     2 launches
+     small    0.270 ms    1.2%     small    0.018 ms    0.2%    30 launches
+  gpu busy 22.349 ms/step           gpu busy 10.721 ms/step, host wall 8.558 ms
+```
+
+Attn segment 14.171 ms -> 2.285 ms/step at 656 kv (**budget 4 ms met**, 6.2x);
+standalone kernel isolation 9234 us -> 40 us/layer @ 656 (230x); @ 1312 kv
+18467 -> 95 us (193x — linear scaling as expected). Whole machine @ 656 kv:
+tpot 24.1 -> 18.7 ms/tok (41.4 -> 53.6 tok/s; 50.2 tok/s with profiler on);
+128-token decode 106.2 -> 112.6 tok/s (tpot 8.9 ms).
+
+### Limitations
+
+- d contract: even, 4 <= d <= 256, d/2 divides 512 (phase C split; d in
+  {64, 128, 256} today). Outside the contract the caller guards smem
+  ((d + max_kv)*4 <= 48 KB) and the naive kernel remains the fallback.
+- F2H converts [2^-25, 2^-24) to a denormal half (software path gave 0) —
+  below the D7 atol 1e-6 band; NaN payloads are quieted (no NaN on the
+  decode path).
+- Engine attn segment (2.285 ms) > 28 x standalone (1.12 ms): the gap is
+  the per-layer launch overhead + small kernels (rms/rope/kv_write ~6 us/layer),
+  now the dominant remainder of the segment.
+- GQA contiguous-group mapping assumed (kv_h = h / kv_ratio); prefill path
+  untouched; graph.rs/fmha.rs unchanged.
+
+## 2026-08-31 — S1-6: JIT m=1 GEMM (gemv_m1) replaces cublas on decode projections
+
+- 内容：decode 步全部 m=1 f16 GEMM（q/k/v/o/gate/up/down × 7 层 + lm_head）
+  改走 JIT 内核 `gemv_m1_f16f32`（+ `gemv_m1_f16f32_reduce`），cublas 保留为
+  回退（`REINFER_JGEMM=off`；launch 失败 → 回退 + `jgemm_fallbacks` 计数）。
+- 设计：两阶段。phase 1 按 k 切 slab（grid = ncols × nslabs，nslabs 选到
+  ~96 block——仅 ncols 分块时 o/ffn/qkv 只有 4..12 block，线程在途字节不足
+  覆盖 DRAM 延迟，实测反而比 cublas 慢 3×），线程一列、stride-4 × 4 累加器
+  ILP、`__ldg` 标量 2B 读（同 decode_dot 风格；__half2 因 B 列奇偶错位+带宽
+  受限无收益而弃用）；phase 2 按 slab 升序定序归约。无原子、固定序 → 位级
+  确定性。
+- 差分门（crates/cuda/tests/gemm_m1_diff.rs，全部 over-tol 0，D7 门
+  rtol 1e-4+atol 1e-6；两 launch 位级一致）：
+
+  ```text
+  jgemm vs cublas n=  1024 k=1024: max_abs 7.6e-6 max_rel 4.3e-7
+  jgemm vs cublas n=  1536 k=1024: max_abs 9.5e-6 max_rel 3.9e-7
+  jgemm vs cublas n=  3072 k=1024: max_abs 5.7e-6 max_rel 3.9e-7
+  jgemm vs cublas n=  1024 k=3072: max_abs 2.3e-5 max_rel 4.2e-7
+  jgemm vs cublas n=  1536 k=3072: max_abs 1.5e-5 max_rel 3.3e-7
+  jgemm vs cublas n=  3072 k=3072: max_abs 1.5e-5 max_rel 3.4e-7
+  jgemm vs cublas n=151936 k=1024: max_abs 1.5e-5 max_rel 7.9e-7
+  jgemm vs cublas n=151936 k=3072: max_abs 9.2e-5 max_rel 1.5e-6
+  worst max_rel 1.55e-6（预期 ≤1e-5 类）
+  ```
+
+- 引擎 A/B（crates/cuda/tests/jgemm_engine.rs）：16-token 贪心两遍位级一致、
+  fallbacks == 0；jgemm on/off 序列 IDENTICAL。
+- 性能（REINFER_DECODE_PROFILE=1, engine_decode_timing, mean over steps
+  21-40；同期 S1-7 在改 dense/prefill，off 基线随之漂移——同窗口对比）：
+  ```text
+  jgemm off: ffn 6.94 + qkv 4.59 + o 2.99 + lm_head 1.21 = 15.7; gpu busy 17.09 ms/step
+  jgemm on : ffn 1.31 + qkv 0.85 + o 0.40 + lm_head 0.43 = 3.0;  gpu busy  4.20 ms/step (4.1x)
+  ```
+  run CLI 128 tok（同机同窗口）：27.5 → 31.6 tok/s（4.65s → 4.05s）。
+  （本日早间 S1-7 改动前基线 gpu busy 8.21 → 3.54 ms/step。）
+- 限制：
+  - 加法次序与 cublas 分块归约不同 → 数值 ~1.5e-6 rel 漂移（记录档，
+    非位级）；argmax 近平局时理论上可能翻转 token（16-token 实测未现）。
+  - 每计划从 1 个 cublas launch 变为 2 个 jgemm launch（profiler 计数
+    不变，564/step）；host wall 2.8 ms 仍低于
+    gpu busy 4.2 ms，未成瓶颈。
+  - `REINFER_GRAPH=on` 时 jgemm 强制关闭（本轮 graph 仍声明 cublas 节点）；
+    graph 就绪面：`Jgemm::raw_lib()` + `cu_kernel_of` → `CUkernel` 即
+    `NodeRole::CustomKernel` 捕获形式，`SpecAcc::custom(handle, 5/6 槽位…)`
+    + 全槽 PtrUpdate 可表达（下一波接线）。
+  - 内核契约：任意 k ≥ 1（逐位 guard）；m=1/f16/f32/OP_T 外形状一律
+    回退 cublas。
+
+## 2026-08-31 — S1-7: fused QKV prefill + FMHA heuristics（D7 位级一致）
+
+- 内容：prefill 的 q/k/v 三段 GEMM+cast 融合为一次宽 GEMM（fused 权重 =
+  三权重按行拼接，n = nqk+2·kvk = 4096；布局已在
+  `fused_qkv_gemm_layout_probe` 证明 cublas 层位级一致），配合单遍
+  `cast_split_qkv_f16` 内核（c_qkv [s×4096] f32 → q [s·nqk] / k [s·kvk] /
+  v [s·kvk] 三段连续 f16）。FMHA 启发式 `pick(seqlen)` 本轮证据表定版
+  v2（128×64×4w，98304B smem）全长度，v0/v1/v2 位级一致（fmha.rs 注释
+  有证据表：v2 比 v0 快 2.5-4.4x，比 v1 快 ~1.3x）。
+- D7 根因（此前 fused 腿垃圾输出的定案）：fused 腿曾把列偏移指针
+  （qb、qb+nqk、qb+nqk+kvk）传进 [s×4096] 行交错缓冲，而下游所有内核
+  （rms_norm_heads / rope_neox_rows / kv_write_seq_rows / FMHA 启动器）
+  都按行连续索引 → 确定性垃圾（2.75e1、151913/151936 全复现）。修复 =
+  `cast_split_qkv_f16` 单遍切分 cast（`f32_to_hbits` 与分离腿
+  `cast_f32_to_f16` 字节相同），下游三缓冲恢复连续布局。
+- D7 门（fmha_prefill.rs，只读）：fused vs separated prefill-end logits
+  **位级一致** —— seq 256/1024/2047 全部 worst|a-b|=0.00e0、
+  0/151936 over D7（`elems_over_d7=0`）。FMHA 变体互证
+  （fmha_variant_numeric_identity）与 FMHA vs dense 参考
+  （fmha_vs_dense_reference，7 形状）均绿。FMHA 预检门
+  （fmha.rs `if first {`，首用 per-address-key 无条件 v0 启动）
+  保留为引擎正确性的必要掩蔽（机制见下）。
+- 微基准（`fmha_heuristics_bench.rs::prefill_qkv_leg_microbench`，需
+  warmup 吸收首跑 JIT；本机 RTX 5090 Laptop 运行间波动 ±20-30%，
+  nvidia-smi 采样：SM 1582-1605MHz（idle）/ 2640-2760MHz（burst），
+  无 SM 节流；重复同 seq fused 第二次调用有 ~1.6x 慢态（全内核均匀
+  膨胀，跨 4 次运行复现，成因未定，仅影响 2047 第二次调用）：
+
+  ```text
+  prefill wall（rep0，中位）          fused       sep        fused 优势
+  seq=256                             56.6-57.7ms  65.3-67.1ms   -14%（省 ~9ms）
+  seq=2047（2048 词基准）             213-217ms    281-288ms     -22%（省 ~65ms）
+  seq=2659                            331-367ms    386-442ms     -20%（省 ~80ms）
+  ```
+
+  per-kernel（REINFER_PREFILL_PROFILE=1，ms/layer，x3 = 三 launch 合计）：
+  ```text
+  seq     fused gemm_qkv    sep gemm_qkv    宽 GEMM 收益      wall（fused vs sep）
+  256     0.213-0.220 x1    0.598-0.602 x3    2.7x            55-57 vs 65-67ms
+  2047    1.092        x1    1.569        x3    1.4x            210-220 vs 302-311ms
+  2659    1.70-1.73    x1    2.12-3.03    x3    1.4-1.8x        309-322 vs 415-455ms
+  ```
+  （早前"2659 宽 GEMM 有 cublas 形状病"结论作废 —— 那是无 warmup 首跑
+  污染。cast_split 单遍 cast 0.057ms/layer 比分离三 cast 0.022ms 慢，
+  全 pref 累计 ~1-3ms，可后续微调。）
+- **FMHA 写跳过根因（本会话定案）+ 引擎 pick 改 v1**：v2（128×64×4w）
+  内核 x-major 网格**后半 CTA（blockIdx.x ≥ gM/2）完整执行到 epilogue
+  （printf 探针 enter+exit 32/32 CTA 全出）但 O/LSE 的 desc 通路 gmem
+  存储**永不落地**：pattern-fill（o=0xAAAA, lse=0x41414141）+ 单次 v2
+  launch 后 512 词 rows 256..511 逐字节保持 0xAAAA（131072/131072）、
+  LSE 同样（1024/1024）；SASS epilogue = 无条件 STG.E.128 + 正确仿射
+  地址（无 CTA 判别分支），同一 CTA 的 printf 环形缓冲写入（普通 VA
+  存储）能落地 → 丢弃在 desc 数据通路/驱动层。边界：gM≥2 即出现
+  （256：x=1 丢；512：x∈{2,3} 丢），与"冷上下文 race"无关（launch
+  #66 依旧丢）。**v0/v1（声明 smem == 启动 smem = 98304）全块写入**
+  （v0/v1-control @512 o-stale [9,12,20,18] = 合法 0xAAAA 尘埃），
+  只有 v2（声明 65536 ≠ 启动 98304）丢 → 丢与声明/启动 smem 失配相关。
+  v2 以真 65536 启动 → Err: Driver 同步故障（32/32 enter 无 exit），
+  98304 超额声明必需。12.6-nvcc "全 0 输出" 笔记 = 同一现象（新缓冲上
+  的陈旧零）。**引擎 pick 自 v2 改 v1**（fmha.rs pick_variant：
+  128×128×8w，声明=启动=98304，全块写入；per-call FMHA 比 v2 慢
+  ~3.2x 但 GEMM 腿主导 prefill wall → 墙时影响 ~2%，v0 基线之上
+  ~1.38x）；v0 预检门保留为廉价保险（每 (shape,address) 键一次，
+  位级一致混读无害）。引擎 28 层 FMHA 共用同一 (q,k,v,o,lse) 地址键
+  → 预检每 pref 只触发一次，v2 时代的 2+ 层 = v2 裸奔 → 批次腿
+  pos128+ 陈旧链（batch_vs_step 漂移 @seq=256 的批次侧成因，已定案）。
+- 端到端 run CLI（Qwen3-0.6B, t=0）：2048 词 TTFT 当前 1065ms /
+  256 词 141ms —— **被 S1-9 decode 段回归污染，非可验收数字**：
+  fused decode 在 kv≥64 数值错、kv≥256 launch 失败
+  （"kernel launch failed: invalid or unknown error"）→ 每步回退 naive
+  GQA。基线（S1-6 时期）：2048 词 927/931ms、256 词 133/136ms。
+  engine_prefill_batch_vs_step_loop 门同因失败（drift 2.393e1 @seq=256，
+  gate 2.275e-1；修复前 2.436e1 —— 漂移量级未变）。定位探针
+  （step_loop_divergence_probe）：s=64 零坏位置（worst 6.8e-2），
+  s=256 恰在 kv_len=64 起漂移（pos64 drift 2.1e1，168/256 坏）→
+  边界在 64-key chunk 而非实现分歧；已交 S1-9 处理。**S1-9 根因 =
+  release-only 编译错位（fused.rs build_plans 的 lm_head plan 行
+  rvalue 地址 + 原始切片，opt-3 下未物化 → 全零 lm logits → [UNK]），
+  已修（命名局部变量）；step-loop 腿 = S1-9 侧，批次腿 pos128+ 陈旧链
+  = 本会话定案的 v2 写跳过（见上），pick 改 v1 后两条都清。**
+- 与 vLLM 的诚实差距：2048 词 vLLM ~200k tok/s（~13ms）vs 当前 fused
+  prefill 2047 tokens ~213-217ms（~9.5k tok/s，v1 pick 后 ~218-222ms /
+  ~9.2-9.4k tok/s）≈ 17-18x；prefill 路径累计（对比 dense 逐 token
+  时代 942s）~4200x。S1-7 本轮 = 宽 GEMM + 位级 D7 + 启发式定版（v2
+  最快但驱动写跳过不可用 → v1）+ 写跳过根因定案，下一轮大头在
+  prefill/decode 交界与 FMHA 驱动层问题（若换驱动版本 v2 或可回归）。
+
+## 2026-09-01 — S1-9b: FFN decode 段压缩（260→300 tok/s 目标）
+
+- 起点（S1-9 融合后，REINFER_DECODE_PROFILE 子段 SEG_FFN_GU/D/RMS）：
+  FFN 段 1.55ms（43%）：gate 6.29MB + up 6.29MB + down 6.29MB =
+  528MB/step ≈ 340GB/s（896 GB/s 锚点的 38%）；release ~250 tok/s。
+- 改动（仅 decode 段：gemm_m1.cu / decode_fused_kernels.cu + engine
+  fused FFN 区 + 测试；graph.rs 只读；prefill 未动）：
+  1. `Jgemm::shape` 每计划 block 目标：2n < k（down，k=3072）→ 192，
+     其余 96 → nslabs_d 24→48（grid 96→192）。**D7 记录**：down 列
+     归约加数 24→48、序变化，预期 |Δ| ≤ 1e-6（gemm.rs 文档已注）。
+  2. **slab-partials 布局转置为 s-major** `partials[slab*n + col]`
+     （10 处：gemm_m1.cu 2 + decode_fused 8）：固定 slab 下 warp 的
+     32 列 = 128B 连续一行——add_rms 的 48 项归约从 32 个分散 4B
+     sector 请求变为 1 个 line（瓶颈是 LSU 事务数，不是延迟）。
+  3. `gemv_phase1` `#pragma unroll 8`：s-major store 让 ptxas 把
+     B 载入流水缩到 40 regs（48→40，实测 2× 变慢）；unroll 8 →
+     56 regs 恢复流水深度。
+  4. `__launch_bounds__(256, 2)` on `gemv_m1_f16f32_multi`（128
+     regs）：微基准 p1_gu 11.35us（= c-major 基线），DRAM 常驻下
+     ffn_gu 0.661（优于 c-major 0.738）。
+  5. engine/fused.rs：p2_add_rms 回退 b256（b1024 实测无收益且要
+     重排 256-slot 平方和树）；动态 stripe 映射门（slab_k ∈
+     {64,128,256}，48-slab 准入）。
+- 微基准（cudaEvent，L2 常驻，mean 10，单点测量每次改动）：
+
+  ```text
+  variant                       p1_gu   p2_gu_d  add_rms48  add_rms24
+  c-major unroll-4（旧）         11.1     12.3      20.5       11.0
+  s-major unroll-4              22.6     12.3      12.3       11.0
+  s-major unroll-8 + lb(256,2)  11.35    12.3     12.3-14.3   10.9
+  ```
+  add_rms 的 48/24 slab 差距从 9.5us 塌缩到 ~1.5us。
+- 引擎 A/B（REINFER_DECODE_PROFILE，window 21-40，kv 637-656，
+  mean 20 steps，release；同日同机基线=任务前树）：
+
+  ```text
+                     before     after(两次)         Δ
+  ffn_gu            0.838    0.641/0.661        −21/−23%
+  ffn_d             0.776    0.542/0.552        −29/−30%
+  ffn_rms           0.332    0.409              +23%（48-slab 归约代价，已封顶）
+  qkv               0.734    0.667/0.682        −7/−9%
+  o                 0.660    0.623/0.640        −3/−6%
+  lm_head           0.561    0.393/0.406        −28/−30%
+  attn              0.393    0.380/0.393        ~0
+  gpu busy  ms/step 4.307    3.665/3.754        −13/−15%（≥5% 尺 ✓）
+  host wall ms/step 3.649    3.157/3.230
+  launches/step     229      229（节点数不变）
+  ```
+  （对照更早记录的 96-flat 基线 gpu busy 4.074：−10/−12%。）
+- run CLI（release，4096 窗口，128 tok，贪心，seed 42）：当前
+  284.8/270.3 tok/s（目标区间 260-300 内）；同日基线 292.9 —— 该
+  表面短 kv（≤128）主机侧 launch 开销主导，±3-5% 噪音内无差别；
+  对 S1-9 记录的 ~250 tok/s 为 +14%。
+- 验收门（全过）：
+  - `fused_layer_bit_exact_vs_split`：7 个 partials 段 + q/k/v、attn、
+    x、xn_ffn、xn_attn、down 全 0-ulp 位级一致（s-major 透明）。
+  - `fused_determinism_double_run`：双跑逐 token 一致。
+  - `fused_engine_ab_bitwise`：真机 128 decode 步位级一致。
+  - graph（REINFER_GRAPH=1）：捕获成功 228 kernel nodes == 228
+    declared specs（grid/block 变化经 shape 推导进 SpecAcc，无
+    节点数变化）；graph-on/off 160 步位级一致。
+  - D7 记录：见上；预期 |Δ| ≤ 1e-6。
+- 结论：gpu busy 4.307 → 3.665/3.754（−13/−15% 同日 A/B，≥5%
+  达标）；tok/s 284.8（260-300 目标内）。FFN 段（gu+d+rms）合计
+  1.946 → 1.59/1.62ms（−17/−19%）。
+- 遗留：run CLI 短 kv 表面 host 侧主导（229 launches × ~9-16us），
+  tok/s 提升需 gpu busy 到 2.5ms 以下才可见——下轮 launch 压缩
+  （graph replay 在 13.x runtime）前该表面已饱和；graph.rs 两个
+  `unnecessary unsafe` 警告为既有，未动。

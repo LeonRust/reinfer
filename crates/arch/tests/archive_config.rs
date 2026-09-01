@@ -26,7 +26,9 @@ fn meta_value(meta: &reinfer_gguf::ModelMeta, arch: &str, key: &str) -> Option<S
 #[test]
 fn archive_config_roundtrip() {
     let Some(path) = std::env::var_os("REINFER_MODEL_GGUF") else {
-        eprintln!("skipped: REINFER_MODEL_GGUF unset (archive check via scripts/golden/archive_check.sh)");
+        eprintln!(
+            "skipped: REINFER_MODEL_GGUF unset (archive check via scripts/golden/archive_check.sh)"
+        );
         return;
     };
     let reader = GgufReader::open(&path).expect("archive open");
@@ -63,7 +65,8 @@ fn archive_config_roundtrip() {
             continue; // optional key present with default (derived) value
         };
         assert_eq!(
-            expect, checks.iter().find(|(f, _)| *f == field).unwrap().1,
+            expect,
+            checks.iter().find(|(f, _)| *f == field).unwrap().1,
             "config field {field} vs meta key {key}"
         );
     }

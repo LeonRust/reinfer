@@ -3,10 +3,10 @@
 //! 单线程顺序（IEEE fp32）：同输入跨进程位级稳定（确定性声明范围：同机
 //! 跨机）。矩阵乘累加顺序与 `kernels::refs::matmul_ref` 一致（i→t→j）。
 
-use crate::model::Model;
 use crate::RunError;
-use reinfer_gguf::codes;
+use crate::model::Model;
 use reinfer_gguf::GgufDtype;
+use reinfer_gguf::codes;
 
 /// 单行字节数（行 = `d` 元素；Q8_0 行按 32 元素块对齐——d 需为 32 的倍数）。
 pub fn row_bytes(dtype: GgufDtype, d: usize) -> Result<usize, RunError> {
@@ -161,7 +161,8 @@ pub fn decode_step(
     for (li, layer) in model.layers.iter().enumerate() {
         // attn_norm → qkv
         let norm = weight_to_f32(&layer.attn_norm, GgufDtype::F16)?;
-        let used = rmsnorm(&x, &norm, cfg.rms_eps);        let qw = weight_to_f32(&layer.q, layer.dtype_q)?;
+        let used = rmsnorm(&x, &norm, cfg.rms_eps);
+        let qw = weight_to_f32(&layer.q, layer.dtype_q)?;
         let kw = weight_to_f32(&layer.k, layer.dtype_q)?;
         let vw = weight_to_f32(&layer.v, layer.dtype_q)?;
         let ow = weight_to_f32(&layer.o, layer.dtype_q)?;
@@ -221,7 +222,8 @@ pub fn decode_step(
         }
         // ffn
         let n1 = rmsnorm(&x, &weight_to_f32(&layer.ffn_norm, GgufDtype::F16)?, cfg.rms_eps);
-        let f = ffn_swiglu(&n1, &fg, &fu, &fd, hidden, cfg.ffn_hidden);        for i in 0..hidden {
+        let f = ffn_swiglu(&n1, &fg, &fu, &fd, hidden, cfg.ffn_hidden);
+        for i in 0..hidden {
             x[i] += f[i];
         }
     }
@@ -244,16 +246,11 @@ fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(w.iter()).map(|(a, b)| a * rstd * b).collect()
 }
 
-
 /// 与投影同长的 bias（f16）逐元素加入。
 fn add_bias_to(x: &mut [f32], bias: &[u8], dtype: GgufDtype) -> Result<(), RunError> {
     let b = weight_to_f32(bias, dtype)?;
     if b.len() != x.len() {
-        return Err(RunError::WeightShape(format!(
-            "bias len {} vs out {}",
-            b.len(),
-            x.len()
-        )));
+        return Err(RunError::WeightShape(format!("bias len {} vs out {}", b.len(), x.len())));
     }
     for (xi, bi) in x.iter_mut().zip(b) {
         *xi += bi;

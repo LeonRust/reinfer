@@ -1,6 +1,8 @@
 # Plan: CUDA performance upgrade — vendor tier + CUDA graphs
 
 > Derived from specs/006-cuda-perf/spec.md
+> Performance baseline: docs/design/benchmark-gap-2026-08-29.md（Wave-1 targets：decode
+> 11→150-250 tok/s、long-prefill 944s→3-8s；与 006 门禁 0.85× llama.cpp CUDA 并存）
 
 ## Architecture Decisions
 

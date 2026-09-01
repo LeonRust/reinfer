@@ -59,7 +59,19 @@ impl DiffKernels {
         let add_mask = lib.kernel("add_f32_f32_inplace")?;
         let transpose16 = lib.kernel("transpose_f16")?;
         let transpose32 = lib.kernel("transpose_f32")?;
-        Ok(Self { lib, rms, rope, softmax, softmax_matrix, cast_f16, add_mask, transpose16, transpose32, stream, arch: arch.to_string() })
+        Ok(Self {
+            lib,
+            rms,
+            rope,
+            softmax,
+            softmax_matrix,
+            cast_f16,
+            add_mask,
+            transpose16,
+            transpose32,
+            stream,
+            arch: arch.to_string(),
+        })
     }
 
     /// 目标架构（诊断）。
@@ -135,7 +147,9 @@ impl DiffKernels {
             (&rows as *const u32) as *mut c_void,
             (&rowlen_v as *const u32) as *mut c_void,
         ];
-        unsafe { super::jit::launch_rows(self.softmax_matrix, stream, dev, rows, 256, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_rows(self.softmax_matrix, stream, dev, rows, 256, args.as_mut_ptr())
+        }
     }
 
     /// 单行 softmax（输入已含 -inf 掩码位；全无效行输出全 -inf）。
@@ -162,7 +176,6 @@ impl DiffKernels {
     }
 }
 
-
 impl DiffKernels {
     /// f32 → f16 元素转换（RNE；PV 前 dtype 一致化——014 T7）。
     pub fn launch_cast_f32_f16(
@@ -182,10 +195,18 @@ impl DiffKernels {
             (&n_v as *const u32) as *mut c_void,
         ];
         // SAFETY：同矩阵 launch。
-        unsafe { super::jit::launch_rows(self.cast_f16, stream, dev, n.div_ceil(256), 256, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_rows(
+                self.cast_f16,
+                stream,
+                dev,
+                n.div_ceil(256),
+                256,
+                args.as_mut_ptr(),
+            )
+        }
     }
 }
-
 
 impl DiffKernels {
     /// 就地加掩码（s += mask；mask 含 -inf 位）。
@@ -205,10 +226,18 @@ impl DiffKernels {
             (&mask as *const *const f32) as *mut c_void,
             (&n_v as *const u32) as *mut c_void,
         ];
-        unsafe { super::jit::launch_rows(self.add_mask, stream, dev, n.div_ceil(256), 256, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_rows(
+                self.add_mask,
+                stream,
+                dev,
+                n.div_ceil(256),
+                256,
+                args.as_mut_ptr(),
+            )
+        }
     }
 }
-
 
 impl DiffKernels {
     /// f16 转置行主序 [rows×cols] → [cols×rows]。
@@ -234,10 +263,20 @@ impl DiffKernels {
         // grid (cols/16, rows/16)；block 16×16（transpose 常规形态）。
         let gx = cols.div_ceil(16);
         let gy = rows.div_ceil(16);
-        unsafe { super::jit::launch_grid(self.transpose16, stream, dev, gx, gy, 16, 16, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_grid(
+                self.transpose16,
+                stream,
+                dev,
+                gx,
+                gy,
+                16,
+                16,
+                args.as_mut_ptr(),
+            )
+        }
     }
 }
-
 
 impl DiffKernels {
     /// f32 转置行主序 [rows×cols] → [cols×rows]。
@@ -260,6 +299,17 @@ impl DiffKernels {
             (&rows_v as *const u32) as *mut c_void,
             (&cols_v as *const u32) as *mut c_void,
         ];
-        unsafe { super::jit::launch_grid(self.transpose32, stream, dev, cols.div_ceil(16), rows.div_ceil(16), 16, 16, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_grid(
+                self.transpose32,
+                stream,
+                dev,
+                cols.div_ceil(16),
+                rows.div_ceil(16),
+                16,
+                16,
+                args.as_mut_ptr(),
+            )
+        }
     }
 }

@@ -190,9 +190,7 @@ pub fn from_gguf_meta(meta: &ModelMeta) -> Result<LlamaConfig, ArchError> {
         None => meta
             .meta_array_str("tokenizer.ggml.tokens")?
             .map(|t| t.len())
-            .ok_or_else(|| ArchError::MissingKey {
-                key: key(architecture, "vocab_size"),
-            })?,
+            .ok_or_else(|| ArchError::MissingKey { key: key(architecture, "vocab_size") })?,
     };
 
     let q_heads = required_u32(meta, &key(architecture, "attention.head_count"))? as usize;
@@ -304,11 +302,13 @@ pub fn from_gguf_meta(meta: &ModelMeta) -> Result<LlamaConfig, ArchError> {
 ///
 /// 零模型标识：仅架构类型字符串白名单（llama.cpp arch 表同款），无仓库/文件名。
 pub fn from_hf_config(value: &serde_json::Value) -> Result<LlamaConfig, ArchError> {
-    let model_type =
-        value.get("architectures").and_then(|a| a.as_array()).and_then(|a| a.first())
-            .and_then(|a| a.as_str())
-            .or_else(|| value.get("model_type").and_then(|m| m.as_str()))
-            .ok_or_else(|| ArchError::MissingKey { key: "architectures".into() })?;
+    let model_type = value
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|a| a.as_str())
+        .or_else(|| value.get("model_type").and_then(|m| m.as_str()))
+        .ok_or_else(|| ArchError::MissingKey { key: "architectures".into() })?;
     let (architecture, head_norm) = match model_type {
         "LlamaForCausalLM" | "llama" => (Architecture::Llama, false),
         "Qwen2ForCausalLM" | "qwen2" => (Architecture::Qwen2, false),
@@ -350,9 +350,7 @@ pub fn from_hf_config(value: &serde_json::Value) -> Result<LlamaConfig, ArchErro
         .get("head_dim")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
-        .unwrap_or_else(|| {
-            if hidden_size % q_heads != 0 { 0 } else { hidden_size / q_heads }
-        });
+        .unwrap_or_else(|| if hidden_size % q_heads != 0 { 0 } else { hidden_size / q_heads });
     if head_dim == 0 {
         return Err(ArchError::InvalidValue {
             key: "head_dim".into(),
@@ -370,12 +368,10 @@ pub fn from_hf_config(value: &serde_json::Value) -> Result<LlamaConfig, ArchErro
             why: "rope theta must be finite and > 0",
         });
     }
-    let rms_eps = value
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .unwrap_or(1e-5);
-    let id = |key: &str| -> Option<u32> { value.get(key).and_then(|v| v.as_u64()).map(|v| v as u32) };
+    let rms_eps =
+        value.get("rms_norm_eps").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(1e-5);
+    let id =
+        |key: &str| -> Option<u32> { value.get(key).and_then(|v| v.as_u64()).map(|v| v as u32) };
 
     Ok(LlamaConfig {
         architecture,
@@ -397,6 +393,42 @@ pub fn from_hf_config(value: &serde_json::Value) -> Result<LlamaConfig, ArchErro
         unk_id: id("unk_token_id"),
         head_norm,
     })
+}
+
+/// EOS 解析优先级（014 D8；vLLM 对齐）：
+/// `generation_config.json` 的 `eos_token_id`（列表取首）> `config.json`
+/// 的 `eos_token_id` > tokenizer 的 eos（`<|im_end|>` 类特殊 token）>
+/// 模型族兜底（qwen3 → 151645，其余无）。
+///
+/// `eos_token_id` 兼收标量与数组（`generation_config.json` 常为
+/// `[151645, 151643]` 形式）。调用于 serve/run 载入 tokenizer 之后，以便
+/// 传入 `tokenizer.eos_token()`。
+pub fn resolve_eos(
+    cfg: &serde_json::Value,
+    gen_cfg: Option<&serde_json::Value>,
+    tokenizer_eos: Option<u32>,
+) -> Option<u32> {
+    let first_eos = |v: &serde_json::Value| -> Option<u32> {
+        v.get("eos_token_id").and_then(|e| {
+            e.as_u64().map(|i| i as u32).or_else(|| {
+                e.as_array().and_then(|a| a.first()).and_then(|x| x.as_u64()).map(|i| i as u32)
+            })
+        })
+    };
+    if let Some(v) = gen_cfg.and_then(first_eos) {
+        return Some(v);
+    }
+    if let Some(v) = first_eos(cfg) {
+        return Some(v);
+    }
+    if let Some(v) = tokenizer_eos {
+        return Some(v);
+    }
+    let mt = cfg.get("model_type").and_then(|m| m.as_str()).unwrap_or_default();
+    if mt.starts_with("qwen3") {
+        return Some(151_645); // `<|im_end|>`
+    }
+    None
 }
 
 /// `{arch}.{suffix}` 完整键名。
@@ -512,7 +544,9 @@ mod tests {
         kvs.push((
             "tokenizer.ggml.tokens".into(),
             MetaValue::Array(reinfer_gguf::ArrayValue::Str(vec![
-                "a".into(), "b".into(), "c".into(),
+                "a".into(),
+                "b".into(),
+                "c".into(),
             ])),
         ));
         let cfg = from_gguf_meta(&meta(kvs)).unwrap();

@@ -53,7 +53,12 @@ pub fn classify(code: CudaErrorCode) -> Option<LaunchError> {
             Some(LaunchError::Driver)
         }
         // fail-closed：参数/未知/未来新码一律 Fatal（须显式加入白名单才放宽）
-        _ => Some(LaunchError::Fatal),
+        other => {
+            // TEMP-DIAG: 保留原始错误码便于部署侧诊断（BLOCKER-B 排查）；
+            // 定位后删除本行或提升为 debug 日志。
+            eprintln!("reinfer-cuda: classify fallback code={other:?}");
+            Some(LaunchError::Fatal)
+        }
     }
 }
 

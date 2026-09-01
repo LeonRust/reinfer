@@ -81,7 +81,8 @@ pub fn prefill_attention(
     )?;
 
     // 1) S = Q·K^T（行主序 gemm：f32×f32、compute 32F——判据档）。
-    let a = GpuMat { ptr: q.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: d_i };
+    let a =
+        GpuMat { ptr: q.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: d_i };
     let b = GpuMat {
         ptr: scratch.kt.as_ptr() as *mut c_void,
         dtype: blas::cudaDataType_t::CUDA_R_32F,
@@ -127,12 +128,28 @@ pub fn prefill_attention(
     )?;
 
     // 2) 行 softmax（sr 行主序 → 原地；P 保持 f32——fp32 中间判据档）。
-    sm.launch_masked_softmax_matrix(dev, stream, scratch.sr.as_ptr() as *const f32, scratch.sr.as_ptr() as *mut f32, seq as u32, seq as u32)?;
+    sm.launch_masked_softmax_matrix(
+        dev,
+        stream,
+        scratch.sr.as_ptr() as *const f32,
+        scratch.sr.as_ptr() as *mut f32,
+        seq as u32,
+        seq as u32,
+    )?;
 
     // 3) O = P·V（行主序全 f32；P 即 sr、V [seq×d]）。
-    let pa = GpuMat { ptr: scratch.sr.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: seq_i };
-    let vb = GpuMat { ptr: v.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: d_i };
-    let mut oc = GpuMat { ptr: out.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: seq_i };
+    let pa = GpuMat {
+        ptr: scratch.sr.as_ptr() as *mut c_void,
+        dtype: blas::cudaDataType_t::CUDA_R_32F,
+        ld: seq_i,
+    };
+    let vb =
+        GpuMat { ptr: v.as_ptr() as *mut c_void, dtype: blas::cudaDataType_t::CUDA_R_32F, ld: d_i };
+    let mut oc = GpuMat {
+        ptr: out.as_ptr() as *mut c_void,
+        dtype: blas::cudaDataType_t::CUDA_R_32F,
+        ld: seq_i,
+    };
     blas.gemm_exec(
         stream,
         seq_i,

@@ -9,3 +9,4 @@ profiler/
 .idea/
 .vscode/
 .cargo/config.toml
+crates/cuda/vendor/fmha/upstream/

@@ -135,3 +135,75 @@ extern "C" __global__ void decode_step_gqa(
         out[((size_t)(b * QH + h)) * d + i] = f32_to_hbits(acc);
     }
 }
+
+// 014 S0-3b: parity-f32 criterion tier — decode attention with f32 q and f32
+// out (the engine's f32 channel keeps q/k/v activation in f32 after the
+// projection GEMM; RoPE and the scale are applied in f32 upstream). KV stays
+// f16 — rounded once at the write, same as the llama.cpp CPU referee f16 KV
+// cache. Scores/softmax math identical to decode_step_gqa (f32, two-pass).
+extern "C" __global__ void decode_step_gqa_f32(
+    const float* __restrict__ q,         // [B, QH, d] f32
+    const unsigned int* __restrict__ page,
+    const unsigned short* __restrict__ kv,   // K [P][BL][KH][d] then V (f16)
+    const unsigned int* __restrict__ kv_lens,
+    float* __restrict__ scores,          // [B, QH, max_kv] scratch
+    float* __restrict__ out,             // [B, QH, d] f32
+    int B, int QH, int d, int block_len, int kv_ratio, int kv_heads,
+    int max_kv, int total_pages) {
+    int cta = blockIdx.x;
+    if (cta >= B * QH) {
+        return;
+    }
+    int b = cta / QH;
+    int h = cta % QH;
+    int kv_h = h / kv_ratio;
+    int kv_len = (int)kv_lens[b];
+    int tid = threadIdx.x;
+
+    const int per_tok_kv = kv_heads * d;
+
+    if (kv_len <= 0) {
+        return;
+    }
+
+    const size_t kv_base = (size_t)total_pages * block_len * per_tok_kv; // V 区基址
+    const float* qrow = q + (size_t)(b * QH + h) * d;
+    float* orow = out + (size_t)(b * QH + h) * d;
+
+    for (int i = tid; i < d; i += TPB) {
+        float maxv = -1e30f;
+        const size_t score_base = (size_t)(b * QH + h) * max_kv;
+        float qi = qrow[i];
+        for (int t = 0; t < kv_len; ++t) {
+            int lp = t / block_len;
+            int off = t % block_len;
+            unsigned int phys = page[lp];
+            const unsigned short* krow =
+                kv + (((size_t)phys * block_len + off) * kv_heads + kv_h) * d;
+            float acc = 0.0f;
+            for (int j = 0; j < d; ++j) {
+                acc += qrow[j] * hbits_to_f32(krow[j]);
+            }
+            scores[score_base + t] = acc;
+            if (acc > maxv) {
+                maxv = acc;
+            }
+        }
+        float sumv = 0.0f;
+        for (int t = 0; t < kv_len; ++t) {
+            sumv += expf(scores[score_base + t] - maxv);
+        }
+        float inv = sumv != 0.0f ? 1.0f / sumv : 0.0f;
+        float acc = 0.0f;
+        for (int t = 0; t < kv_len; ++t) {
+            float p = expf(scores[score_base + t] - maxv) * inv;
+            int lp = t / block_len;
+            int off = t % block_len;
+            unsigned int phys = page[lp];
+            const unsigned short* vrow = kv + kv_base +
+                (((size_t)phys * block_len + off) * kv_heads + kv_h) * d;
+            acc += p * hbits_to_f32(vrow[i]);
+        }
+        orow[i] = acc;
+    }
+}

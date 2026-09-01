@@ -41,14 +41,19 @@ pub mod arch;
 #[cfg(feature = "cuda")]
 pub mod jit_provider;
 
+pub mod attention;
+pub mod decode;
+pub mod dequant;
 /// diff 内核（rms_norm/rope/masked_softmax；012 D2；feature `cuda`）。
 #[cfg(feature = "cuda")]
 pub mod diff;
-pub mod dequant;
-pub mod gemm;
-pub mod attention;
-pub mod decode;
 pub mod engine;
+pub mod fmha;
+/// S1-9: fused decode-step kernels（融合组装载/plan 表/发射；feature `cuda`）。
+#[cfg(feature = "cuda")]
+pub mod fused;
+pub mod gemm;
+pub mod graph;
 mod send_sync;
 
 #[cfg(feature = "cuda")]
@@ -62,5 +67,13 @@ pub mod buffer;
 
 #[cfg(feature = "cuda")]
 pub use buffer::{DeviceBuffer, HostBuffer, MemRef, copy, copy_async};
+
+/// GPU sampler 链（006-2 T3C；feature `cuda`）：单 launch 内核 +
+/// `GpuSamplerChain`（penalty+softmax+topk/argmax，单流，D2 三层契约）。
+#[cfg(feature = "cuda")]
+pub mod sampler;
+
+#[cfg(feature = "cuda")]
+pub use sampler::GpuSamplerChain;
 // MemcpyKind 共享于 kernels（昇腾后端复用同一校验逻辑）
 pub use reinfer_kernels::MemcpyKind;

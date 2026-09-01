@@ -36,16 +36,20 @@ fn load() -> (Tokenizer, serde_json::Value, usize) {
 #[ignore = "hf smoke: env-gated real model"]
 fn qwen3_hf_tokenizer_smoke() {
     let (t, _cfg, vocab) = load();
-    assert!(t.vocab_size() <= vocab,
-            "tokenizer 域 ({}) 不得超出 embedding 行数 ({vocab})",
-            t.vocab_size());
+    assert!(
+        t.vocab_size() <= vocab,
+        "tokenizer 域 ({}) 不得超出 embedding 行数 ({vocab})",
+        t.vocab_size()
+    );
 
     // bos/eos/unk 查表引用
     let eos = t.eos_token().expect("eos present");
     assert_eq!(eos, 151645, "eos = <|im_end|>");
 
     // 编码：英文 + 中文 + 空格 + 空行 fragment（id 全在 embedding 界内）
-    for text in ["Hello", "Hello world", "\u{4f60}\u{597d}\u{ff0c}\u{4e16}\u{754c}", "\n\n", "a\tb "] {
+    for text in
+        ["Hello", "Hello world", "\u{4f60}\u{597d}\u{ff0c}\u{4e16}\u{754c}", "\n\n", "a\tb "]
+    {
         let ids = t.encode(text, false).expect("encode");
         assert!(ids.iter().all(|&i| (i as usize) < vocab), "id OOV ({text:?})");
         let _ = t;
@@ -54,6 +58,12 @@ fn qwen3_hf_tokenizer_smoke() {
     // 特殊 token 整体分段（parse_special）
     let ids = t.encode("<|im_start|>system", true).expect("encode special");
     assert!(ids.iter().any(|&i| i == 151644), "<|im_start|> 应整体成片");
+
+    // 014 D8：special:false 的 added token（<think> 等）同样整体匹配，
+    // 不得被 BPE 拆分（拆分会改变 prompt 语义 → greedy 永不自然停）。
+    let ids = t.encode("Hello<think>abc</think>", true).expect("encode think");
+    assert!(ids.iter().any(|&i| i == 151667), "<think> 应整体成片");
+    assert!(ids.iter().any(|&i| i == 151668), "</think> 应整体成片");
 
     // 解码往返（字节级 piece → UTF-8 文本）
     let text = "Hello world";

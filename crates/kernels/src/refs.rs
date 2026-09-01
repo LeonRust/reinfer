@@ -68,8 +68,6 @@ pub fn masked_softmax_ref(x: &[f32], mask: &[bool]) -> Vec<f32> {
     out
 }
 
-
-
 /// fp32 累加 naive 矩阵乘（014 T6 单源 CPU 参考）。
 ///
 /// 行主序：`C[m×n] = A[m×k] · B[k×n]`；累加顺序 i→j→t 递增（确定性）；
@@ -98,8 +96,14 @@ pub fn matmul_ref(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32
 /// seq×seq 布尔矩阵（row i、col t：参与 iff `mask[i*seq+t]`；causal 下三角
 /// 由调用方构造；false 位 = `-inf` 语义）。计算：S=Q·K^T（fp32 累加）→
 /// 行 softmax（全无效行 → 全 0）→ O=P·V（fp32 累加）；输出 f32 [seq×d]。
-pub fn prefill_attn_ref(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize,
-                        mask: &[bool]) -> Vec<f32> {
+pub fn prefill_attn_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    d: usize,
+    mask: &[bool],
+) -> Vec<f32> {
     assert_eq!(q.len(), seq * d);
     assert_eq!(k.len(), seq * d);
     assert_eq!(v.len(), seq * d);
@@ -154,7 +158,6 @@ pub fn prefill_attn_ref(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize,
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {

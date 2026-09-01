@@ -137,12 +137,42 @@ impl JLib {
     pub fn raw(&self) -> sys::CUlibrary {
         self.lib
     }
+
+    /// 取元内核的 `CUkernel` 句柄——CUDA-graph KernelSpec 声明用：capture
+    /// 记录 `cuLibraryLoadData` 内核为 `CUkernel`（`functionType = 2`），
+    /// V2 SetParams 刷新需要同一句柄形态；`kernel()` 的 `CUfunction`
+    /// （`fn_type = 3`）与记录类型不符，刷新被拒（graph.rs `FN_TYPE`）。
+    pub fn cu_kernel(&self, name: &str) -> Result<*mut c_void, LaunchError> {
+        cu_kernel_of(self.lib, name)
+    }
+}
+
+/// 库句柄面的 `CUkernel` 查询（graph spec 声明用；引擎持有
+/// `DenseKernels::raw_lib()` 等 `CUlibrary`，不保有 `JLib`）。
+pub fn cu_kernel_of(lib: sys::CUlibrary, name: &str) -> Result<*mut c_void, LaunchError> {
+    let cname = CString::new(name).map_err(|_| LaunchError::Fatal)?;
+    let mut k: sys::CUkernel = std::ptr::null_mut();
+    // SAFETY: 输出槽位有效；名字为 NUL 结尾；库句柄存活。
+    let r = unsafe { sys::cuLibraryGetKernel(&mut k, lib, cname.as_ptr()) };
+    rc(r)?;
+    if k.is_null() {
+        return Err(LaunchError::Fatal);
+    }
+    Ok(k as *mut c_void)
 }
 
 impl KernelFn {
     /// 原始 CUfunction 句柄（probe/诊断；交 cuLaunchKernel）。
     pub fn raw(&self) -> sys::CUfunction {
         self.0
+    }
+
+    /// 包装裸 `CUfunction`（Graph V2 声明驱动 launch 用：声明的 `CUkernel`
+    /// 句柄在声明构建期经 `cuKernelGetFunction` 一次性转换，步循环直接用
+    /// 转换结果——`launch_fmha`/`launch_rows` 的 `KernelFn` 入参面）。
+    #[must_use]
+    pub fn from_raw(f: sys::CUfunction) -> Self {
+        KernelFn(f)
     }
 }
 
@@ -282,6 +312,63 @@ pub unsafe fn launch_grid(
         )
     };
     rc(r)
+}
+
+/// 3D grid + 动态 smem launch（006 T1 FMHA）：grid = (gx, gy, gz)，
+/// `smem` 字节为 launch 传入的动态共享内存量；**调用方须先对 kernel 执行
+/// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)`**（>48KB opt-in，
+/// 见 `set_max_dynamic_smem`）。
+///
+/// # Safety
+/// 同 [`launch_row`]。
+#[allow(clippy::too_many_arguments)] // 内核 launch 参数矩阵（C3 纪律显式化）
+pub unsafe fn launch_fmha(
+    kernel: KernelFn,
+    stream: &CudaStream,
+    _dev: u32,
+    gx: u32,
+    gy: u32,
+    gz: u32,
+    block: u32,
+    smem: u32,
+    args: *mut *mut c_void,
+) -> Result<(), LaunchError> {
+    let cu_stream: sys::CUstream = stream.handle() as *mut c_void as sys::CUstream;
+    // SAFETY: 同 launch_row 前提。
+    let r = unsafe {
+        sys::cuLaunchKernel(
+            kernel.0,
+            gx,
+            gy,
+            gz,
+            block,
+            1,
+            1,
+            smem,
+            cu_stream,
+            args,
+            std::ptr::null_mut(),
+        )
+    };
+    rc(r)
+}
+
+/// 为 kernel 声明动态 smem 上限（>48KB 需要 opt-in；FMHA 128×128×128
+/// 形态为 98304 B）。幂等：同一 kernel 重复设置允许（按 max 合并）。
+pub fn set_max_dynamic_smem(kernel: KernelFn, bytes: u32) -> Result<(), LaunchError> {
+    // SAFETY: kernel 句柄有效；属性/值合法（驱动侧校验）。
+    let r = unsafe {
+        sys::cuFuncSetAttribute(
+            kernel.raw(),
+            sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            bytes as i32,
+        )
+    };
+    if r == sys::CUresult::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(classify(r as CudaErrorCode).unwrap_or(LaunchError::Fatal))
+    }
 }
 
 /// 行级 launch 原语（014 T5）：grid = `grid` blocks × `block` threads；

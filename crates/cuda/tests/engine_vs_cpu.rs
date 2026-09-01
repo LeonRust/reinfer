@@ -14,7 +14,7 @@
 
 mod gpu {
     use reinfer_core::DeviceId;
-    use reinfer_cuda::engine::{argmax_first, Engine};
+    use reinfer_cuda::engine::{Engine, argmax_first};
     use reinfer_cuda::{CudaContext, CudaStream};
     use reinfer_safetensors::SafeFile;
     use reinfer_tokenizer::Tokenizer;
@@ -70,9 +70,11 @@ mod gpu {
                         .collect(),
                     F32 => std::iter::repeat(0.0)
                         .take(0)
-                        .chain(bytes.chunks_exact(4).map(|c| {
-                            f32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                        }))
+                        .chain(
+                            bytes
+                                .chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                        )
                         .collect(),
                     other => panic!("calibration dtype {other:?} not supported (use fp16 gguf)"),
                 }
@@ -110,10 +112,9 @@ mod gpu {
         }
 
         fn load(model_dir: &std::path::Path) -> Self {
-            let config: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(model_dir.join("config.json")).unwrap(),
-            )
-            .unwrap();
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(model_dir.join("config.json")).unwrap())
+                    .unwrap();
             let cfg = reinfer_arch::llama::from_hf_config(&config).unwrap();
             let safe = SafeFile::open(&model_dir.join("model.safetensors")).unwrap();
             let f2 = |t: &reinfer_safetensors::TensorView<'_>| -> Vec<f32> {
@@ -157,7 +158,6 @@ mod gpu {
                 kv_v: vec![0.0; kv_size],
             }
         }
-
 
         fn step(&mut self, token: u32, pos: usize) -> Vec<f32> {
             self.step_trace(token, pos).0
@@ -246,11 +246,8 @@ mod gpu {
                 let xn2 = rms_n(&x, &w.ffn_norm, cfg.rms_eps);
                 let gate = matmul1(&xn2, &w.gate, ffn, h);
                 let up = matmul1(&xn2, &w.up, ffn, h);
-                let silu: Vec<f32> = gate
-                    .iter()
-                    .enumerate()
-                    .map(|(i, g)| g / (1.0 + (-g).exp()) * up[i])
-                    .collect();
+                let silu: Vec<f32> =
+                    gate.iter().enumerate().map(|(i, g)| g / (1.0 + (-g).exp()) * up[i]).collect();
                 let down = matmul1(&silu, &w.down, h, ffn);
                 for i in 0..h {
                     x[i] += down[i];
@@ -435,11 +432,7 @@ mod gpu {
                 println!("    cpu sl(head..t)[0..32]={:?}", &csl[..32.min(csl.len())]);
             }
             let cmp = |name: &str, g: &[f32], c: &[f32]| {
-                let mx = g
-                    .iter()
-                    .zip(c.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max);
+                let mx = g.iter().zip(c.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                 println!("  layer {li} {name}: maxdiff={mx:.5}");
             };
             cmp("x_embed", gx0, cx0);
@@ -512,9 +505,11 @@ mod gpu {
         stats(&gl, "gpu");
         stats(&cl, "cpu");
         // token 10 在 top500 内的排名（孤立判断）
-        println!("gpu rank(tok10)={:?} cpu rank(tok10)={:?}",
+        println!(
+            "gpu rank(tok10)={:?} cpu rank(tok10)={:?}",
             g_idx.iter().position(|(i, _)| *i == 10),
-            c_idx.iter().position(|(i, _)| *i == 10));
+            c_idx.iter().position(|(i, _)| *i == 10)
+        );
         assert_eq!(g_top, c_top, "top-1 必须一致（语义对齐锚）");
     }
 

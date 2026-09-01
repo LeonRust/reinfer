@@ -20,7 +20,7 @@
 mod gpu {
     use reinfer_core::DeviceId;
     use reinfer_cuda::decode::DecodeKernels;
-    use reinfer_cuda::{copy, CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef};
+    use reinfer_cuda::{CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef, copy};
     use reinfer_gguf::codes::f16_to_f32;
 
     fn xorshift(seed: &mut u64) -> u64 {
@@ -143,10 +143,14 @@ mod gpu {
         {
             let ph = HostBuffer::alloc((b * qh * d * 2) as usize).unwrap();
             unsafe {
-                let s = std::slice::from_raw_parts_mut(ph.as_ptr() as *mut u8, (b * qh * d * 2) as usize);
+                let s = std::slice::from_raw_parts_mut(
+                    ph.as_ptr() as *mut u8,
+                    (b * qh * d * 2) as usize,
+                );
                 s.fill(0x55);
             }
-            copy(&mut MemRef::Device(&dout), &MemRef::Host(&ph), (b * qh * d * 2) as usize, None).unwrap();
+            copy(&mut MemRef::Device(&dout), &MemRef::Host(&ph), (b * qh * d * 2) as usize, None)
+                .unwrap();
         }
 
         dk.launch_decode_step_gqa(
@@ -169,13 +173,8 @@ mod gpu {
         .unwrap();
         dk.sync_stream().unwrap();
         // d2h: out
-        copy(
-            &mut MemRef::Host(&hout),
-            &MemRef::Device(&dout),
-            (b * qh * d * 2) as usize,
-            None,
-        )
-        .unwrap();
+        copy(&mut MemRef::Host(&hout), &MemRef::Device(&dout), (b * qh * d * 2) as usize, None)
+            .unwrap();
         let raw: Vec<u16> = unsafe {
             std::slice::from_raw_parts(hout.as_ptr() as *const u16, (b * qh * d) as usize).to_vec()
         };
@@ -217,7 +216,8 @@ mod gpu {
                 let phys_p = phys[lp] as usize;
                 for kk in 0..kv_heads {
                     for i in 0..d {
-                        kv[((phys_p * bl + off) * kv_heads + kk) * d + i] = rand_f16_bits(&mut seed);
+                        kv[((phys_p * bl + off) * kv_heads + kk) * d + i] =
+                            rand_f16_bits(&mut seed);
                         let vbase = total_pages * bl * per_tok;
                         kv[vbase + ((phys_p * bl + off) * kv_heads + kk) * d + i] =
                             rand_f16_bits(&mut seed);
@@ -249,16 +249,17 @@ mod gpu {
                 let ulp = if wh == 0.0 { 1e-9 } else { ulp_of(wh) };
                 if (g - w).abs() > ulp + 1e-6 {
                     bad += 1;
-                    if bad < 4 {
-                                    }
+                    if bad < 4 {}
                 }
             }
             let vbase_idx = total_pages * bl * per_tok;
-            eprintln!("gqa dbg hostV[0..4]={:?} hostK[0..4]={:?}",
+            eprintln!(
+                "gqa dbg hostV[0..4]={:?} hostK[0..4]={:?}",
                 &kv[vbase_idx..vbase_idx + 4],
-                &kv[0..4]);
+                &kv[0..4]
+            );
             assert_eq!(bad, 0, "gqa qh={qh} ratio={ratio}: {bad} elems over 1 ulp");
-            }
+        }
     }
 
     #[test]
@@ -268,13 +269,13 @@ mod gpu {
         let dev = ctx.device_id().index();
         let cache = std::env::temp_dir().join("reinfer-jit-gqa-det");
         let _ = std::fs::remove_dir_all(&cache);
-        let (qh, ratio, bl, max_kv, kv_len, d) = (14usize, 2usize, 16usize, 96usize, 40usize, 64usize);
+        let (qh, ratio, bl, max_kv, kv_len, d) =
+            (14usize, 2usize, 16usize, 96usize, 40usize, 64usize);
         let total_pages = max_kv.div_ceil(bl);
         let log_pages = kv_len.div_ceil(bl);
         let mut seed = 0xD3A2_u64;
-        let phys: Vec<u32> = (0..log_pages)
-            .map(|_| ((xorshift(&mut seed) as usize) % total_pages) as u32)
-            .collect();
+        let phys: Vec<u32> =
+            (0..log_pages).map(|_| ((xorshift(&mut seed) as usize) % total_pages) as u32).collect();
         let kv_heads = qh / ratio;
         let per_tok = kv_heads * d;
         let mut kv = vec![0xFFFFu16; total_pages * bl * per_tok * 2];
@@ -292,10 +293,36 @@ mod gpu {
         }
         let q: Vec<u16> = (0..qh * d).map(|_| rand_f16_bits(&mut seed)).collect();
         let lens = [kv_len as u32];
-        let a = run_one(dev, 1, qh as u32, d as u32, bl as u32, ratio as u32, max_kv as u32,
-            total_pages as u32, &phys, &kv, &lens, &q, &cache);
-        let b = run_one(dev, 1, qh as u32, d as u32, bl as u32, ratio as u32, max_kv as u32,
-            total_pages as u32, &phys, &kv, &lens, &q, &cache);
+        let a = run_one(
+            dev,
+            1,
+            qh as u32,
+            d as u32,
+            bl as u32,
+            ratio as u32,
+            max_kv as u32,
+            total_pages as u32,
+            &phys,
+            &kv,
+            &lens,
+            &q,
+            &cache,
+        );
+        let b = run_one(
+            dev,
+            1,
+            qh as u32,
+            d as u32,
+            bl as u32,
+            ratio as u32,
+            max_kv as u32,
+            total_pages as u32,
+            &phys,
+            &kv,
+            &lens,
+            &q,
+            &cache,
+        );
         assert_eq!(a, b, "decode determinism: two launches differ");
     }
 

@@ -22,7 +22,11 @@ pub struct DequantKernels {
 
 impl DequantKernels {
     /// Loader constructor (toolchain probe → compile/cache → kernel fetch).
-    pub fn new(arch: &str, cache_dir: Option<PathBuf>, stream: CudaStream) -> Result<Self, LaunchError> {
+    pub fn new(
+        arch: &str,
+        cache_dir: Option<PathBuf>,
+        stream: CudaStream,
+    ) -> Result<Self, LaunchError> {
         let tc = probe_toolchain_for_arch(arch)?;
         let src = KernelSource {
             name: "dequant_kernels",
@@ -67,7 +71,9 @@ impl DequantKernels {
             (&out as *const *mut f32) as *mut c_void,
             (&nblocks as *const u32) as *mut c_void,
         ];
-        unsafe { super::jit::launch_rows(self.dequant, &self.stream, dev, nblocks, 32, args.as_mut_ptr()) }
+        unsafe {
+            super::jit::launch_rows(self.dequant, &self.stream, dev, nblocks, 32, args.as_mut_ptr())
+        }
     }
 
     /// Raw library handle (diagnostics/upstream orchestration).

@@ -29,10 +29,7 @@ fn main() -> ExitCode {
         println!("key {key} {}", dump_value(value));
     }
     for t in reader.tensors() {
-        println!(
-            "tensor {} {:?} {}",
-            t.name, t.dtype, t.element_count().unwrap_or(0)
-        );
+        println!("tensor {} {:?} {}", t.name, t.dtype, t.element_count().unwrap_or(0));
     }
     ExitCode::SUCCESS
 }

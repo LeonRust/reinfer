@@ -15,10 +15,10 @@
 
 mod gpu {
     use reinfer_core::DeviceId;
-    use reinfer_cuda::attention::{prefill_attention, PrefillScratch};
+    use reinfer_cuda::attention::{PrefillScratch, prefill_attention};
     use reinfer_cuda::diff::DiffKernels;
     use reinfer_cuda::gemm::Gemm;
-    use reinfer_cuda::{copy, CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef};
+    use reinfer_cuda::{CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef, copy};
     use reinfer_gguf::codes::f16_to_f32;
     use reinfer_kernels::refs::prefill_attn_ref;
 
@@ -62,10 +62,7 @@ mod gpu {
     }
 
     fn mask_f32(seq: usize) -> Vec<f32> {
-        causal_mask(seq)
-            .iter()
-            .map(|ok| if *ok { 0.0f32 } else { f32::NEG_INFINITY })
-            .collect()
+        causal_mask(seq).iter().map(|ok| if *ok { 0.0f32 } else { f32::NEG_INFINITY }).collect()
     }
 
     fn make_ctx() -> (u32, CudaStream, Gemm, DiffKernels) {
@@ -105,12 +102,13 @@ mod gpu {
         let dmask = upl(dev, &mask_host.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
         let mut dout = DeviceBuffer::alloc(DeviceId::new(0), seq * d * 4).unwrap();
         let hout = HostBuffer::alloc(seq * d * 4).unwrap();
-        prefill_attention(dev, blas, dk, stream, scratch, &dq, &dk2, &dv, &dmask, seq, d, &mut dout)
-            .unwrap();
+        prefill_attention(
+            dev, blas, dk, stream, scratch, &dq, &dk2, &dv, &dmask, seq, d, &mut dout,
+        )
+        .unwrap();
         copy(&mut MemRef::Host(&hout), &MemRef::Device(&dout), seq * d * 4, None).unwrap();
-        let raw: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(hout.as_ptr() as *const f32, seq * d).to_vec()
-        };
+        let raw: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(hout.as_ptr() as *const f32, seq * d).to_vec() };
         let mut got = vec![0.0f32; seq * d];
         for r in 0..seq {
             for c in 0..d {
@@ -155,7 +153,8 @@ mod gpu {
         // P 行和 ≈ 1（读回 sr 全量抽查）。
         {
             let hp = HostBuffer::alloc(SEQ * SEQ * 4).unwrap();
-            copy(&mut MemRef::Host(&hp), &MemRef::Device(&scratch.sr), SEQ * SEQ * 4, None).unwrap();
+            copy(&mut MemRef::Host(&hp), &MemRef::Device(&scratch.sr), SEQ * SEQ * 4, None)
+                .unwrap();
             // SAFETY：pinned host；×f32
             let p: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(hp.as_ptr() as *const f32, SEQ * SEQ).to_vec()

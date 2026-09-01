@@ -20,7 +20,7 @@
 mod gpu {
     use reinfer_core::DeviceId;
     use reinfer_cuda::dequant::DequantKernels;
-    use reinfer_cuda::{copy, CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef};
+    use reinfer_cuda::{CudaContext, CudaStream, DeviceBuffer, HostBuffer, MemRef, copy};
     use reinfer_gguf::codes::dequantize_q8_0;
 
     const NBLOCKS: u32 = 1 << 16; // 64 KiB blocks → 2 MiB blob
@@ -91,27 +91,20 @@ mod gpu {
         let host_out = HostBuffer::alloc(OUT * 4).expect("hout");
         let dev_out = DeviceBuffer::alloc(dev, OUT * 4).expect("dout");
 
-        copy(
-            &mut MemRef::Device(&dev_blob),
-            &MemRef::Host(&host_blob),
-            blob.len(),
-            None,
+        copy(&mut MemRef::Device(&dev_blob), &MemRef::Host(&host_blob), blob.len(), None)
+            .expect("h2d");
+        dq.launch_dequant_q8_0(
+            dev.index(),
+            dev_blob.as_ptr(),
+            dev_out.as_ptr() as *mut f32,
+            NBLOCKS,
         )
-        .expect("h2d");
-        dq.launch_dequant_q8_0(dev.index(), dev_blob.as_ptr(), dev_out.as_ptr() as *mut f32, NBLOCKS)
-            .expect("launch");
+        .expect("launch");
         dq.sync_stream().expect("sync");
-        copy(
-            &mut MemRef::Host(&host_out),
-            &MemRef::Device(&dev_out),
-            OUT * 4,
-            None,
-        )
-        .expect("d2h");
+        copy(&mut MemRef::Host(&host_out), &MemRef::Device(&dev_out), OUT * 4, None).expect("d2h");
         // SAFETY: host 内存 pin；OUT×f32
-        let got: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(host_out.as_ptr() as *const f32, OUT).to_vec()
-        };
+        let got: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(host_out.as_ptr() as *const f32, OUT).to_vec() };
         let expect = upload_cpu_ref(&blob);
         assert_eq!(got.len(), expect.len());
         for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
@@ -157,13 +150,8 @@ mod gpu {
             let gblob_d = DeviceBuffer::alloc(dev, gblob.len()).expect("gblob d");
             let gout_h = HostBuffer::alloc(gexpect.len() * 4).expect("gout h");
             let gout_d = DeviceBuffer::alloc(dev, gexpect.len() * 4).expect("gout d");
-            copy(
-                &mut MemRef::Device(&gblob_d),
-                &MemRef::Host(&gblob_h),
-                gblob.len(),
-                None,
-            )
-            .expect("gh2d");
+            copy(&mut MemRef::Device(&gblob_d), &MemRef::Host(&gblob_h), gblob.len(), None)
+                .expect("gh2d");
             dq.launch_dequant_q8_0(
                 dev.index(),
                 gblob_d.as_ptr(),
@@ -172,13 +160,8 @@ mod gpu {
             )
             .expect("glaunch");
             dq.sync_stream().expect("gsync");
-            copy(
-                &mut MemRef::Host(&gout_h),
-                &MemRef::Device(&gout_d),
-                gexpect.len() * 4,
-                None,
-            )
-            .expect("gd2h");
+            copy(&mut MemRef::Host(&gout_h), &MemRef::Device(&gout_d), gexpect.len() * 4, None)
+                .expect("gd2h");
             // SAFETY: 同上
             let gg: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(gout_h.as_ptr() as *const f32, gexpect.len()).to_vec()
@@ -199,7 +182,10 @@ mod gpu {
             }
             // 0-ulp 对象 = 有限值域（量化 d 的正常值）——NaN/Inf 块的 GPU 硬件
             // 规范化差异（quiet NaN）不设立判据，记录于 notes（真机规律）。
-            eprintln!("golden: {nan_blocks}/{} non-finite values skipped (GPU NaN normalization)", gexpect.len());
+            eprintln!(
+                "golden: {nan_blocks}/{} non-finite values skipped (GPU NaN normalization)",
+                gexpect.len()
+            );
         }
         println!("dequant bit-exact: {} random blocks + golden", NBLOCKS);
     }
@@ -220,19 +206,19 @@ mod gpu {
             std::ptr::copy_nonoverlapping(blob.as_ptr(), host_blob.as_ptr() as *mut u8, blob.len());
         }
         let dev_blob = DeviceBuffer::alloc(dev, blob.len()).expect("db");
-        copy(&mut MemRef::Device(&dev_blob), &MemRef::Host(&host_blob), blob.len(), None).expect("h2d");
+        copy(&mut MemRef::Device(&dev_blob), &MemRef::Host(&host_blob), blob.len(), None)
+            .expect("h2d");
 
         let run = |hostout: &HostBuffer, devout: &DeviceBuffer| {
-            dq.launch_dequant_q8_0(dev.index(), dev_blob.as_ptr(), devout.as_ptr() as *mut f32, NBLOCKS)
-                .expect("launch");
-            dq.sync_stream().expect("sync");
-            copy(
-                &mut MemRef::Host(hostout),
-                &MemRef::Device(devout),
-                OUT * 4,
-                None,
+            dq.launch_dequant_q8_0(
+                dev.index(),
+                dev_blob.as_ptr(),
+                devout.as_ptr() as *mut f32,
+                NBLOCKS,
             )
-            .expect("d2h");
+            .expect("launch");
+            dq.sync_stream().expect("sync");
+            copy(&mut MemRef::Host(hostout), &MemRef::Device(devout), OUT * 4, None).expect("d2h");
             // SAFETY: 同上
             unsafe { std::slice::from_raw_parts(hostout.as_ptr() as *const f32, OUT).to_vec() }
         };

@@ -148,8 +148,16 @@ fi
 if [ "$MODE" != "dry-run" ]; then
   if [ -n "${REINFER_CUDA_NVCC:-}" ]; then
     echo "[gate] REINFER_CUDA_NVCC=$REINFER_CUDA_NVCC"
+  elif [ -x /usr/local/cuda-13.2/bin/nvcc ]; then
+    # sm_120a JIT needs nvcc 13.2 — a wrong/default nvcc produces a silent
+    # all-zero cubin: the layer-fused kernel spins at 100% GPU with no
+    # output (the 'hang' seen in the field). Default to the known-good
+    # toolchain when unset, so the gate never inherits a broken JIT.
+    export REINFER_CUDA_NVCC=/usr/local/cuda-13.2/bin/nvcc
+    echo "[gate] REINFER_CUDA_NVCC unset -> defaulted to /usr/local/cuda-13.2/bin/nvcc"
   else
-    echo "[gate] WARN: REINFER_CUDA_NVCC unset (sm_120a JIT needs nvcc 13.2 on this machine)"
+    echo "[gate] WARN: REINFER_CUDA_NVCC unset and /usr/local/cuda-13.2/bin/nvcc missing — expected nvcc 13.2 (sm_120a JIT) missing; abort"
+    exit 2
   fi
   echo "[gate] measure: python3 run_all.py --engine reinfer --suite perf_c1 (bench-vs-vllm harness)..."
   python3 "$HARNESS_DIR/run_all.py" --engine reinfer --suite perf_c1 --seed "$SEED" \

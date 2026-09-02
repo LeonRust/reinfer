@@ -46,6 +46,10 @@ use reinfer_kernels::LaunchError;
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+/// S1-13: profiler readback drain budget (the engine's own step sync has
+/// its own, longer, budget — the profiler just degrades gracefully).
+const PROFILE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// S1-11 (specs/017): the block-width switch (default **2** — the widened
 /// stages' 512-col tiles are split into 256-col tile PAIRS, one per block;
 /// `REINFER_FUSED_BW=1`/off words keep the S1-10 single-width kernel
@@ -313,9 +317,10 @@ pub struct LayerFusedKernels {
     dev: u32,
     /// The uploaded `LayerFusedConst` blob (stable).
     cbuf: DeviceBuffer,
-    /// 20 u32 barrier slots (10 counters + 10 generations), zeroed once at
-    /// build — every barrier self-resets, so the state is clean across
-    /// launches and graph replays.
+    /// 24 u32 barrier table: 10 counters + 10 generations (self-reset per
+    /// barrier, zeroed once at build) + the S1-13 watchdog words
+    /// (bar[20] = timed-out barrier slot + 1, bar[21..22] = elapsed spin
+    /// clock64 cycles at fire as a u64 lo/hi — diagnostics, bar[23] spare).
     bar: DeviceBuffer,
     /// Per-(layer, stage) clock64 marks [n_layers * 9] (block 0 only).
     stage_ts: DeviceBuffer,
@@ -666,12 +671,12 @@ impl LayerFusedKernels {
         }
         copy(&mut MemRef::Device(&self.cbuf), &MemRef::Host(&hb), bytes.len(), None)?;
 
-        self.bar = DeviceBuffer::alloc(dev, 20 * 4)?;
-        let zeros = HostBuffer::alloc(20 * 4)?;
+        self.bar = DeviceBuffer::alloc(dev, 24 * 4)?;
+        let zeros = HostBuffer::alloc(24 * 4)?;
         unsafe {
-            std::ptr::write_bytes(zeros.as_ptr() as *mut u8, 0, 20 * 4);
+            std::ptr::write_bytes(zeros.as_ptr() as *mut u8, 0, 24 * 4);
         }
-        copy(&mut MemRef::Device(&self.bar), &MemRef::Host(&zeros), 20 * 4, None)?;
+        copy(&mut MemRef::Device(&self.bar), &MemRef::Host(&zeros), 24 * 4, None)?;
 
         // Persist the width, the column width, the pipe mode and the
         // selected entry.
@@ -821,8 +826,23 @@ impl LayerFusedKernels {
             return Ok(());
         }
         let hb = HostBuffer::alloc(n_layers * 9 * 4)?;
-        copy(&mut MemRef::Host(&hb), &MemRef::Device(&self.stage_ts), n_layers * 9 * 4, None)?;
-        stream.synchronize()?;
+        copy(
+            &mut MemRef::Host(&hb),
+            &MemRef::Device(&self.stage_ts),
+            n_layers * 9 * 4,
+            Some(stream),
+        )?;
+        // S1-13: bounded — a wedged layer kernel must not hang the
+        // profiler; skip this step's marks when the stream does not drain
+        // in time (the step itself still errors via the engine's sync).
+        if !stream.synchronize_bounded(PROFILE_DRAIN_TIMEOUT)? {
+            eprintln!(
+                "[reinfer-cuda] layer-fused profile: stream did not drain in \
+                 {:.0}s — skipping this step's stage marks",
+                PROFILE_DRAIN_TIMEOUT.as_secs_f32()
+            );
+            return Ok(());
+        }
         let marks: Vec<u32> =
             unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const u32, n_layers * 9).to_vec() };
         // Per-stage delta per layer: marks[li*9 + stage+1] - marks[li*9 +
@@ -876,5 +896,36 @@ impl LayerFusedKernels {
             self.ts_steps = 0;
         }
         Ok(())
+    }
+
+    /// Read the 24-word barrier table back to the host (S1-13 diagnostics:
+    /// `bar[20]` is 0 normally, `slot + 1` when the grid-barrier watchdog
+    /// self-terminated a launch at that slot). Blocking copy — the engine
+    /// calls this only after the stream drained (or with the engine stream
+    /// in a non-blocking state, where the copy engine runs while SMs spin).
+    pub fn barrier_state(&self) -> Result<[u32; 24], LaunchError> {
+        let _guard = CtxGuard::set_current(self.dev)?;
+        let hb = HostBuffer::alloc(24 * 4)?;
+        copy(&mut MemRef::Host(&hb), &MemRef::Device(&self.bar), 24 * 4, None)?;
+        let mut out = [0u32; 24];
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const u32, 24) });
+        Ok(out)
+    }
+
+    /// Read the per-(layer, stage) clock64 marks of each launch's block 0
+    /// back to the host (S1-13 diagnostics — the copy engine runs while
+    /// the SMs spin, so a wedged step's progress stays observable).
+    /// Returns [n_layers * 9] u32: row li = layer li's launch, entry st =
+    /// the tick at the end of stage st (0 = that stage never completed —
+    /// rows of launches still queued are all zero).
+    /// Zero the barrier table on `stream` (S1-13 recovery: the watchdog
+    /// words and any half-reset counter/gen of the wedged launch must be
+    /// clean before the next layer launch — stream-ordered so it cannot
+    /// race the drained launch or the next step's kernels).
+    pub fn reset_barriers(&self, stream: &CudaStream) -> Result<(), LaunchError> {
+        let _guard = CtxGuard::set_current(self.dev)?;
+        let zeros = HostBuffer::alloc(24 * 4)?;
+        unsafe { core::ptr::write_bytes(zeros.as_ptr() as *mut u8, 0u8, 24 * 4) };
+        copy(&mut MemRef::Device(&self.bar), &MemRef::Host(&zeros), 24 * 4, Some(stream))
     }
 }

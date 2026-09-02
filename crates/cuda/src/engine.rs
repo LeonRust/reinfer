@@ -43,6 +43,24 @@ use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// S1-13 decode-deadlock guardrails (see the notes for the reproduction):
+// the layer-fused grid barriers can wedge the GPU when foreign work
+// starves CTA slots (serve + desktop both reproduced). The kernel
+// watchdog self-terminates the stuck launch after ~10 s; the host syncs
+// below turn the residual cases into deterministic errors instead of
+// infinite spins.
+//
+// Per-step drain budget (full): the watchdog normally drains the stream
+// within it — the barrier table then reports the slot.
+const DECODE_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+// Fail-fast probe used by steps while `decode_stall` is set (a previous
+// step's GPU is still busy) — each subsequent step errors within this
+// budget instead of paying the full one.
+const DECODE_SYNC_PROBE: std::time::Duration = std::time::Duration::from_secs(3);
+// DecodeProfiler::finalize drain budget — on a stall the profiler
+// disables itself (like the event-budget overflow) rather than block.
+const PROFILER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// 引擎错误面。
 #[derive(Debug)]
 pub enum EngineError {
@@ -64,6 +82,13 @@ pub enum EngineError {
     EmbeddingOov(u32),
     /// logits 全量 NaN（生成语义：显式错误）。
     NaNLogits,
+    /// S1-13: the decode stream did not drain within the sync budget (the
+    /// grid-barrier watchdog could not self-terminate the stuck launch).
+    SyncTimeout(String),
+    /// S1-13: the layer-fused grid-barrier watchdog fired (slot = the
+    /// timed-out barrier index; the launch was aborted — this step's
+    /// logits are invalid).
+    BarrierTimeout(u32),
 }
 
 impl std::fmt::Display for EngineError {
@@ -78,6 +103,10 @@ impl std::fmt::Display for EngineError {
             EngineError::UnsupportedDtype(d) => write!(f, "unsupported dtype: {d}"),
             EngineError::EmbeddingOov(t) => write!(f, "embedding OOV token: {t}"),
             EngineError::NaNLogits => write!(f, "logits contain only NaN — refuse to sample"),
+            EngineError::SyncTimeout(m) => write!(f, "decode sync timeout: {m} (S1-13)"),
+            EngineError::BarrierTimeout(slot) => {
+                write!(f, "layer-fused grid-barrier stall at slot {slot} (S1-13 watchdog)")
+            }
         }
     }
 }
@@ -670,6 +699,10 @@ pub struct Engine {
     /// stage-7 stripe merge) or the occupancy query fails — fail-open
     /// back to the S1-9 fused path with a note.
     layer_fused: Option<LayerFusedKernels>,
+    /// S1-13: set while a previous step's GPU work is still busy (bounded
+    /// sync timed out). Later steps probe with `DECODE_SYNC_PROBE` instead
+    /// of the full budget; cleared once the stream drains again.
+    decode_stall: bool,
     kernels: DenseKernels,
     diff: DiffKernels,
     decode: DecodeKernels,
@@ -1262,7 +1295,19 @@ impl DecodeProfiler {
         }
         // One synchronize per step — the events are stream-ordered, so the
         // stream's completion implies every recorded event completed.
-        stream.synchronize()?;
+        // S1-13: bounded — a wedged layer kernel must not hang the decode
+        // step here; the step's own sync reports it as a deterministic
+        // error and this profiler degrades to disabled (like the
+        // event-budget overflow) instead of blocking.
+        if !stream.synchronize_bounded(PROFILER_DRAIN_TIMEOUT)? {
+            eprintln!(
+                "[reinfer-cuda] REINFER_DECODE_PROFILE: stream did not drain in \
+                 {:.0}s — profiler disabled for the remaining steps",
+                PROFILER_DRAIN_TIMEOUT.as_secs_f32()
+            );
+            self.active = false;
+            return Ok(());
+        }
         // Fold intervals into the 20-step aggregation window.
         for iv in self.cur.intervals.iter() {
             let ms = iv.start.elapsed_ms(&iv.end)?;
@@ -3342,6 +3387,7 @@ impl Engine {
             // S1-10: placeholder — built below after the fused kernels
             // (the layer kernel reads the fused geometry).
             layer_fused: None,
+            decode_stall: false,
             kernels,
             diff,
             decode,
@@ -3641,6 +3687,55 @@ impl Engine {
     }
 
     /// 单 token 步进：写 KV（pos）并返回 logits（f32 行主序 [vocab]）。
+    /// S1-13 bounded drain for the non-step sync points (prefill lm_head,
+    /// batch decode lm_head). Same contract as step_impl's inline block:
+    /// a stream that does not drain within the budget (fail-fast probe
+    /// while `decode_stall` is set, full budget otherwise) becomes a
+    /// deterministic `SyncTimeout`; after a successful drain a watchdog
+    /// record in the barrier table (bar[20]) is reset and reported as a
+    /// deterministic `BarrierTimeout`. Never spins without bound.
+    fn sync_drain_bounded(&mut self, what: &str, pos: usize) -> Result<(), EngineError> {
+        // Clone the handle so the &mut self borrow is not held against the
+        // caller's `&self.stream` reference.
+        let stream = self.stream.clone();
+        let budget = if self.decode_stall { DECODE_SYNC_PROBE } else { DECODE_SYNC_BUDGET };
+        if !stream.synchronize_bounded(budget)? {
+            // GPU still busy — no watchdog fired (its CTAs never got
+            // scheduled, or foreign work still starves the slots).
+            self.decode_stall = true;
+            eprintln!(
+                "[reinfer-cuda] S1-13: {what} did not drain within {:.0}s \
+                 (pos {pos}, {} budget) — EngineError::SyncTimeout",
+                budget.as_secs_f32(),
+                if budget == DECODE_SYNC_PROBE { "fail-fast probe" } else { "full" },
+            );
+            return Err(EngineError::SyncTimeout(format!(
+                "{what} at pos {pos} did not drain within {:.0}s \
+                 (S1-13: layer-fused grid-barrier stall, watchdog did not fire)",
+                budget.as_secs_f32()
+            )));
+        }
+        self.decode_stall = false;
+        // Watchdog fired during this call (a wedged layer-fused launch
+        // self-terminated and left a record)? The launch was aborted, so
+        // the step's logits are invalid: reset the table (stream-ordered,
+        // so the next call starts clean) and error out deterministically.
+        if let Some(lf) = self.layer_fused.as_ref() {
+            let bar = lf.barrier_state()?;
+            if bar[20] != 0 {
+                let slot = bar[20] - 1;
+                eprintln!(
+                    "[reinfer-cuda] S1-13: layer-fused grid-barrier watchdog fired \
+                     at slot {slot} (pos {pos}, {what}) — resetting the barrier \
+                     table and failing this step"
+                );
+                lf.reset_barriers(&stream)?;
+                return Err(EngineError::BarrierTimeout(slot));
+            }
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self, token: u32, pos: usize, kv_len: usize) -> Result<Vec<f32>, EngineError> {
         self.step_impl(token, pos, kv_len, &mut None, &mut None)
     }
@@ -3746,7 +3841,60 @@ impl Engine {
         if !replayed {
             self.step_decode_launches(&stream, token, pos, kv_len, trace, detail)?;
         }
-        stream.synchronize()?;
+        // S1-13: bounded sync instead of `synchronize()` — a wedged
+        // layer-fused grid barrier must not hang the decode thread
+        // forever. The kernel watchdog self-terminates the stuck launch
+        // (~10 s) and records the slot; a stream that still does not
+        // drain within the budget becomes a deterministic error.
+        let budget = if self.decode_stall { DECODE_SYNC_PROBE } else { DECODE_SYNC_BUDGET };
+        if !stream.synchronize_bounded(budget)? {
+            // GPU still busy — no watchdog fired (its CTAs never got
+            // GPU still busy — no watchdog fired (its CTAs never got
+            // scheduled, or foreign work still starves the slots).
+            self.decode_stall = true;
+            eprintln!(
+                "[reinfer-cuda] S1-13: decode step did not drain within {:.0}s \
+                 (pos {pos}, {} budget) — EngineError::SyncTimeout",
+                budget.as_secs_f32(),
+                if budget == DECODE_SYNC_PROBE { "fail-fast probe" } else { "full" },
+            );
+            // S1-13: NO device readback here — the device is still wedged
+            // and even a bounded async copy + poll can stall the host (the
+            // driver blocks new submissions while the in-flight queue is
+            // jammed behind the stuck launch). The watchdog slot/counts/
+            // gens are read from the barrier table AFTER the next
+            // successful drain, which is the only safe readback point.
+            return Err(EngineError::SyncTimeout(format!(
+                "decode step at pos {pos} did not drain within {:.0}s \
+                 (S1-13: layer-fused grid-barrier stall, watchdog did not fire)",
+                budget.as_secs_f32()
+            )));
+        }
+        self.decode_stall = false;
+        // Watchdog fired during this step? The barrier table reports the
+        // wedged slot (bar[20] = slot + 1) — the launch was aborted, so
+        // this step's logits are invalid: reset the table (stream-ordered,
+        // so the next step starts clean) and error out deterministically.
+        if let Some(lf) = self.layer_fused.as_ref() {
+            let bar = lf.barrier_state()?;
+            if bar[20] != 0 {
+                let slot = bar[20] - 1;
+                let (cnts, gens): (Vec<u32>, Vec<u32>) = (bar[..10].to_vec(), bar[10..20].to_vec());
+                // bar[21..22] = elapsed spin cycles (u64 lo/hi) at the
+                // watchdog fire; clock64 runs at ~2.37-2.5 GHz here.
+                let elapsed = (bar[21] as u64) | ((bar[22] as u64) << 32);
+                eprintln!(
+                    "[reinfer-cuda] S1-13: layer-fused grid-barrier watchdog fired \
+                     at slot {slot} (pos {pos}, elapsed {:.1} s @2.5 GHz) — counts \
+                     {:?}, gens {:?}; resetting the barrier table and failing this step",
+                    elapsed as f64 / 2.5e9,
+                    cnts,
+                    gens
+                );
+                lf.reset_barriers(&stream)?;
+                return Err(EngineError::BarrierTimeout(slot));
+            }
+        }
         copy(
             &mut MemRef::Host(&self.logits_host),
             &MemRef::Device(&self.logits),
@@ -5547,7 +5695,11 @@ impl Engine {
         self.prefill_prof.mark(stream, PTag::FinalRms)?;
         self.gemm1r(&xn, &self.lm_head, s, self.cfg.vocab_size, h, &logits)?;
         self.prefill_prof.mark(stream, PTag::LmHead)?;
-        stream.synchronize()?;
+        // S1-13: bounded drain — prefill shares the stream with decode,
+        // so a wedged layer-fused decode launch still in flight (its
+        // watchdog may fire long after the failed step's sync gave up)
+        // must not hang prefill's lm_head sync forever.
+        self.sync_drain_bounded("prefill lm_head", s)?;
         // S1-7: fold and print the profile (events completed — the sync
         // above closed the window). No-op when the profiler is off.
         self.prefill_prof.finalize();
@@ -6082,8 +6234,7 @@ impl Engine {
                     // SAFETY: table row for (bi, li) is within the batch
                     // table ([B x n_layer x pp] entries; page[0] = the
                     // layer base).
-                    let table =
-                        unsafe { table_base.add(bi * n_layers * self.pp + li * self.pp) };
+                    let table = unsafe { table_base.add(bi * n_layers * self.pp + li * self.pp) };
                     let kv_b = if shared_pool { pool_kv } else { r.kv.kv };
                     self.decode.launch_decode_step_gqa(
                         dev,
@@ -6179,8 +6330,10 @@ impl Engine {
             eps,
         )?;
         self.gemm_batch_jgemm(&sc.xn, &self.lm_head, b, vocab, h, &sc.logits)?;
-        stream.synchronize()?;
         trace.finish(stream)?;
+        // S1-13: bounded drain (see sync_drain_bounded) — the batch step
+        // shares the stream with everything else; never sync unbounded.
+        self.sync_drain_bounded("batch decode lm_head", reqs[0].pos)?;
         copy(&mut MemRef::Host(&sc.logits_hb), &MemRef::Device(&sc.logits), b * vocab * 4, None)?;
         Ok((0..b)
             .map(|i| {

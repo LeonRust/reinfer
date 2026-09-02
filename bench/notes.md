@@ -1650,3 +1650,91 @@ mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触�
   smoke_s3.py：stop（单/数组）finish=stop、pen 分布变化 → 全 PASS。
 - 记录：T7 配套的 stop 语义在 sched 路径（对拍 vLLM 行为一致——stop 触发
   finish_reason=stop，文本不含 stop 串）。
+
+## 2026-09-02 — S1-13 decode 死锁（间歇性生成挂死：复现/根因/修复/验证）
+
+### 现象与复现（先复现后修）
+
+- 压法：`/tmp/repro_dl/` 复现台（serve 8765 串行 B=1，Qwen3-0.6B，
+  REINFER_DECODE_PROFILE=1）连续发 20-30 个 64-token 请求，driver 单请求
+  120s 无响应判 HANG。
+- 修复前 2/2 挂死：
+  - RUN=1（W=2 默认）：REQ 2 挂死；GPU 100% @ ~71W（137+ 秒样本）。
+  - RUN=2（REINFER_FUSED_BW=1，W=1）：REQ 15 挂死；GPU 100% @ 66W——
+    **宽度无关**（W=1/W=2 都挂），非块宽特有问题。
+- 复现窗口依赖环境：引擎单测、nsys（018 记录）都不挂——共同点是没有外部
+  GPU 竞争。每张 HANG 快照都有 **gnome-remote-desktop-daemon（258 MiB 显存
+  常驻 + 周期内核流）**——外部 SM 占用的来源，属环境因子（期间本机画面/
+  远程会话活动会直接放大挂死概率；静置时 20 连发可全绿）。
+
+### 根因（迟达竞态；含排除清单）
+
+- layer-fused 解码内核（decode_layer_fused_kernels.cu）用感知翻转原子
+  grid barrier：每 slot 每 kernel 实例一次；缺少数 CTA 的实例永不放行。
+- **机制**：某 CTA 被外部 GPU 工作饿死 >10s，**在本实例已放行之后**（最后
+  到达者已重置 cnt + 翻转 gen）才走到 barrier → 捕获到新 gen → 自旋等
+  一个只有**下一个 kernel 实例**才能给的放行；而下一实例要等本 kernel 的
+  全部 CTA 退出（kernel 边界串行）→ 自死锁。只有 watchdog 能解。
+- 关键证据（RUN=4 的 watchdog 读数）：counts=[0×10]（最后到达者确实到达并
+  复位）、gens=[16072×9,0]（16072 = 574 步 × 28 层——所有实例都完成过并
+  翻转了 gen）——**不是缺席，是迟达**。block-0 进度（初版诊断）显示 28 层
+  全停在末 stage s8——卡在末层末 barrier（slot 8）。
+- 排除清单：
+  (a) gen-slot 竞态：sense-reversal 自复位语义正确（counts/gens 读数一致）；
+  (b) 部分参与者集合/block 退出——由「迟达」机制具体化（饿死的 CTA 落后于
+  实例放行）；
+  (c) CUDA event/stream 同步竞态：nsys 018 不复现、事件序稳定；
+  (d) 时钟/负载 vs 自旋：clock64 实测 ~2.37GHz 无漂移，纯自旋只在持锁场景
+  才卡死——本机制不依赖它（迟达者自旋的是新 gen，放行者永远不来）。
+
+### 修复
+
+- **A（内核 watchdog，.cu）**：grid_barrier 自旋设 clock64 预算
+  BARRIER_SPIN_BUDGET=2.5e10（~10s @2.5GHz，9 个调用点统一）；超时由首个
+  写入者记录 bar[20]=slot+1、bar[21..22]=自旋 clock64 周期（u64 高低字，
+  修掉初版 bar[21] u32 截断——2.5e10 超出 u32 范围，曾显示「1.4s」实为
+  ~10s）并自杀退出；全部卡死 CTA 同机制退出 → launch 有界排空、不永久占
+  流。
+- **B（host 有界同步，engine.rs/layer_fused.rs）**：
+  - stream.rs `synchronize_bounded(timeout)`：cudaStreamQuery 轮询（10ms
+    睡），NOT_READY 到点返回 false，其余错误分类——**无永久自旋**。
+  - engine `decode_stall` 状态：干净时全预算 20s，疑似卡死（上次失败后）
+    3s fail-fast probe；超时 → EngineError::SyncTimeout（带 pos）+ 诊断；
+    drain 成功后才读 barrier 表——bar[20] 有值（watchdog 触发过）→ 重置
+    表（流序）→ EngineError::BarrierTimeout(slot)，logits 作废不出。
+  - 覆盖点：decode step（step_impl）、**prefill lm_head**、**batch decode
+    lm_head**（后两处原本是裸 `stream.synchronize()`——prefill 与 decode 共
+    流，残留卡死 launch 会让后续请求的 prefill 无界等待）——统一走
+    `sync_drain_bounded`。
+  - **错误路径禁设备调用**：SyncTimeout 分支里原有一段 stage 进度读回
+    （先无界 NULL 流阻塞拷贝、后有界异步拷贝+轮询）——真机三连复现
+    （RUN=3 REQ4 / 误跑 RUN=1 REQ8 / RUN=5 REQ17）都挂在它上面：设备仍卡时
+    驱动会阻塞新提交（队列塞死），**worker 持引擎锁死在错误处理里，错误帧
+    永不达客户端**。已删除——超时路径只 eprintln + 返回；wedge 信息一律等
+    下一次成功 drain 后从 barrier 表读（唯一安全读回点）。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 修复前复现 | RUN=1 REQ2 挂 / RUN=2(W=1) REQ15 挂（2/2）|
+| RUN=4（初版 A+B）| REQ 9 → watchdog ~10s → BarrierTimeout slot 8，客户端 10.2s 收到明确错误；REQ 10-20 全 OK；无挂死 rc=0 |
+| RUN=5（+prefill/batch 有界）| REQ 16 SyncTimeout(pos 154, 20s) 明确错误；REQ 17 serve 层挂——定位为错误路径诊断读回（见修复 B 末条）|
+| RUN=6（终版：错误路径禁设备调用）| **20/20 全完成，0 挂死 rc=0**：REQ 12/18 SyncTimeout 明确错误（88.3s/44.6s）；REQ 13/19 prefill 时 watchdog 触发（slot 6/slot 3）→ 重置+BarrierTimeout → 引擎内 per-token 回退成功（ttft 1.6s 恢复延迟）；错误后请求全部正常（tpot 12.3-12.6ms）|
+| 位级套件 | fused_decode 11/11 通过（终版代码 685s；中途一次环境 wedge 把 layer_fused_engine_ab_bitwise 打成 SyncTimeout 失败——watchdog 机制按设计快速报错而非挂死，单测重跑 200s 通过，A/B 输出逐位一致）|
+
+- 达标判据「挂死消除（或转为明确错误 + 后续请求正常）」在 RUN=4/6 均达成；
+  bin/reinfer/ 一行未动（约束）。
+
+### 下一建议
+
+- 引擎侧已无无界等待点（step/prefill/batch decode 全有界、错误路径无设备
+  调用）。仍有两处裸 `stream.synchronize()`：step_trace/trace 锚点读回
+  （dev 工具，非 serve 热路径）——如要彻底可改有界。
+- prefill 在 decode_stall 期间用 3s probe：超大 prompt（近 max-model-len）
+  + 卡死刚过时可能误伤一次（罕见、自愈）——可给 prefill 单独预算。
+- daemon（gnome-remote-desktop-daemon）是外部环境因子：压测/验收时应静置
+  桌面并记录；真机 S1-13 复现概率随它波动（本次 RUN=1/2 挂、RUN=4/6 全
+  活是同一环境的不同时刻）。
+- watchdog 触发延迟 = CTA 被饿死后才轮到跑 10s 自旋预算，所以 SyncTimeout
+  （20s 内 watchdog 未触发）不是失败——是饿死更深；两者都是确定错误路径。

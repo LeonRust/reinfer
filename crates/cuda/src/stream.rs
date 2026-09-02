@@ -29,6 +29,28 @@ impl CudaStream {
         unsafe { sys::cudaStreamSynchronize(self.raw) }.result().map_err(from_runtime_error)
     }
 
+    /// 有界同步（S1-13 decode-deadlock 兜底）：轮询本流完成态而不是永久
+    /// 阻塞——`Ok(true)` = `timeout` 内排空；`Ok(false)` = 仍在忙（调用方把
+    /// 卡死转为确定性错误；层内核 barrier 看门狗自终止后本流最终排空）。
+    /// `cudaStreamQuery` 的 `NOT_READY` 不是错误（与 `error.rs` 白名单一致）。
+    pub fn synchronize_bounded(&self, timeout: std::time::Duration) -> Result<bool, LaunchError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let rc = unsafe { sys::cudaStreamQuery(self.raw) } as i32;
+            if rc == crate::error::CUDA_SUCCESS {
+                return Ok(true);
+            }
+            if rc == crate::error::CUDA_ERROR_NOT_READY {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            return Err(crate::error::classify(rc).unwrap_or(LaunchError::Fatal));
+        }
+    }
+
     /// 原始句柄（crate 内部：注册表/后续 kernel 启动经公开入口消费）。
     pub(crate) fn handle(&self) -> sys::cudaStream_t {
         self.raw

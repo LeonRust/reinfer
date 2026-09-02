@@ -712,7 +712,9 @@ impl Jgemm {
         let grid1 = m as u32 * ncols * nslabs;
         // SAFETY: `a`/`b` valid (caller contract); `partials_v` valid for
         // m*n*nslabs*4 bytes (just ensured); locals for params.
-        unsafe { launch_rows(self.kernel_batch, stream, self.dev, grid1, 256, args1.as_mut_ptr())? };
+        unsafe {
+            launch_rows(self.kernel_batch, stream, self.dev, grid1, 256, args1.as_mut_ptr())?
+        };
         let c_v2: *mut f32 = c;
         let m_v2: c_int = m as c_int;
         let n_v2: c_int = n as c_int;

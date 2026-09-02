@@ -200,11 +200,27 @@ __device__ __forceinline__ unsigned short f32_to_hbits(float f) {
 // `cnt`/`gen` slots are distinct per barrier index and self-reset, so no
 // per-launch initialization is needed (the buffer is zeroed once at build;
 // the first launch's barrier 0 sees cnt == 0).
-__device__ __forceinline__ void grid_barrier(volatile unsigned int* cnt,
+//
+// S1-13 watchdog: the spin is bounded (BARRIER_SPIN_BUDGET clock64 cycles,
+// ~10 s at 2.5 GHz — legitimate barriers resolve in µs). A release that
+// never comes (a co-resident-grid guarantee broken by foreign SM
+// occupancy, a lost wake-up, an arrival-count mismatch) otherwise spins
+// forever at 100% SM utilization with the host stuck in its stream sync.
+// On budget exhaustion the block records the barrier slot in the error
+// word (bar[20] = slot + 1, first writer wins) and self-terminates; every
+// stuck block hits the same budget, so the launch drains in bounded time
+// and the host turns the flag into a deterministic step error. The
+// success path is unchanged (the budget check only reads clock64).
+#define BARRIER_SPIN_BUDGET 25000000000ull  // ~10 s at 2.5 GHz
+__device__ __forceinline__ bool grid_barrier(volatile unsigned int* cnt,
                                              volatile unsigned int* gen,
+                                             volatile unsigned int* err,
+                                             int slot,
                                              int p) {
+    __shared__ bool s_ok;
     __syncthreads();
     if (threadIdx.x == 0) {
+        s_ok = true;
         __threadfence();  // release: my stage writes are visible before arrival
         unsigned int arrive = atomicAdd((unsigned int*)cnt, 1);
         if ((int)arrive == p - 1) {
@@ -213,12 +229,32 @@ __device__ __forceinline__ void grid_barrier(volatile unsigned int* cnt,
             atomicAdd((unsigned int*)gen, 1);  // release the others
         } else {
             unsigned int s = *gen;
+            unsigned long long t0 = clock64();
             while (*gen == s) {  // spin until the last block releases
+                if (clock64() - t0 > BARRIER_SPIN_BUDGET) {
+                    // Watchdog: the release never came. Record the slot
+                    // and exit the kernel (the caller returns) — the other
+                    // stuck blocks time out the same way, so the launch
+                    // drains and the host errors the step.
+                    if (err != 0 && *err == 0) {
+                        *err = (unsigned int)slot + 1;
+                        // diag: elapsed spin cycles (u64 across two words —
+                        // the budget is 2.5e10, beyond u32's range).
+                        unsigned long long dt = clock64() - t0;
+                        err[1] = (unsigned int)(dt & 0xffffffffu);
+                        err[2] = (unsigned int)(dt >> 32);
+                    }
+                    s_ok = false;
+                    break;
+                }
             }
-            __threadfence();  // acquire: others' stage writes are visible now
+            if (s_ok) {
+                __threadfence();  // acquire: others' writes are visible now
+            }
         }
     }
     __syncthreads();
+    return s_ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,7 +1461,8 @@ __device__ __forceinline__ void layer_fused_body(
     const int G = gridDim.x;
     // 10 barrier slots (2 * N_BARRIERS u32): index k guards stage k -> k+1
     // (bar0..bar6 full-grid/participant, bar7/bar8 the add_rms split
-    // barriers, bar9 spare).
+    // barriers, bar9 spare). The watchdog error word lives at bar[20]
+    // (0 = clean; slot + 1 after a spin timeout — see grid_barrier).
     volatile unsigned int* bcnt = bar;
     volatile unsigned int* bgen = bar + 10;
     const int tw = W == 1 ? 512 : 256 * WC;
@@ -1476,7 +1513,9 @@ __device__ __forceinline__ void layer_fused_body(
     // A-tree bar0 (the whole grid in the S1-11 kernel): p1_qkv partials
     // -> p2_qkv — in pipe mode only the producers participate (the
     // consumers are a subset of the same prefix).
-    grid_barrier(&bcnt[0], &bgen[0], pA0);
+    if (!grid_barrier(&bcnt[0], &bgen[0], bar + 20, 0, pA0)) {
+        return;  // S1-13 watchdog fired (see grid_barrier)
+    }
     if constexpr (PIPE) {
         // A-only blocks: p1_qkv producers with no stage-2..8 role — the
         // B tree and the edges never include {bx >= pB}, so they retire
@@ -1489,7 +1528,9 @@ __device__ __forceinline__ void layer_fused_body(
     p2qkv_tiles<W>(c, table, cq + 2 * ck, bx, G, tid, pos, wq, wk);
     stage_ts_mark(c, li, 2);
     if (bx < P1) {
-        grid_barrier(&bcnt[1], &bgen[1], P1);
+        if (!grid_barrier(&bcnt[1], &bgen[1], bar + 20, 1, P1)) {
+            return;  // S1-13 watchdog fired
+        }
     }
     // 3. fused flash (kv write + attention): one tile per q head
     for (int h = bx; h < c->q_heads; h += G) {
@@ -1497,7 +1538,9 @@ __device__ __forceinline__ void layer_fused_body(
     }
     stage_ts_mark(c, li, 3);
     if (bx < P2) {
-        grid_barrier(&bcnt[2], &bgen[2], P2);
+        if (!grid_barrier(&bcnt[2], &bgen[2], bar + 20, 2, P2)) {
+            return;  // S1-13 watchdog fired
+        }
     }
     // 4. o phase-1 (reads the full attention row)
     p1_tiles_plain(c, table, 3, 1, c->tiles_o, bx, G, tid);
@@ -1505,25 +1548,33 @@ __device__ __forceinline__ void layer_fused_body(
     // P_edge_add_o (slot 3; the whole grid in the S1-11 kernel): the
     // p1_o partials -> the add(o) workers (the pipe mode's first data
     // edge between the A tree and the B group).
-    grid_barrier(&bcnt[3], &bgen[3], pB);
+    if (!grid_barrier(&bcnt[3], &bgen[3], bar + 20, 3, pB)) {
+        return;  // S1-13 watchdog fired
+    }
     // 5. o phase-2 + residual add (add stripes over pB in pipe mode; all
     //    blocks in the S1-11 kernel) + ffn rms (block 0)
     stage_add_columns(table[3].partials, c->x, c->h, c->nslabs_o, bx, pB, tid);
-    grid_barrier(&bcnt[7], &bgen[7], pB);
+    if (!grid_barrier(&bcnt[7], &bgen[7], bar + 20, 7, pB)) {
+        return;  // S1-13 watchdog fired
+    }
     if (bx == 0) {
         stage_rms_out(c->x, c->xn, wffn, c->h, c->eps, tid);
     }
     stage_ts_mark(c, li, 5);
     // B-tree: rms(o) (block 0, the last arriver) -> the p1_gu tiles.
     if (bx < p4) {
-        grid_barrier(&bcnt[4], &bgen[4], p4);
+        if (!grid_barrier(&bcnt[4], &bgen[4], bar + 20, 4, p4)) {
+            return;  // S1-13 watchdog fired
+        }
     }
     // 6. gate/up phase-1 (reads xn = p2_o's ffn-normed x)
     p1_tiles<W, WC>(c, table, 4, 2, c->tiles_gu, tw, bx, G, tid);
     stage_ts_mark(c, li, 6);
     // B-tree: p1_gu partials -> the p2_gu_d tiles.
     if (bx < p5) {
-        grid_barrier(&bcnt[5], &bgen[5], p5);
+        if (!grid_barrier(&bcnt[5], &bgen[5], bar + 20, 5, p5)) {
+            return;  // S1-13 watchdog fired
+        }
     }
     // 7. gate/up phase-2 + swiglu + down phase-1 (one tile per down
     //    (col-block, slab) — the split's full down phase-1 grid; 017-d:
@@ -1540,12 +1591,16 @@ __device__ __forceinline__ void layer_fused_body(
     stage_ts_mark(c, li, 7);
     // P_edge_down (slot 6; the whole grid in the S1-11 kernel): the
     // down partials -> the add(down) workers.
-    grid_barrier(&bcnt[6], &bgen[6], pB);
+    if (!grid_barrier(&bcnt[6], &bgen[6], bar + 20, 6, pB)) {
+        return;  // S1-13 watchdog fired
+    }
     // 8. down phase-2 + residual add (add stripes over pB in pipe mode;
     //    all blocks in the S1-11 kernel) + next attn rms (block 0 — the
     //    next layer's gather reads xn after this launch returns)
     stage_add_columns(table[6].partials, c->x, c->h, c->nslabs_d, bx, pB, tid);
-    grid_barrier(&bcnt[8], &bgen[8], pB);
+    if (!grid_barrier(&bcnt[8], &bgen[8], bar + 20, 8, pB)) {
+        return;  // S1-13 watchdog fired
+    }
     if (bx == 0) {
         stage_rms_out(c->x, c->xn, wnext, c->h, c->eps, tid);
     }

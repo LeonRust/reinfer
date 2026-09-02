@@ -986,7 +986,7 @@ mod backend {
                             "choices": [{
                                 "index": 0,
                                 if is_chat { "delta" } else { "text" }: {},
-                                "finish_reason": if stopped_by_eos { "stop" } else { "length" },
+                                "finish_reason": if stopped_by_eos || stopped_by_stop { "stop" } else { "length" },
                             }],
                             "usage": {
                                 "prompt_tokens": pt,
@@ -1024,8 +1024,8 @@ mod backend {
                         det.push(o);
                     }
                 }
-                SchedFrame::Done { stopped_by_eos, tokens, .. } => {
-                    finish = Some((stopped_by_eos, tokens));
+                SchedFrame::Done { stopped_by_eos, stopped_by_stop, tokens, .. } => {
+                    finish = Some((stopped_by_eos || stopped_by_stop, tokens));
                     break;
                 }
                 SchedFrame::Error { message } => {

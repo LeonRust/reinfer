@@ -1635,3 +1635,18 @@ mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触�
 - 结论：299.8 门禁在本硬件+本共识架构下不可达；**249.8 为终值**（gate-fixture
   已注）。对照：vLLM 参照 352.7 = 59% 带宽效率（896GB/s 上限 596）——同硬件
   边界下的对等口径已尽。
+
+## 2026-09-02 — S3-1/S3-2 API 面（stop + freq/pres；真机冒烟）
+
+- stop：serve 解析（str/数组 ≤32、空 token 拒绝）→ token 化；sched 路径（req
+  增量匹配）与串行路径（pipeline 后缀匹配，匹配 token 消费不发出）双生效；
+  finish_reason 双路径映射 `"stop"`（修一个观察 bug：SSE JSON 分支与聚合
+  分支最初只判 stopped_by_eos——stop 触发报 length；两处已修，冒烟复测
+  finish=stop）。
+- freq/pres：GenParams→SamplerParams 字段；CPU 链接入 llm-samplers
+  SampleFreqPresence（原先显式 NotSupported——接参数即 500）；无惩罚时链
+  字节不变。链序：llama.cpp repeat → HF freq/pres（vLLM 序）。
+- 测试：bin 26/26、kernels 51/51（support 列表更新+正向测试）；冒烟
+  smoke_s3.py：stop（单/数组）finish=stop、pen 分布变化 → 全 PASS。
+- 记录：T7 配套的 stop 语义在 sched 路径（对拍 vLLM 行为一致——stop 触发
+  finish_reason=stop，文本不含 stop 串）。

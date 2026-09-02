@@ -39,6 +39,17 @@
 | S2-2 | **连续批 + chunked prefill + token 预算**（调度核心） | 005 | S2-1 | 批量 decode GPU 利用 |
 | S2-3 | **KV 池预算**（90% 显存）+ `max-num-seqs` 语义 | 005 D2 | S2-1 | 显存常驻 20GB+、趋势平坦 |
 | S2-4 | **前缀缓存接口实现**（D9 lookup/refill → P3-01 RadixCache） | 005 D9 / P3-01 | S2-3 | 共享前缀 2-10× 收益；bit-identical |
+**2026-09-02 记录 — S1-11 块宽化波（specs/017）**：017-a 落地 W=2 层融合变体
+（`REINFER_FUSED_BW` 缺省 2；164 块、`p1_tiles<W>` 配对循环、
+`stage_p2_qkv_w2`）——W=2 vs W=1 逐字节位级一致，gpu busy 4.52→4.10ms，
+p1_gu −26~−31%。017-b（p2_o/add_rms 宽化）经真实探针**证伪"add_rms 工作"
+假设**：p2_o=bar4 到达 ~1µs + 自身 DRAM 受限 stage-6（12.6MB/层 @ ~430GB/s
+≈50% 峰值）——干净回退。017-c（bar4 等待/退避）同样零收益并回退；诚实结论：
+剩余 0.83ms/step 行是 **phase-1 流量的带宽效率**（016 barrier 归因有误）；
+017-d（b 行加宽，430→~700GB/s）为进行中接力。**门禁重测（2026-09-02）：
+249.8 tok/s（tpot 4.003ms，83.3%×299.8）——FAIL 记录，较 S1-10c +2.4%。**
+S3-1（双路径 `stop` + finish_reason）与 S3-2（freq/pres 惩罚经 D5 链）同轮
+接线。
 
 **2026-09-01**：S2-4 已开工 —— `specs/016-prefix-cache/`（draft，v1 = 页对齐 run 缓存，命中省计算；radix 前端 ‖ 引擎 prefill 偏移 ‖ executor 复制钩子；D1 run 地址/层步长、D2 refill 并入释放守卫、D3 位级论证见 plan.md）。Wave A agent 运行中；验收表在 bench/notes.md §P3-01。
 

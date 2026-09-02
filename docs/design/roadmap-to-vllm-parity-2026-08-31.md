@@ -40,6 +40,20 @@
 | S2-3 | KV pool budget (90 % VMM) + `max-num-seqs` semantics | 005 D2 | S2-1 | VRAM resident 20 GB+, flat trend |
 | S2-4 | Prefix-cache interface implementation (D9 lookup/refill → P3-01 RadixCache) | 005 D9 / P3-01 | S2-3 | 2-10× on shared prefixes; bit-identical |
 
+**2026-09-02 record — S1-11 block-width wave (specs/017)**: 017-a landed a
+W=2 layer-fused variant (`REINFER_FUSED_BW` default 2; 164 blocks, `p1_tiles<W>`
+pair loops, `stage_p2_qkv_w2`) — bit-exact (W=2 vs W=1 byte-for-byte), gpu busy
+4.52→4.10 ms, p1_gu −26~−31%. 017-b (p2_o/add_rms widening) disproved the
+"add_rms work" hypothesis with a real probe: p2_o is bar4-arrival ~1 µs + the
+block's own DRAM-bound stage-6 (12.6 MB/层 @ ~430 GB/s ≈ 50 % of peak) — reverted
+cleanly. 017-c (bar4-wait/backoff) also zero-gain and reverted; the honest
+conclusion: the remaining 0.83 ms/step row is **bandwidth efficiency** of the
+phase-1 streams (016 barrier attribution was wrong); 017-d (b-row widening,
+430→~700 GB/s) is the live follow-up. **Gate re-measured (2026-09-02): 249.8
+tok/s (tpot 4.003 ms, 83.3 % of 299.8) — FAIL recorded, +2.4 % over S1-10c.**
+S3-1 (`stop` both paths + finish_reason) and S3-2 (freq/pres penalties through
+the D5 chain) wired this cycle as well.
+
 **2026-09-01**: S2-4 已开工 — `specs/016-prefix-cache/` (draft, v1 = page-aligned run cache, compute-saving hits, radix front-end ‖ engine prefill-offset ‖ executor copy hooks; plans/decisions incl. D1 run-vs-layer stride, D2 ref-ordered refill in the release guard, D3 bit-identity argument). Wave A agents running; acceptance table in bench/notes.md §P3-01.
 
 **2026-09-01 record**: S2-1/S2-2 真机验收全项通过（unified acceptance, RTX 5090 Laptop,

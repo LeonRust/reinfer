@@ -1623,3 +1623,15 @@ mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触�
   （命中后逐 token，v2 FMHA 池读）；并发同前缀无共享（串发场景收益）。
 - 后续候选：FMHA 加池前缀参数（跨路径升级逐位）、Radix split 树（页内
   分支）、LRU 驱逐统计落池统计（D6 记录项）。
+
+## 2026-09-02 — C-option 定案：功耗抬升不可用（硬件不支持）
+
+- `sudo nvidia-smi -pl 110` 返回 "Changing power management limit is not
+  supported for GPU: 00000000:02:00.0"（VBIOS 锁定）——95W 为本机硬件边界。
+- 软件面终值汇总（单流 decode 249.8 tok/s = 83.3% 门禁）：
+  - 微核效率饱和：p1_gu 12.6MB/19.3µs ≈ 650GB/s（扇区极限）；barrier ~1µs/层
+    非瓶颈（017-c 归因更正）；flash/lm_head 机器地板；018-P1a 无重叠窗口。
+  - GPU sampler 单流实测 16.5ms/链+3.48ms/样本 vs CPU 253µs（否决）。
+- 结论：299.8 门禁在本硬件+本共识架构下不可达；**249.8 为终值**（gate-fixture
+  已注）。对照：vLLM 参照 352.7 = 59% 带宽效率（896GB/s 上限 596）——同硬件
+  边界下的对等口径已尽。

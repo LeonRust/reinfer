@@ -64,6 +64,7 @@ bench/perf-gate.sh
 |---|---|---|---|---|---|---|
 | 2026-09-01 S1-8 建档 | — | — | — | — | 299.8 / 317.4（定案参照） | 门禁协议卡生效 |
 | 2026-09-01 S1-9b 现状 | （notes.md 当日 commit） | release --features cuda | 284.8 / 270.3（run CLI 短 kv） | — | 299.8 / 317.4 | FAIL（≈95%） |
+| 2026-09-02 S1-11 W=2（017-a; 017-b 回退终态; perf-gate.sh --skip-build） | （工作区未提交; 待收口提交后 git rev-parse HEAD 回填） | release --features cuda（REINFER_CUDA_NVCC=13.2; 无 sched=串行路径; REINFER_FUSED_BW 缺省 2） | 249.8 | 4.003 | 299.8 / 317.4 | FAIL（83.3%; 较 243.9 +2.4%） |
 | <!-- 每波一行：值+commit+flags 由执行者填写；判定=§2 表三态 --> | | | | | | |
 
 > commit+构建 flags 采用 **manually fill** 纪律：脚本只写数值与判定；每波执行者在

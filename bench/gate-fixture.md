@@ -64,6 +64,12 @@ bench/perf-gate.sh
 |---|---|---|---|---|---|---|
 | 2026-09-01 S1-8 建档 | — | — | — | — | 299.8 / 317.4（定案参照） | 门禁协议卡生效 |
 | 2026-09-01 S1-9b 现状 | （notes.md 当日 commit） | release --features cuda | 284.8 / 270.3（run CLI 短 kv） | — | 299.8 / 317.4 | FAIL（≈95%） |
+> **2026-09-02 硬度注记（C-option 关闭）**：`sudo nvidia-smi -pl 110` 在该机返
+> "Changing power management limit is not supported for GPU: 00000000:02:00.0"——
+> RTX 5090 Laptop VBIOS 不支持运行时功耗修改；95W = 硬件边界。结合 017 系列
+> 全量零收益证据（p1_gu 650GB/s 扇区饱和 / barrier ~1µs / 层内链无重叠窗口），
+> 单流 decode 门禁 299.8 判定为**本硬件+本架构下的不可达边界**；perf-gate 登记
+> 值（249.8）即为终值记录。
 | 2026-09-02 S1-11 W=2（017-a; 017-b 回退终态; perf-gate.sh --skip-build） | （工作区未提交; 待收口提交后 git rev-parse HEAD 回填） | release --features cuda（REINFER_CUDA_NVCC=13.2; 无 sched=串行路径; REINFER_FUSED_BW 缺省 2） | 249.8 | 4.003 | 299.8 / 317.4 | FAIL（83.3%; 较 243.9 +2.4%） |
 | <!-- 每波一行：值+commit+flags 由执行者填写；判定=§2 表三态 --> | | | | | | |
 

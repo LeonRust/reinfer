@@ -160,8 +160,29 @@ if [ "$MODE" != "dry-run" ]; then
     exit 2
   fi
   echo "[gate] measure: python3 run_all.py --engine reinfer --suite perf_c1 (bench-vs-vllm harness)..."
-  python3 "$HARNESS_DIR/run_all.py" --engine reinfer --suite perf_c1 --seed "$SEED" \
-    || { echo "perf-gate.sh: harness run failed (exit $?)"; exit 2; }
+  # Watchdog: an intermittent engine-level deadlock (grid-barrier gen
+  # race under disturbed clocks — observed at 100% GPU with no output)
+  # would otherwise hang the run forever. Cap the run at 120s; on
+  # timeout, clean up, restart the server via the harness, and retry ONCE.
+  try_run() {
+    if timeout 120 python3 "$HARNESS_DIR/run_all.py" --engine reinfer --suite perf_c1 --seed "$SEED"; then
+      return 0
+    fi
+    return 1
+  }
+  if ! try_run; then
+    echo "[gate] WARN: perf_c1 exceeded 120s (engine deadlock or stall) — cleaning up and retrying once"
+    pkill -9 -x reinfer 2>/dev/null || true
+    sleep 3
+    (cd "$HARNESS_DIR" && bash stop_servers.sh >/dev/null 2>&1 || true)
+    sleep 2
+    if timeout 120 python3 "$HARNESS_DIR/run_all.py" --engine reinfer --suite perf_c1 --seed "$SEED"; then
+      echo "[gate] retry succeeded"
+    else
+      echo "perf-gate.sh: harness run failed (watchdog retry also stalled)"
+      exit 2
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------- 4+5) parse + verdict

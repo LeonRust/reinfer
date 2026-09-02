@@ -333,12 +333,6 @@ impl CpuSamplerChain {
         if !params.logit_bias.is_empty() {
             return Err(SampleError::NotSupported(UnsupportedParam::LogitBias));
         }
-        if params.frequency_penalty.is_some_and(|p| p != 0.0) {
-            return Err(SampleError::NotSupported(UnsupportedParam::FrequencyPenalty));
-        }
-        if params.presence_penalty.is_some_and(|p| p != 0.0) {
-            return Err(SampleError::NotSupported(UnsupportedParam::PresencePenalty));
-        }
         if !params.bad_words.is_empty() {
             return Err(SampleError::NotSupported(UnsupportedParam::BadWords));
         }
@@ -353,6 +347,8 @@ impl CpuSamplerChain {
             top_k: params.top_k,
             top_p: params.top_p,
             repeat_penalty: params.repeat_penalty,
+            frequency_penalty: params.frequency_penalty,
+            presence_penalty: params.presence_penalty,
             repeat_last_n: params.repeat_last_n,
             seed: params.seed,
         })
@@ -563,6 +559,8 @@ mod tests {
                 top_k: params.top_k,
                 top_p: params.top_p,
                 repeat_penalty: params.repeat_penalty,
+                frequency_penalty: params.frequency_penalty,
+                presence_penalty: params.presence_penalty,
                 repeat_last_n: params.repeat_last_n,
                 seed: params.seed,
             };
@@ -589,14 +587,6 @@ mod tests {
                 UnsupportedParam::LogitBias,
             ),
             (
-                SamplerParams { frequency_penalty: Some(0.5), ..Default::default() },
-                UnsupportedParam::FrequencyPenalty,
-            ),
-            (
-                SamplerParams { presence_penalty: Some(-0.3), ..Default::default() },
-                UnsupportedParam::PresencePenalty,
-            ),
-            (
                 SamplerParams { bad_words: vec![vec![1, 2, 3]], ..Default::default() },
                 UnsupportedParam::BadWords,
             ),
@@ -615,6 +605,30 @@ mod tests {
                 .sample(&view(&[1.0f32, 2.0, 3.0]), &params, &mut RngState::new(1))
                 .unwrap_err();
             assert!(matches!(err, SampleError::NotSupported(p) if p == expected));
+
+            /// S3-2: frequency/presence penalties are now on the CPU chain
+            /// (SampleFreqPresence via llm-samplers; off when both are 0/None —
+            /// legacy parameter sets keep their bit-identical chain).
+            #[test]
+            fn freq_pres_penalties_are_supported_on_cpu_chain() {
+                let params = SamplerParams {
+                    temperature: 1.0,
+                    frequency_penalty: Some(0.5),
+                    presence_penalty: Some(0.3),
+                    ..Default::default()
+                };
+                let mut chain = CpuSamplerChain::new(&params).expect("freq/pres accepted");
+                // Sample path reaches the greedy/distrib stage with the penalties in
+                // the chain — no NotSupported, a token comes out.
+                let v = view(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+                let out = chain.sample(&v, &params, &mut RngState::new(7)).expect("sample ok");
+                assert!(out.token < 6, "token within vocab");
+                // Defaults (no penalties) stay accepted and bit-identical-path.
+                let d = SamplerParams::default();
+                let mut c2 = CpuSamplerChain::new(&d).expect("defaults accepted");
+                let out2 = c2.sample(&v, &d, &mut RngState::new(7)).expect("default sample ok");
+                assert!(out2.token < 6);
+            }
         }
     }
 

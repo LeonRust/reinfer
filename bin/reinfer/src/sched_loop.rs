@@ -307,6 +307,8 @@ pub enum SchedFrame {
     Done {
         /// Whether generation stopped on EOS (OpenAI `finish_reason`).
         stopped_by_eos: bool,
+        /// Whether generation stopped on a `stop` sequence (S3-1).
+        stopped_by_stop: bool,
         /// Generated token count.
         tokens: usize,
         /// Prompt token count.
@@ -643,6 +645,8 @@ impl<E: BatchExecutor> SchedLoop<E> {
             top_k: req.params.top_k,
             top_p: req.params.top_p,
             repeat_penalty: req.params.repeat_penalty,
+            frequency_penalty: req.params.frequency_penalty,
+            presence_penalty: req.params.presence_penalty,
             repeat_last_n: 64, // legacy pipeline penalty window (unchanged)
             seed: Some(
                 req.params.seed.unwrap_or_else(|| splitmix64(self.cfg.base_seed ^ id.as_u64())),
@@ -1009,15 +1013,15 @@ impl<E: BatchExecutor> SchedLoop<E> {
                 }
                 ConfirmEvent::Stopped => {
                     self.trace(id, Event::Stopped);
-                    self.terminal(id, false);
+                    self.terminal(id, false, true);
                 }
                 ConfirmEvent::Eos => {
                     self.trace(id, Event::Eos);
-                    self.terminal(id, true);
+                    self.terminal(id, true, false);
                 }
                 ConfirmEvent::MaxOutput => {
                     self.trace(id, Event::MaxOutput);
-                    self.terminal(id, false);
+                    self.terminal(id, false, false);
                 }
                 ev => unreachable!("{ev:?}"),
             }
@@ -1026,10 +1030,11 @@ impl<E: BatchExecutor> SchedLoop<E> {
 
     /// Terminal accounting: Done frame, exactly-once release guard, EMA
     /// update, working-set removal, segment release ("后释放").
-    fn terminal(&mut self, id: ReqId, stopped_by_eos: bool) {
+    fn terminal(&mut self, id: ReqId, stopped_by_eos: bool, stopped_by_stop: bool) {
         let m = self.meta.get_mut(&id).expect("live meta");
         let frame = SchedFrame::Done {
             stopped_by_eos,
+            stopped_by_stop,
             tokens: m.generated.len(),
             prompt_tokens: m.prompt.len(),
         };
@@ -1165,6 +1170,7 @@ fn sample_token(
     dev: u32,
     vocab: usize,
 ) -> Result<(u32, Option<TokenOut>), String> {
+    let t0 = std::time::Instant::now();
     let view = LogitsView::new(
         reinfer_core::DeviceId::new(dev),
         reinfer_kernels::DeviceBuffer::new(0, 0),
@@ -1183,6 +1189,9 @@ fn sample_token(
     } else {
         None
     };
+    if std::env::var("REINFER_PROF_SAMPLER").as_deref() == Ok("1") {
+        eprintln!("reinfer: prof: sampler host ({vocab} vocab) took {:?}", t0.elapsed());
+    }
     Ok((out.token, tokout))
 }
 
@@ -1746,7 +1755,7 @@ mod tests {
             // dropped singleton is invisible; segments must be refilled
             // with materialized KV only, so the loop's flush-on-refill
             // path guarantees it).
-            if let Some((sid, sseg, kv_len)) = self.singleton.take().filter(|s| s.0 == id) {
+            if let Some((_sid, sseg, kv_len)) = self.singleton.take().filter(|s| s.0 == id) {
                 debug_assert_eq!(sseg.base_page, seg.base_page);
                 let s = self.segs.get_mut(&seg.base_page).expect("singleton segment live");
                 assert!(s.len() <= kv_len, "flush cannot overshoot");
@@ -1829,6 +1838,8 @@ mod tests {
             top_k: None,
             top_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             seed: Some(42),
         }
     }
@@ -1941,7 +1952,12 @@ mod tests {
                     assert!(delta.starts_with('T'));
                     assert!(out.is_none());
                 }
-                SchedFrame::Done { stopped_by_eos, tokens: n, prompt_tokens } => {
+                SchedFrame::Done {
+                    stopped_by_eos,
+                    stopped_by_stop: _,
+                    tokens: n,
+                    prompt_tokens,
+                } => {
                     done = true;
                     assert!(!stopped_by_eos, "terminated by max output");
                     assert_eq!(n, 6);

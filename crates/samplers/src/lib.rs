@@ -25,6 +25,10 @@ pub struct SamplingParams {
     pub top_p: Option<f32>,
     /// 重复惩罚（须 >1.0 才启用；llama.cpp 语义：logits>0 除法、<0 乘法）。
     pub repeat_penalty: Option<f32>,
+    /// HF 语义频率惩罚（[0,2]；0.0 = off；llm-samplers SampleFreqPresence）。
+    pub frequency_penalty: Option<f32>,
+    /// HF 语义存在惩罚（[0,2]；0.0 = off；llm-samplers SampleFreqPresence）。
+    pub presence_penalty: Option<f32>,
     /// 重复惩罚作用于最近 N token。
     pub repeat_last_n: usize,
     /// 随机种子（Some → 全链确定）。
@@ -38,6 +42,8 @@ impl Default for SamplingParams {
             top_k: None,
             top_p: None,
             repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             repeat_last_n: 64,
             seed: None,
         }
@@ -60,8 +66,15 @@ impl Sampler {
             None => Box::new(StdRng::from_entropy()),
         };
         let mut chain = SamplerChain::new();
+        // Penalties family: llama.cpp repeat first, then HF freq/presence
+        // (vLLM order: bias → penalties → filters → temperature).
         if let Some(pen) = params.repeat_penalty.filter(|p| *p > 1.0) {
             chain.push_sampler(SampleRepetition::new(pen, params.repeat_last_n));
+        }
+        let freq = params.frequency_penalty.unwrap_or(0.0).max(0.0);
+        let pres = params.presence_penalty.unwrap_or(0.0).max(0.0);
+        if freq > 0.0 || pres > 0.0 {
+            chain.push_sampler(SampleFreqPresence::new(freq, pres, params.repeat_last_n));
         }
         if let Some(k) = params.top_k.filter(|k| *k > 0) {
             chain.push_sampler(SampleTopK::new(k, 1));

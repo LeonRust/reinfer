@@ -661,6 +661,8 @@ fn cmd_run_cuda(
         top_k: a.top_k,
         top_p: a.top_p,
         repeat_penalty: a.repeat_penalty,
+        frequency_penalty: None, // run CLI 无惩罚选项（S3-2 serve 面已接）
+        presence_penalty: None,
         seed: a.seed,
     };
     let _n_new = 0usize;
@@ -670,6 +672,7 @@ fn cmd_run_cuda(
         &ids,
         &params,
         eos,
+        &[],
         a.max_tokens,
         |delta, _tok| {
             print!("{delta}");

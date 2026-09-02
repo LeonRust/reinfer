@@ -42,12 +42,24 @@ pub struct GenParams {
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    /// D5 chain: OpenAI `frequency_penalty` (S3-2 serve surface).
+    pub frequency_penalty: Option<f32>,
+    /// D5 chain: OpenAI `presence_penalty` (S3-2 serve surface).
+    pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
 }
 
 impl Default for GenParams {
     fn default() -> Self {
-        Self { temperature: 1.0, top_k: None, top_p: None, repeat_penalty: None, seed: None }
+        Self {
+            temperature: 1.0,
+            top_k: None,
+            top_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+        }
     }
 }
 
@@ -69,6 +81,9 @@ pub struct GenStat {
     pub elapsed: std::time::Duration,
     pub first_token: Option<std::time::Duration>,
     pub stopped_by_eos: bool,
+    /// S3-1: a `stop` sequence matched (the sampled token behind it is
+    /// consumed but not emitted — OpenAI stop semantics).
+    pub stopped_by_stop: bool,
 }
 
 /// 006-2 T3E: build the sampler chain for one generation. The GPU provider
@@ -111,6 +126,9 @@ pub fn generate_stream(
     prompt_ids: &[u32],
     params: &GenParams,
     eos_id: Option<u32>,
+    // S3-1: OpenAI `stop` sequences (token ids; suffix match). Empty =
+    // legacy EOS-only behavior (bit-identical).
+    stop: &[Vec<u32>],
     max_tokens: u32,
     mut sink: impl FnMut(&str, Option<&TokenOut>) -> bool,
     logprobs_top_n: usize,
@@ -141,6 +159,8 @@ pub fn generate_stream(
         top_k: params.top_k,
         top_p: params.top_p,
         repeat_penalty: params.repeat_penalty,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
         repeat_last_n: 64, // legacy pipeline penalty window (unchanged)
         seed: params.seed,
         ..SamplerParams::default()
@@ -160,6 +180,7 @@ pub fn generate_stream(
     let t0 = std::time::Instant::now();
     let mut first_token = None;
     let mut stopped_by_eos = false;
+    let mut stopped_by_stop = false;
     while generated.len() < max_tokens as usize {
         let logits = engine.step(cur, pos, pos + 1).map_err(|e| format!("generate: {e}"))?;
         if first_token.is_none() {
@@ -181,6 +202,13 @@ pub fn generate_stream(
             break;
         }
         generated.push(next);
+        // S3-1 stop: a matching suffix ends the generation — the sampled
+        // token behind the match is consumed but not emitted.
+        if let Some(pat) = stop.iter().find(|pat| generated.ends_with(pat.as_slice())) {
+            generated.truncate(generated.len() - pat.len());
+            stopped_by_stop = true;
+            break;
+        }
         cur = next;
         pos += 1;
         let full = tokenizer.decode_all(&generated);
@@ -201,7 +229,13 @@ pub fn generate_stream(
     if generated.is_empty() {
         first_token = None;
     }
-    Ok(GenStat { tokens: generated.len(), elapsed: t0.elapsed(), first_token, stopped_by_eos })
+    Ok(GenStat {
+        tokens: generated.len(),
+        elapsed: t0.elapsed(),
+        first_token,
+        stopped_by_eos,
+        stopped_by_stop,
+    })
 }
 
 /// 渲染模型 chat 模板（tokenizer_config.json 的 `chat_template`；minijinja）。

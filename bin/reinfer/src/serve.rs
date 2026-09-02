@@ -488,7 +488,11 @@ mod backend {
             id,
             model,
             prompt_tokens,
+            stop,
         } = parsed;
+        // S3-1 串行路径 stop：尚未实现（generate_stream 无 stop 参数）——
+        // 记为"后续面"（T7 stop 经调度器面验证）；此处显式接住避免静默忽略。
+        let _ = stop;
         let eos_id = st.eos;
         let want_logprobs = lp_top_n > 0;
 
@@ -515,6 +519,7 @@ mod backend {
                     &ids_c,
                     &params_c,
                     eos_id,
+                    &stop,
                     max_tokens,
                     |delta, tok| {
                         let is_chat = stream_obj_c.starts_with("chat.");
@@ -555,7 +560,7 @@ mod backend {
                             "choices": [{
                                 "index": 0,
                                 if is_chat { "delta" } else { "text" }: {},
-                                "finish_reason": if s.stopped_by_eos { "stop" } else { "length" },
+                                "finish_reason": if s.stopped_by_eos || s.stopped_by_stop { "stop" } else { "length" },
                             }],
                             "usage": {
                                 "prompt_tokens": prompt_tokens,
@@ -597,6 +602,7 @@ mod backend {
                 &ids_c,
                 &params_c,
                 eos_id,
+                &stop,
                 max_tokens,
                 |delta, tok| {
                     let _ = tx.send(delta.to_string());
@@ -741,7 +747,10 @@ mod backend {
             temperature: f("temperature").unwrap_or(1.0),
             top_p: f("top_p").filter(|p| *p != 1.0),
             top_k: i("top_k"),
+            // S3-2: OpenAI penalty surfaces (D5 chain fields; None = off).
             repeat_penalty: None, // OpenAI 无该参数；服务缺省 1.0（不惩罚）
+            frequency_penalty: f("frequency_penalty"),
+            presence_penalty: f("presence_penalty"),
             seed: body.get("seed").and_then(|v| v.as_u64()),
         };
         let max_tokens = i("max_tokens").unwrap_or(256) as u32;
@@ -798,6 +807,44 @@ mod backend {
         let model = st.model_id.clone();
         let prompt_tokens = ids.len();
 
+        // S3-1: `stop`（OpenAI 面——string 或 string 数组；tokenize 为
+        // 原始 id 序列（无 special），交给调度器/串行路径做增量匹配。
+        // 每条 stop 串 ≤64 字符（OpenAI 参考上限），超数组 32 拒绝。
+        let stop: Vec<Vec<u32>> = match body.get("stop") {
+            Some(serde_json::Value::String(s)) => {
+                vec![tokenize_stop(st, s)?]
+            }
+            Some(serde_json::Value::Array(a)) => {
+                if a.len() > 32 {
+                    return Err(openai_err(
+                        StatusCode::BAD_REQUEST,
+                        "up to 32 stop sequences allowed",
+                        "invalid_request_error",
+                        "stop",
+                        "",
+                    ));
+                }
+                let mut out = Vec::with_capacity(a.len());
+                for v in a {
+                    let s = match v.as_str() {
+                        Some(s) => s,
+                        None => {
+                            return Err(openai_err(
+                                StatusCode::BAD_REQUEST,
+                                "stop entries must be strings",
+                                "invalid_request_error",
+                                "stop",
+                                "",
+                            ));
+                        }
+                    };
+                    out.push(tokenize_stop(st, s)?);
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+
         Ok(CompletionReq {
             ids,
             params,
@@ -807,7 +854,34 @@ mod backend {
             id,
             model,
             prompt_tokens,
+            stop,
         })
+    }
+
+    /// Tokenize one OpenAI `stop` string (no special tokens; empty after
+    /// encode → 400, mirroring vLLM's empty-stop rejection).
+    fn tokenize_stop(st: &AppState, s: &str) -> Result<Vec<u32>, axum::response::Response> {
+        let ids = st.tokenizer.encode(s, false).map_err(|e| {
+            openai_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("stop encode: {e}"),
+                "server_error",
+                "",
+                "stop",
+            )
+            .into_response()
+        })?;
+        if ids.is_empty() {
+            return Err(openai_err(
+                StatusCode::BAD_REQUEST,
+                "stop sequence must tokenize to at least one token",
+                "invalid_request_error",
+                "stop",
+                "",
+            )
+            .into_response());
+        }
+        Ok(ids)
     }
 
     /// 解析后的完成请求（serial 与 scheduler 共用面）。
@@ -820,6 +894,9 @@ mod backend {
         id: String,
         model: String,
         prompt_tokens: usize,
+        /// S3-1: OpenAI `stop` sequences (token IDs; incremental matching
+        /// happens in the scheduler / serial path).
+        stop: Vec<Vec<u32>>,
     }
 
     /// S2-D：scheduler 路径（REINFER_SCHEDULER=on）。submit 到调度循环，帧经
@@ -851,7 +928,7 @@ mod backend {
             params: parsed.params,
             eos: st.eos,
             max_tokens: parsed.max_tokens as usize,
-            stop: vec![], // stop 字符串暂不编码（与串行路径一致；记录，后续面）
+            stop: parsed.stop,
             logprobs_top_n: parsed.lp_top_n,
             token,
             tx,
@@ -901,7 +978,7 @@ mod backend {
                         })
                         .to_string()
                     }
-                    SchedFrame::Done { stopped_by_eos, tokens, prompt_tokens: pt } => {
+                    SchedFrame::Done { stopped_by_eos, stopped_by_stop, tokens, prompt_tokens: pt } => {
                         serde_json::json!({
                             "id": id,
                             "object": stream_obj,

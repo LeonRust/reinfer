@@ -35,6 +35,12 @@ impl CudaStream {
     /// `cudaStreamQuery` 的 `NOT_READY` 不是错误（与 `error.rs` 白名单一致）。
     pub fn synchronize_bounded(&self, timeout: std::time::Duration) -> Result<bool, LaunchError> {
         let deadline = std::time::Instant::now() + timeout;
+        // Fast path: spin on cudaStreamQuery WITHOUT sleeping — the stream
+        // normally drains within microseconds of the last kernel's tail.
+        // (The original 10ms sleep every NOT_READY added ~10ms/step to the
+        // healthy decode loop — an S1-13 regression.) Only after a short
+        // CPU-poll window (no sleep) do we back off to sleep(1ms).
+        let mut polls_without_yield = 0u32;
         loop {
             let rc = unsafe { sys::cudaStreamQuery(self.raw) } as i32;
             if rc == crate::error::CUDA_SUCCESS {
@@ -44,7 +50,13 @@ impl CudaStream {
                 if std::time::Instant::now() >= deadline {
                     return Ok(false);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                polls_without_yield += 1;
+                if polls_without_yield < 64 {
+                    // busy-poll ramp: query until the timeout budget
+                    // (each query ~1-2us; 64 polls ~0.1ms)
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
             return Err(crate::error::classify(rc).unwrap_or(LaunchError::Fatal));

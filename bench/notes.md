@@ -1738,3 +1738,14 @@ mock 测试（直接 new+run 单线程）从未覆盖，首度真机 serve 触�
   活是同一环境的不同时刻）。
 - watchdog 触发延迟 = CTA 被饿死后才轮到跑 10s 自旋预算，所以 SyncTimeout
   （20s 内 watchdog 未触发）不是失败——是饿死更深；两者都是确定错误路径。
+
+## 2026-09-02 — S1-13b：sync 快路径回归修复（11ms → 4.3-4.8ms）
+
+- S1-13 的 `sync_drain_bounded` 在每次 `NOT_READY` 即 `sleep(10ms)`——健康
+  decode 循环每步同步时 kernel 尾部尚未排空 → **每步白等 ~10ms**（S1-13 引入
+  的系统回归：tpot 3.9→11.0ms，门禁 90.4 tok/s——agent RUN=6 的 12.3ms 同为
+  该回归，当时记为"正常"）。
+- 修复：快路径连续 `cudaStreamQuery` 忙轮询（64 次，~0.1ms 无 sleep），之后
+  才 `sleep(1ms)` 退避——健康路径回落到零开销。
+- 验证：手动 4 请求 tpot 11.05→4.76ms；perf-gate（S1-13 后）n=20 全完成、
+  0 errors、tpot 4.301ms=232.5 tok/s（机况中态）。Watchdog 未触发。

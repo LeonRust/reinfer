@@ -71,6 +71,7 @@ bench/perf-gate.sh
 > 单流 decode 门禁 299.8 判定为**本硬件+本架构下的不可达边界**；perf-gate 登记
 > 值（249.8）即为终值记录。
 | 2026-09-02 S1-11 W=2（017-a; 017-b 回退终态; perf-gate.sh --skip-build） | （工作区未提交; 待收口提交后 git rev-parse HEAD 回填） | release --features cuda（REINFER_CUDA_NVCC=13.2; 无 sched=串行路径; REINFER_FUSED_BW 缺省 2） | 249.8 | 4.003 | 299.8 / 317.4 | FAIL（83.3%; 较 243.9 +2.4%） |
+| 2026-09-02 S1-13 后重测（sync 快路径修复） | 03e1f2d (见下 commit) | release --features cuda（watchdog+有界同步） | 232.5 | 4.301 | 299.8 / 317.4 | FAIL（77.6%；机况中态；无挂死完整 20/20） |
 | <!-- 每波一行：值+commit+flags 由执行者填写；判定=§2 表三态 --> | | | | | | |
 
 > commit+构建 flags 采用 **manually fill** 纪律：脚本只写数值与判定；每波执行者在

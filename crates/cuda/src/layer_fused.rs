@@ -60,6 +60,14 @@ const BW_ENV: &str = "REINFER_FUSED_BW";
 /// width 2; W=1 forces WC=1.
 const WC_ENV: &str = "REINFER_FUSED_WC";
 
+/// 018 P1a (specs/018-decode-pipeline): the two-tree pipe switch
+/// (`REINFER_FUSED_PIPE=1` — the W=2/WC=1 kernel with the A/B barrier
+/// trees and the P_edge_add_o / P_edge_down data edges). Default 0 = the
+/// S1-11 kernel byte-identical (the pipe entry is only instantiated at
+/// W=2/WC=1, so other width combinations silently keep the S1-11
+/// kernel). Orthogonal to REINFER_FUSED_BW/WC.
+const PIPE_ENV: &str = "REINFER_FUSED_PIPE";
+
 /// REINFER_FUSED_BW parsing: unset -> **2** (default on); off words mirror
 /// the opt-out convention (like REINFER_FUSED) and select width 1.
 #[must_use]
@@ -82,6 +90,20 @@ fn col_width_from_env(value: Option<&str>) -> u32 {
             "2" => 2,
             "4" => 4,
             _ => 1,
+        },
+    }
+}
+
+/// REINFER_FUSED_PIPE parsing: unset -> off; "1"/on-words -> the two-tree
+/// pipe entry (specs/018 P1a). The reserved P2a/P3a values (2/3) are not
+/// implemented — they stay off.
+#[must_use]
+fn pipe_from_env(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => true,
+            _ => false,
         },
     }
 }
@@ -183,6 +205,12 @@ struct LayerFusedConst {
     eps: f32,
     /// head-norm on (q_norm/k_norm present).
     hn: i32,
+    /// 018 P1a pipe sets (only the pipe entry reads them; Qwen3-0.6B
+    /// W=2: 144/96).
+    /// bar0 participants (the p1_qkv producer prefix).
+    pipe_pa0: i32,
+    /// B-group prefix (edge + B-tree participants).
+    pipe_pb: i32,
 }
 
 /// Per-layer geometry + buffer pointers the const is built from. Plain
@@ -256,6 +284,13 @@ pub struct LayerFusedSpec {
 /// (`REINFER_FUSED_WC`): WC=2/4 entries `decode_step_layer_fused_bw2_wc2`
 /// /`..._wc4` load each thread's WC consecutive columns as one vector
 /// load. WC=1 is the S1-11 entry verbatim.
+///
+/// 018 P1a (specs/018-decode-pipeline): a fifth entry
+/// `decode_step_layer_fused_bw2_pipe` (selected by `REINFER_FUSED_PIPE=1`
+/// at W=2/WC=1) runs the same stage program with the barriers split into
+/// two trees (A: gather/qkv/flash/o-p1; B: add_rms(o)/gu/down) plus the
+/// P_edge_add_o / P_edge_down data edges — same arithmetic, different
+/// participant sets (uploaded in the const as pipe_pa0/pipe_pb).
 #[derive(Debug)]
 pub struct LayerFusedKernels {
     lib: JLib,
@@ -266,11 +301,15 @@ pub struct LayerFusedKernels {
     /// 017-d: the W=2 WC=2/4 entries.
     kernel_w2_wc2: KernelFn,
     kernel_w2_wc4: KernelFn,
+    /// 018 P1a: the two-tree pipe entry (`decode_step_layer_fused_bw2_pipe`).
+    kernel_w2_pipe: KernelFn,
     /// Selected block width (1 = S1-10 behavior, 2 = S1-11 widened).
     block_width: u32,
     /// Selected per-thread column width of the phase-1 stages (1/2/4;
     /// 1 when block width 1).
     col_width: u32,
+    /// 018 P1a: the two-tree pipe mode is on (W=2/WC=1 pipe entry).
+    pipe: bool,
     dev: u32,
     /// The uploaded `LayerFusedConst` blob (stable).
     cbuf: DeviceBuffer,
@@ -310,14 +349,17 @@ impl LayerFusedKernels {
         let kernel_w2 = lib.kernel("decode_step_layer_fused_bw2")?;
         let kernel_w2_wc2 = lib.kernel("decode_step_layer_fused_bw2_wc2")?;
         let kernel_w2_wc4 = lib.kernel("decode_step_layer_fused_bw2_wc4")?;
+        let kernel_w2_pipe = lib.kernel("decode_step_layer_fused_bw2_pipe")?;
         Ok(Self {
             lib,
             kernel,
             kernel_w2,
             kernel_w2_wc2,
             kernel_w2_wc4,
+            kernel_w2_pipe,
             block_width: 1,
             col_width: 1,
+            pipe: false,
             dev,
             cbuf: DeviceBuffer::alloc(DeviceId::new(dev), 4)?, // placeholder
             bar: DeviceBuffer::alloc(DeviceId::new(dev), 4)?,  // placeholder
@@ -398,6 +440,18 @@ impl LayerFusedKernels {
         // WC=1.
         let mut wc =
             if w == 2 { col_width_from_env(std::env::var(WC_ENV).ok().as_deref()) } else { 1 };
+        // 018 P1a: the two-tree pipe mode (REINFER_FUSED_PIPE=1). Only
+        // the W=2/WC=1 entry has a pipe instantiation (specs/018 P1a is
+        // measured at the default width) — any other combination keeps
+        // the S1-11 kernel (the switch stays orthogonal to BW/WC).
+        let mut pipe = pipe_from_env(std::env::var(PIPE_ENV).ok().as_deref());
+        if pipe && (w != 2 || wc != 1) {
+            eprintln!(
+                "reinfer-cuda: REINFER_FUSED_PIPE needs block width 2 / column width 1 \
+                 (got {w}/{wc}) — pipe off (S1-11 kernel)"
+            );
+            pipe = false;
+        }
         // Co-residency gate: the exact resident block count for the real
         // launch geometry (512 threads, the launch's dynamic smem), times
         // the SM count. The grid is capped at max_tiles (the largest
@@ -431,6 +485,7 @@ impl LayerFusedKernels {
             super::jit::set_max_dynamic_smem(self.kernel_w2, shared)?;
             super::jit::set_max_dynamic_smem(self.kernel_w2_wc2, shared)?;
             super::jit::set_max_dynamic_smem(self.kernel_w2_wc4, shared)?;
+            super::jit::set_max_dynamic_smem(self.kernel_w2_pipe, shared)?;
         }
         // W=2 needs TWO co-resident blocks per SM (its
         // __launch_bounds__(512, 2) caps the registers at 64/thread);
@@ -438,10 +493,16 @@ impl LayerFusedKernels {
         // pressure), the width falls back to W=1 — the S1-10 behavior
         // verbatim (REINFER_FUSED_BW=off keeps it). The 017-d column
         // width falls back WC -> 1 first (same gate), then width.
-        let entry = |w: u32, wc: u32| -> KernelFn {
+        let entry = |w: u32, wc: u32, pipe: bool| -> KernelFn {
             match (w, wc) {
                 (1, _) => self.kernel,
-                (2, 1) => self.kernel_w2,
+                (2, 1) => {
+                    if pipe {
+                        self.kernel_w2_pipe
+                    } else {
+                        self.kernel_w2
+                    }
+                }
                 (2, 2) => self.kernel_w2_wc2,
                 (2, 4) => self.kernel_w2_wc4,
                 _ => self.kernel, // unreachable (env parsing clamps)
@@ -462,14 +523,14 @@ impl LayerFusedKernels {
             }
             Ok(occ)
         };
-        let mut occ = occ_of(entry(w, wc))?;
+        let mut occ = occ_of(entry(w, wc, pipe))?;
         if w == 2 && wc > 1 && occ < 2 {
             eprintln!(
                 "reinfer-cuda: layer-fused column width {wc} not co-resident (occ {occ}) — \
                  falling back to column width 1"
             );
             wc = 1;
-            occ = occ_of(self.kernel_w2)?;
+            occ = occ_of(entry(w, 1, false))?;
         }
         if w == 2 && occ < 2 {
             eprintln!(
@@ -478,6 +539,7 @@ impl LayerFusedKernels {
             );
             w = 1;
             wc = 1;
+            pipe = false;
             occ = occ_of(self.kernel)?;
         }
         let mut sms: i32 = 0;
@@ -519,6 +581,28 @@ impl LayerFusedKernels {
             .max(tiles_gu)
             .max(tiles_gu_d);
         let grid = (occ * sms).min(max_tiles as i32).max(1) as u32;
+
+        // 018 P1a pipe sets (uploaded in the const; only the pipe entry
+        // reads them — the kernel derives nothing, the host owns the
+        // sets): pa0 = the p1_qkv producer prefix (ceil(tiles_qkv/2) —
+        // one PAIR of tw-col tiles per block at W=2); pb = the B-group
+        // prefix, the max over every stage-2..8 producer prefix (the
+        // p2_qkv pairs, the flash heads, the p1_o tiles, the p1_gu
+        // pairs, the p2_gu_d tiles — the add stripes then repartition
+        // over pb). W=2/Qwen3-0.6B: 144/96. Only the W=2 build has a
+        // pipe entry; other widths upload 0 (never read).
+        let pipe_pa0 = if w == 2 { tiles_qkv.div_ceil(2).min(grid) as i32 } else { 0 };
+        let pipe_pb = if w == 2 {
+            tiles_gu
+                .div_ceil(2)
+                .max(tiles_gu_d)
+                .max(tiles_o)
+                .max(spec.q_heads as u32)
+                .max(tiles_p2.div_ceil(2))
+                .min(grid) as i32
+        } else {
+            0
+        };
 
         // Buffers: stage-clock slots (allocated FIRST — the const's
         // stage_ts pointer addresses them), the const blob, the barrier
@@ -566,6 +650,8 @@ impl LayerFusedKernels {
             scale_q: 1.0 / (spec.d as f32).sqrt(),
             eps: spec.eps,
             hn,
+            pipe_pa0,
+            pipe_pb,
         };
         self.cbuf = DeviceBuffer::alloc(dev, std::mem::size_of::<LayerFusedConst>())?;
         let bytes = unsafe {
@@ -587,10 +673,12 @@ impl LayerFusedKernels {
         }
         copy(&mut MemRef::Device(&self.bar), &MemRef::Host(&zeros), 20 * 4, None)?;
 
-        // Persist the width, the column width and the selected entry.
+        // Persist the width, the column width, the pipe mode and the
+        // selected entry.
         self.block_width = w;
         self.col_width = wc;
-        self.kernel = entry(w, wc);
+        self.pipe = pipe;
+        self.kernel = entry(w, wc, pipe);
         self.grid = grid;
         self.shared = shared;
         self.ts_acc = [0.0; 9];
@@ -609,13 +697,20 @@ impl LayerFusedKernels {
     /// launch uses).
     #[must_use]
     pub fn kernel_name(&self) -> &'static str {
-        match (self.block_width, self.col_width) {
-            (1, _) => "decode_step_layer_fused",
-            (2, 1) => "decode_step_layer_fused_bw2",
-            (2, 2) => "decode_step_layer_fused_bw2_wc2",
-            (2, 4) => "decode_step_layer_fused_bw2_wc4",
+        match (self.block_width, self.col_width, self.pipe) {
+            (1, _, _) => "decode_step_layer_fused",
+            (2, 1, true) => "decode_step_layer_fused_bw2_pipe",
+            (2, 1, false) => "decode_step_layer_fused_bw2",
+            (2, 2, _) => "decode_step_layer_fused_bw2_wc2",
+            (2, 4, _) => "decode_step_layer_fused_bw2_wc4",
             _ => "decode_step_layer_fused_bw2",
         }
+    }
+
+    /// Whether the two-tree pipe variant is selected (018 P1a).
+    #[must_use]
+    pub fn pipe(&self) -> bool {
+        self.pipe
     }
 
     /// The co-resident grid size (graph declaration geometry).

@@ -1347,6 +1347,76 @@ bw2_wc2/bw2_wc4，__launch_bounds__(512,2)，REG:64 LOCAL:0 无溢出）：
 launch 重叠）；③ 权重瓦片化布局；④（新）层时大头再分解——层均 123.7µs
 中 p1_gu 行仅 ~20µs，flash/p2_qkv/p1_o 行的 DRAM/L2 构成未单独计量。
 
+### 018 P1a（草案子节）：双组 barrier 树 + 数据边同步（REINFER_FUSED_PIPE）— 零收益，回退
+
+> 任务（specs/018-decode-pipeline P1a）：把每层 1 个全网格 barrier 拆成
+> A（gather/qkv/flash）与 B（o/gu/down）两棵组内树 + 边 barrier，让 B 组
+> o/gu/down 权重流与 A 组下一层 qkv gather 流重叠。017-c 已证单 barrier
+> 仅 1-4µs，P1a 价值不在 barrier 本身而在组间重叠——但 1-launch-per-layer
+> 结构下数据链严格串行（o→add_rms(o)→gu→down→add_rms(down)→下轮 gather），
+> 诚实预期 ≈0。判据：层均值 ≥5% 降 或 gpu busy ≤4.0ms（今日基线 4.172/
+> 4.170ms、层均值 123.7µs）才保留，否则回退 + 记录。红线：不改任何 stage
+> 算术/列序/归约树；未提交。
+
+**分组方案与改动**（位级安全：只改"哪些块在哪个 barrier 等"；tile→块指派
+pipe 与非 pipe 相同——grid-stride 同 G 同 bx，存活块 ⊇ 各 stage producer）：
+- 树 A = slots 0/1/2：barA0 参与者 pa0 = min(⌈tiles_qkv/2⌉, G) = 144
+  （p1_qkv producer 前缀；S1-11 是全网格）；P1=16、P2=48 不变。
+- 边 P_edge_add_o = slot 3，参与者 pB = 96（add(o) 条纹在 PB=96 上重分区：
+  逐列算术不变，stage_add_columns 的 p 参数 = 拆分计数）。
+- 树 B = slots 7/4/5/6/8，全用 pB = max(⌈tiles_gu/2⌉, tiles_gu_d, tiles_o,
+  q_heads, ⌈tiles_p2/2⌉) 截 G = 96（必须盖住 stage-2..8 所有 producer
+  前缀，否则位错不挂）。
+- 退出语义：块 ≥ pa0 顶部退出（li=0 冗余 gather 前）；块 [pB, pa0)（A-only，
+  v-plan partials 已被 stage2 读完）在 barA0 释放后退出。slot 序与 20-u32
+  buffer 不变；PIPE=false 缺省 = S1-11 字节一致。
+- 宿主公式 pa0/pb 按 tiles 推算（Qwen3-0.6B W=2：144/96）；新入口
+  `decode_step_layer_fused_bw2_pipe`（REG:64 同档，2/SM 共驻保持）；
+  layer_fused_body 模板加 `<bool PIPE=false>`（if constexpr 防无实例化）；
+  REINFER_FUSED_PIPE=1 host 开关（缺省 0），与 REINFER_FUSED_BW/WC 正交。
+- 改动清单：`decode_layer_fused_kernels.cu`（4 处：头注、const 2 字段、add
+  p 参数、body 模板 + 退出 + 新入口）、`layer_fused.rs`（PIPE_ENV 解析 +
+  kernel_w2_pipe 装载/选口 + pa0/pb 上传）、`fused_decode.rs`（+2 门）。
+
+**位级（真机，串行 --test-threads=1；pipe 路径终态源码）全绿**：
+既有 5 门照跑全过（bit_exact_vs_split / li1 / bw_ab / determinism / engine
+A/B）；新门 `layer_fused_pipe_ab_bitwise`（15.75s）——PIPE=1 内核 li=1 全
+输出表面（q/k/v、attn、x、xn_attn、down、7 partials 段、page-1 kv）与 S1-11
+位级一致，grid 164；新门 `layer_fused_pipe_engine_ab_bitwise`（203.91s）——
+pipe=1 双载 16 token determinism + pipe 1 vs 0 各 128 步逐位一致 + 文本一致。
+（调试期另加 li=0 连发与 engine 单步探针门，均过，已删。）
+
+**A/B 表**（REINFER_DECODE_PROFILE=1，window 21-40 @4096，engine_smoke
+engine_decode_timing；交错 A/B。gpu busy 为 cudaEvent 实量；层均值行 =
+clock64 ticks，时钟随负载漂 1.6-2.4GHz，跨轮可比性差，只做同刻参照）：
+
+| 轮 | A: PIPE=0 gpu busy | A 层 ticks | B: PIPE=1 gpu busy | B 层 ticks | B−A |
+|---|---|---|---|---|---|
+| 1 (15:44) | 4.107 ms | 287.7e6 | 4.235 ms | 298.5e6 | +3.1% |
+| 2 (15:50, nsys 下) | 4.141 ms | 289.4e6 | 4.158 ms | 294.4e6 | +0.4% |
+| 3 (16:02) | 3.326 ms* | 221.7e6* | 3.900 ms | 274.4e6 | +17%（快态漂移）|
+| 4 (16:06) | 4.137 ms | 291.0e6 | 4.007 ms | 287.1e6 | −3.1% |
+| 5 (16:08) | 3.442 ms* | 234.8e6* | 4.258 ms | 300.6e6 | +24%（快态漂移）|
+
+\* 快态窗口：同日同码 A 也落 3.33-3.44ms（±15-20% 机况漂移，远端桌面编码
+间歇抢 SM），判据只看交错邻对差。稳定态邻对差：+3.1% / +0.4% / −3.1%，
+无一轮 B 达 ≥5% 降；B 的 3.900/4.007 落在 A 同刻 3.33-3.44 的快态上，
+busy ≤4.0 不具 B 特异性。层 tick 行 B 均值 ≈ A（+0.8%，噪声内）。
+
+**判定：回退。** 判据不可达（需 −5%，实测 ±3% 噪声内无方向）；实现正确
+（位级 7 门全绿）但设计前提（组间可重叠窗口）在 1-launch-per-layer + 数据
+链串行结构下不成立——与 017-c E1（P4/P5→96 零收益）同型。**终态 =
+REINFER_FUSED_PIPE 缺省 0**（= S1-11 字节一致，自始如此）；pipe 入口保留
+在 env 后（正确性已钉），与 017 各 E 系列/017-d WC=2/4 同款处置。P2a（B 组
+轮空期 L2 预取）与 P3a（边 producer-count 轮询）**条件（P1a 保留）未达 → 018
+波到此结束**，不继续。
+
+**机况观察（另记，非 P1a 归因）**：今日 engine 长跑两度悬挂（15:07 pipe
+engine 门、15:50 A2 PIPE=0——后者为未触碰的 S1-11 路径），GPU SM 100% +
+host 单核自旋、无输出，25min 不恢复；kill 重跑即过（各 4-5min），库级
+li0/li1 连发与 engine 探针复现均绿，nsys 下不复现。疑 S1-11 引擎路径间歇
+性 barrier/时序问题或远端会话 GPU 抢占，留待后续会话归因（本波不追）。
+
 ## 2026-09-01 — S1-8: 基准回归门禁建档（006 T7；纯文档/脚本/测试域）
 
 - **门禁定案（decode 唯一门禁）**：0.85× llama.cpp CUDA = **299.8 tok/s**（参照

@@ -69,6 +69,31 @@
 // bw2_wc2` / `..._wc4` (both __launch_bounds__(512, 2)) carry WC=2/4,
 // selected by REINFER_FUSED_WC.
 //
+// 018 P1a (specs/018-decode-pipeline) two-tree pipe mode: the layer's
+// grid barriers are split into TWO trees — A (slots 0-2: the
+// gather/qkv/flash/o-p1 chain) and B (slots 4-8: the add_rms(o)/gu/down
+// chain) — plus the data-edge barriers P_edge_add_o (slot 3: the p1_o
+// partials -> add(o) workers) and P_edge_down (slot 6: the down
+// partials -> add(down) workers). The stage program, the tile ->
+// (block, thread) assignments and every arithmetic order are untouched;
+// only WHICH blocks wait at WHICH barrier and the add-stripe
+// repartition (per-column arithmetic identical) differ:
+//   - bar0 (slot 0) shrinks from the full grid to the p1_qkv producer
+//     prefix A0 = ceil(tiles_qkv/2) (the p2_qkv consumers are a subset
+//     of the same prefix). Blocks with no stage work at all (bx >= A0)
+//     retire before stage 1.
+//   - the edge + B-tree barriers (slots 3/7/4/5/6/8) shrink to the
+//     B-group prefix PB (every stage-2..8 producer and consumer sits
+//     under it); the add(o)/add(down) stripes are repartitioned over
+//     the B prefix (p = PB instead of the grid).
+//   - A-only blocks (bx in [PB, A0): p1_qkv producers with no
+//     stage-2..8 role) retire right after bar0's release.
+// The participant sets are uploaded by the host in the const
+// (`pipe_pa0`/`pipe_pb`; Qwen3-0.6B W=2: 144/96) and only the pipe
+// instantiation reads them; PIPE=false keeps the S1-11 code byte-
+// identical (REINFER_FUSED_PIPE=1 selects the `decode_step_layer_fused_
+// bw2_pipe` entry, host-side).
+//
 // Host side: crates/cuda/src/layer_fused.rs; engine wiring:
 // crates/cuda/src/engine.rs (REINFER_LAYER_FUSED gate, S1-10 step launch
 // + GraphStepDecl::build_layer_fused).
@@ -111,6 +136,10 @@ struct LayerFusedConst {
     int q_heads, kv_heads, ratio, block_len, max_kv, total_pages, pp;
     float eta, scale_q, eps;
     int hn;                        // head_norm on (q_norm/k_norm present)
+    // 018 P1a pipe sets (only the pipe instantiation reads them; the
+    // host uploads them — Qwen3-0.6B W=2: pipe_pa0 = 144, pipe_pb = 96).
+    int pipe_pa0;                  // bar0 participants (the p1_qkv producer prefix)
+    int pipe_pb;                   // B-group prefix (edge + B-tree participants)
 };
 
 __device__ __forceinline__ float hbits_to_f32(unsigned short h) {
@@ -1096,8 +1125,12 @@ __device__ __forceinline__ void stage_flash(const LayerFusedConst* c,
 __device__ __forceinline__ void stage_add_columns(const float* partials,
                                                   unsigned short* x,
                                                   int n, int nslabs,
-                                                  int bx, int G, int tid) {
-    const int cols = (n + G - 1) / G;
+                                                  int bx, int p, int tid) {
+    // `p` = the stripe-split count: the grid size in the S1-11 kernel,
+    // the B-group prefix in the 018 P1a pipe mode (the caller only
+    // reaches here with bx < p, so every column is still owned by
+    // exactly one block and the per-column arithmetic is unchanged).
+    const int cols = (n + p - 1) / p;
     const int my = bx * cols;
     const int me = my + cols < n ? my + cols : n;
     for (int i = my + tid; i < me; i += blockDim.x) {
@@ -1377,7 +1410,7 @@ __device__ __forceinline__ void stage_ts_mark(const LayerFusedConst* c, int li,
 // blocks arrive without work). WC only changes which columns each
 // thread owns — never the per-column arithmetic.
 // ---------------------------------------------------------------------------
-template <int W, int WC>
+template <int W, int WC, bool PIPE = false>
 __device__ __forceinline__ void layer_fused_body(
     const LayerFusedConst* c,
     const PlanRow* table,       // this layer's 7 rows
@@ -1408,15 +1441,50 @@ __device__ __forceinline__ void layer_fused_body(
     const int P4 = c->tiles_gu < G ? c->tiles_gu : G;
     const int P5m = c->tiles_gu < c->tiles_gu_d ? c->tiles_gu_d : c->tiles_gu;
     const int P5 = P5m < G ? P5m : G;
+    // 018 P1a pipe participants. Default = the S1-11 values (full grid
+    // and the P4/P5 prefixes), so the PIPE=false path is byte-identical
+    // to the S1-11 kernel; only the pipe instantiation reads the const
+    // fields (host-uploaded; Qwen3-0.6B W=2: 144/96 — see the file
+    // header). pB = the B-group prefix: every stage-2..8 producer and
+    // consumer sits under it (barA1/A2's P1/P2 sets stay as they are).
+    int pA0 = G;  // bar0 (A tree): p1_qkv partials -> p2_qkv
+    int pB = G;   // edge + B-tree participants (slots 3/7/4/5/6/8, add stripes)
+    int p4 = P4;  // slot 4: rms(o) -> p1_gu
+    int p5 = P5;  // slot 5: p1_gu -> p2_gu_d
+    if constexpr (PIPE) {
+        pA0 = c->pipe_pa0;
+        pB = c->pipe_pb;
+        p4 = c->pipe_pb;
+        p5 = c->pipe_pb;
+    }
 
     stage_ts_mark(c, li, 0);
+    if constexpr (PIPE) {
+        // Blocks past the p1_qkv producer prefix have no work in any
+        // stage of this launch — retire before the (redundant) gather
+        // and stage 1 (they never join a barrier).
+        if (bx >= pA0) {
+            return;
+        }
+    }
     if (li == 0) {
         stage_gather_rms0(c, token, tid);
     }
     // 1. phase-1 of the q/k/v plans (reads xn)
     p1_tiles<W, WC>(c, table, 0, 3, c->tiles_qkv, tw, bx, G, tid);
     stage_ts_mark(c, li, 1);
-    grid_barrier(&bcnt[0], &bgen[0], G);
+    // A-tree bar0 (the whole grid in the S1-11 kernel): p1_qkv partials
+    // -> p2_qkv — in pipe mode only the producers participate (the
+    // consumers are a subset of the same prefix).
+    grid_barrier(&bcnt[0], &bgen[0], pA0);
+    if constexpr (PIPE) {
+        // A-only blocks: p1_qkv producers with no stage-2..8 role — the
+        // B tree and the edges never include {bx >= pB}, so they retire
+        // here (after bar0's release, their v-plan partials are read).
+        if (bx >= pB) {
+            return;
+        }
+    }
     // 2. q/k/v phase-2 + casts + head-norm + rope (cq + 2*ck tiles)
     p2qkv_tiles<W>(c, table, cq + 2 * ck, bx, G, tid, pos, wq, wk);
     stage_ts_mark(c, li, 2);
@@ -1434,22 +1502,28 @@ __device__ __forceinline__ void layer_fused_body(
     // 4. o phase-1 (reads the full attention row)
     p1_tiles_plain(c, table, 3, 1, c->tiles_o, bx, G, tid);
     stage_ts_mark(c, li, 4);
-    grid_barrier(&bcnt[3], &bgen[3], G);
-    // 5. o phase-2 + residual add (all blocks) + ffn rms (block 0)
-    stage_add_columns(table[3].partials, c->x, c->h, c->nslabs_o, bx, G, tid);
-    grid_barrier(&bcnt[7], &bgen[7], G);
+    // P_edge_add_o (slot 3; the whole grid in the S1-11 kernel): the
+    // p1_o partials -> the add(o) workers (the pipe mode's first data
+    // edge between the A tree and the B group).
+    grid_barrier(&bcnt[3], &bgen[3], pB);
+    // 5. o phase-2 + residual add (add stripes over pB in pipe mode; all
+    //    blocks in the S1-11 kernel) + ffn rms (block 0)
+    stage_add_columns(table[3].partials, c->x, c->h, c->nslabs_o, bx, pB, tid);
+    grid_barrier(&bcnt[7], &bgen[7], pB);
     if (bx == 0) {
         stage_rms_out(c->x, c->xn, wffn, c->h, c->eps, tid);
     }
     stage_ts_mark(c, li, 5);
-    if (bx < P4) {
-        grid_barrier(&bcnt[4], &bgen[4], P4);
+    // B-tree: rms(o) (block 0, the last arriver) -> the p1_gu tiles.
+    if (bx < p4) {
+        grid_barrier(&bcnt[4], &bgen[4], p4);
     }
     // 6. gate/up phase-1 (reads xn = p2_o's ffn-normed x)
     p1_tiles<W, WC>(c, table, 4, 2, c->tiles_gu, tw, bx, G, tid);
     stage_ts_mark(c, li, 6);
-    if (bx < P5) {
-        grid_barrier(&bcnt[5], &bgen[5], P5);
+    // B-tree: p1_gu partials -> the p2_gu_d tiles.
+    if (bx < p5) {
+        grid_barrier(&bcnt[5], &bgen[5], p5);
     }
     // 7. gate/up phase-2 + swiglu + down phase-1 (one tile per down
     //    (col-block, slab) — the split's full down phase-1 grid; 017-d:
@@ -1464,10 +1538,14 @@ __device__ __forceinline__ void layer_fused_body(
         }
     }
     stage_ts_mark(c, li, 7);
-    grid_barrier(&bcnt[6], &bgen[6], G);
-    // 8. down phase-2 + residual add (all blocks) + next attn rms (block 0)
-    stage_add_columns(table[6].partials, c->x, c->h, c->nslabs_d, bx, G, tid);
-    grid_barrier(&bcnt[8], &bgen[8], G);
+    // P_edge_down (slot 6; the whole grid in the S1-11 kernel): the
+    // down partials -> the add(down) workers.
+    grid_barrier(&bcnt[6], &bgen[6], pB);
+    // 8. down phase-2 + residual add (add stripes over pB in pipe mode;
+    //    all blocks in the S1-11 kernel) + next attn rms (block 0 — the
+    //    next layer's gather reads xn after this launch returns)
+    stage_add_columns(table[6].partials, c->x, c->h, c->nslabs_d, bx, pB, tid);
+    grid_barrier(&bcnt[8], &bgen[8], pB);
     if (bx == 0) {
         stage_rms_out(c->x, c->xn, wnext, c->h, c->eps, tid);
     }
@@ -1502,6 +1580,25 @@ extern "C" __global__ void __launch_bounds__(512, 2) decode_step_layer_fused_bw2
     int li, int n_layers, unsigned int pos, unsigned int token) {
     layer_fused_body<2, 1>(c, table, wnext, wffn, wq, wk, bar, li, n_layers,
                            pos, token);
+}
+
+// 018 P1a pipe entry (REINFER_FUSED_PIPE=1): the W=2 kernel with the
+// two barrier trees (A: gather/qkv/flash/o-p1; B: add_rms(o)/gu/down)
+// and the P_edge_add_o / P_edge_down data edges — the stage program and
+// the tile assignments are the bw2 entry's (only the participant sets
+// and the early exits differ; see the file header). The participant
+// counts come from the const's pipe_pa0/pipe_pb fields (host-uploaded).
+extern "C" __global__ void __launch_bounds__(512, 2) decode_step_layer_fused_bw2_pipe(
+    const LayerFusedConst* __restrict__ c,
+    const PlanRow* __restrict__ table,       // this layer's 7 rows
+    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
+    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
+    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
+    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
+    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+    int li, int n_layers, unsigned int pos, unsigned int token) {
+    layer_fused_body<2, 1, true>(c, table, wnext, wffn, wq, wk, bar, li,
+                                 n_layers, pos, token);
 }
 
 // 017-d WC=2 entry: W=2 pairing plus 2 consecutive columns per thread

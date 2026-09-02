@@ -1358,6 +1358,10 @@ mod gpu {
     /// S1-11 (specs/017) block-width env (the host reads it at build).
     const BW_ENV: &str = "REINFER_FUSED_BW";
 
+    /// 018 P1a (specs/018-decode-pipeline): the two-tree pipe env (the
+    /// host reads it at build; the W=2/WC=1 pipe entry).
+    const PIPE_ENV: &str = "REINFER_FUSED_PIPE";
+
     /// The output surface one layer-kernel arm produces, for the W=1 vs
     /// W=2 comparison.
     struct ArmOut {
@@ -1379,10 +1383,12 @@ mod gpu {
     }
 
     /// Run the li=1 layer kernel at the given block width (`width` = the
-    /// REINFER_FUSED_BW env value; the host picks the entry at build) over
-    /// `b`/`kv` (the arm's own fresh buffers) and read every output
-    /// surface back for comparison. Asserts the build actually selected
-    /// the requested width (a silent occupancy fallback must fail loudly).
+    /// REINFER_FUSED_BW env value; the host picks the entry at build) and
+    /// pipe mode (`pipe` = the REINFER_FUSED_PIPE value, "0" for the
+    /// S1-11 kernel) over `b`/`kv` (the arm's own fresh buffers) and read
+    /// every output surface back for comparison. Asserts the build
+    /// actually selected the requested width and pipe mode (a silent
+    /// occupancy fallback must fail loudly).
     fn run_layer_fused_arm(
         lf: &mut LayerFusedKernels,
         ctx: &CudaContext,
@@ -1392,11 +1398,13 @@ mod gpu {
         g: &FusedGeom,
         kv: &DeviceBuffer,
         width: &str,
+        pipe: &str,
     ) -> ArmOut {
         // SAFETY (test-only): --test-threads=1 keeps the env mutation
         // single-threaded; the value is read once at build.
         unsafe {
             std::env::set_var(BW_ENV, width);
+            std::env::set_var(PIPE_ENV, pipe);
         }
         let spec = LayerFusedSpec {
             h: H,
@@ -1432,6 +1440,12 @@ mod gpu {
             want,
             "width {width}: the build did not select the requested width \
              (occupancy fell back?)"
+        );
+        assert_eq!(
+            lf.pipe(),
+            pipe == "1",
+            "pipe {pipe}: the build did not select the pipe entry \
+             (width/occupancy fell back?)"
         );
         lf.launch(
             stream,
@@ -1541,14 +1555,15 @@ mod gpu {
         // buffers, so the arm-B build_plans must not reallocate them yet.
         fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b2)).unwrap();
         let g2 = fused.geom();
-        let a1 = run_layer_fused_arm(&mut lf_w1, &ctx, &stream, dev, &b2, &g2, &kv2, "1");
+        let a1 = run_layer_fused_arm(&mut lf_w1, &ctx, &stream, dev, &b2, &g2, &kv2, "1", "0");
 
         fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b3)).unwrap();
         let g3 = fused.geom();
-        let a2 = run_layer_fused_arm(&mut lf_w2, &ctx, &stream, dev, &b3, &g3, &kv3, "2");
+        let a2 = run_layer_fused_arm(&mut lf_w2, &ctx, &stream, dev, &b3, &g3, &kv3, "2", "0");
         // SAFETY (test-only): single-threaded env (see load_pair).
         unsafe {
             std::env::remove_var(BW_ENV);
+            std::env::remove_var(PIPE_ENV);
         }
 
         assert_u16_eq(&a1.q16, &a2.q16, "bw q16");
@@ -1570,6 +1585,120 @@ mod gpu {
             "layer-fused block width A/B: W=2 (grid {}) byte-identical to W=1 on q/k/v, attn, x, \
              xn_attn, down, all 7 partials segments and the page-1 kv write",
             lf_w2.grid()
+        );
+    }
+
+    /// 018 P1a (specs/018): pipe A/B — the W=2 kernel
+    /// (REINFER_FUSED_PIPE=0, the S1-11 full-grid barrier kernel) and
+    /// the two-tree pipe variant (REINFER_FUSED_PIPE=1: A/B barrier
+    /// trees + the P_edge_add_o / P_edge_down data edges; blocks outside
+    /// the group prefixes retire early, the add stripes repartition over
+    /// the B prefix) run the same li=1 layer on identical inputs; every
+    /// output surface must be byte-identical (only WHICH blocks wait at
+    /// WHICH barrier changed — never the arithmetic).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / pipe-ab"]
+    fn layer_fused_pipe_ab_bitwise() {
+        let (ctx, stream, arch, cache) = setup();
+        let dev = ctx.device_id().index();
+        let dense = DenseKernels::new(&arch, Some(cache.clone())).unwrap();
+        let diff = DiffKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let decode = DecodeKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let jgemm = Jgemm::new(dev, &arch, Some(cache.clone())).unwrap();
+        let gemm_lib = load_gemm_m1(&arch, Some(cache.clone()));
+        let mut fused = FusedDecodeKernels::new(
+            dev,
+            &arch,
+            Some(cache.clone()),
+            gemm_lib.kernel("gemv_m1_f16f32_reduce").unwrap(),
+        )
+        .unwrap();
+        let mut lf_off = LayerFusedKernels::new(dev, &arch, Some(cache.clone())).unwrap();
+        let mut lf_pipe = LayerFusedKernels::new(dev, &arch, Some(cache.clone())).unwrap();
+
+        let b1 = layer_bufs(dev, 0x51A5_01C2u64);
+        let b2 = layer_bufs(dev, 0x51A5_01C2u64);
+        let b3 = layer_bufs(dev, 0x51A5_01C2u64);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &b2);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &b3);
+        let kv2 = {
+            let per_tok_kv = KVK;
+            let kv_s = read_u16(&b2.kv_s, BLOCK_LEN * per_tok_kv * 2);
+            let mut seed = 0x51A5_01C2u64 ^ 0x0BAD_5EEDu64;
+            let page_a = (0..(BLOCK_LEN * per_tok_kv * 2))
+                .map(|_| rand_f16_bits(&mut seed))
+                .collect::<Vec<u16>>();
+            let kv2: Vec<u16> = [
+                &page_a[0..BLOCK_LEN * per_tok_kv],
+                &kv_s[0..BLOCK_LEN * per_tok_kv],
+                &page_a[BLOCK_LEN * per_tok_kv..],
+                &kv_s[BLOCK_LEN * per_tok_kv..],
+            ]
+            .concat();
+            upl(dev, &bytes_u16(&kv2))
+        };
+        let kv3 = {
+            let per_tok_kv = KVK;
+            let kv_s = read_u16(&b3.kv_s, BLOCK_LEN * per_tok_kv * 2);
+            let mut seed = 0x51A5_01C2u64 ^ 0x0BAD_5EEDu64;
+            let page_a = (0..(BLOCK_LEN * per_tok_kv * 2))
+                .map(|_| rand_f16_bits(&mut seed))
+                .collect::<Vec<u16>>();
+            let kv3: Vec<u16> = [
+                &page_a[0..BLOCK_LEN * per_tok_kv],
+                &kv_s[0..BLOCK_LEN * per_tok_kv],
+                &page_a[BLOCK_LEN * per_tok_kv..],
+                &kv_s[BLOCK_LEN * per_tok_kv..],
+            ]
+            .concat();
+            upl(dev, &bytes_u16(&kv3))
+        };
+
+        // Arm A (pipe off — the S1-11 kernel) first; its partials live
+        // in the fused unit's buffers, so the arm-B build_plans must not
+        // reallocate them yet.
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b2)).unwrap();
+        let g2 = fused.geom();
+        let a1 = run_layer_fused_arm(&mut lf_off, &ctx, &stream, dev, &b2, &g2, &kv2, "2", "0");
+        assert_eq!(
+            lf_off.kernel_name(),
+            "decode_step_layer_fused_bw2",
+            "pipe=0 arm must select the S1-11 kernel"
+        );
+
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b3)).unwrap();
+        let g3 = fused.geom();
+        let a2 = run_layer_fused_arm(&mut lf_pipe, &ctx, &stream, dev, &b3, &g3, &kv3, "2", "1");
+        assert_eq!(
+            lf_pipe.kernel_name(),
+            "decode_step_layer_fused_bw2_pipe",
+            "pipe=1 arm must select the pipe kernel"
+        );
+        // SAFETY (test-only): single-threaded env (see load_pair).
+        unsafe {
+            std::env::remove_var(BW_ENV);
+            std::env::remove_var(PIPE_ENV);
+        }
+
+        assert_u16_eq(&a1.q16, &a2.q16, "pipe q16");
+        assert_u16_eq(&a1.k16, &a2.k16, "pipe k16");
+        assert_u16_eq(&a1.v16, &a2.v16, "pipe v16");
+        assert_u16_eq(&a1.attn, &a2.attn, "pipe attn");
+        assert_u16_eq(&a1.x, &a2.x, "pipe x");
+        assert_u16_eq(&a1.xn, &a2.xn, "pipe xn_attn");
+        assert_u16_eq(&a1.down, &a2.down, "pipe down");
+        assert_f32_eq(&a1.p_q, &a2.p_q, "pipe partials q");
+        assert_f32_eq(&a1.p_k, &a2.p_k, "pipe partials k");
+        assert_f32_eq(&a1.p_v, &a2.p_v, "pipe partials v");
+        assert_f32_eq(&a1.p_o, &a2.p_o, "pipe partials o");
+        assert_f32_eq(&a1.p_g, &a2.p_g, "pipe partials gate");
+        assert_f32_eq(&a1.p_u, &a2.p_u, "pipe partials up");
+        assert_f32_eq(&a1.p_d, &a2.p_d, "pipe partials down");
+        assert_u16_eq(&a1.kv, &a2.kv, "pipe kv");
+        println!(
+            "layer-fused pipe A/B: pipe (grid {}) byte-identical to the S1-11 kernel on q/k/v, \
+             attn, x, xn_attn, down, all 7 partials segments and the page-1 kv write",
+            lf_pipe.grid()
         );
     }
 
@@ -1671,13 +1800,39 @@ mod gpu {
 
     /// Load the engine with REINFER_FUSED=`fused_value` and
     /// REINFER_LAYER_FUSED=`layer_value` (both read once at load; the
-    /// process env is ours — tests must run single-threaded).
+    /// process env is ours — tests must run single-threaded). The 018
+    /// P1a pipe switch is cleared (off) unless a pipe arm asks for it.
     fn load_pair(fused_value: &str, layer_value: &str) -> Engine {
         // SAFETY (test-only): --test-threads=1 keeps the env mutation
         // single-threaded; the value is read once at Engine::load.
         unsafe {
             std::env::set_var(FUSED_ENV, fused_value);
             std::env::set_var(LAYER_FUSED_ENV, layer_value);
+            std::env::remove_var(PIPE_ENV);
+        }
+        let ctx = CudaContext::init(DeviceId::new(0)).expect("ctx");
+        let dev = ctx.device_id();
+        let stream = CudaStream::new(dev).expect("stream");
+        let _ = stream.synchronize().expect("sync");
+        Engine::load(
+            dev,
+            &reinfer_cuda::arch::resolve_arch().expect("arch"),
+            Some(std::env::temp_dir().join("reinfer-jit-fused-engine")),
+            &model_dir(),
+            4096,
+        )
+        .expect("engine load")
+    }
+
+    /// `load_pair` with the 018 P1a two-tree pipe switch
+    /// (REINFER_FUSED_PIPE=`pipe_value`; the W=2/WC=1 pipe entry).
+    fn load_pair_pipe(fused_value: &str, layer_value: &str, pipe_value: &str) -> Engine {
+        // SAFETY (test-only): --test-threads=1 keeps the env mutation
+        // single-threaded; the value is read once at Engine::load.
+        unsafe {
+            std::env::set_var(FUSED_ENV, fused_value);
+            std::env::set_var(LAYER_FUSED_ENV, layer_value);
+            std::env::set_var(PIPE_ENV, pipe_value);
         }
         let ctx = CudaContext::init(DeviceId::new(0)).expect("ctx");
         let dev = ctx.device_id();
@@ -1830,6 +1985,45 @@ mod gpu {
         assert_bitwise(&l_on, &l_off, "layer on/off");
         println!(
             "layer-fused A/B: {} decode steps bit-identical; text {:?}",
+            t_on.len(),
+            tok.decode_all(&t_on)
+        );
+    }
+
+    /// 018 P1a (specs/018): engine A/B — REINFER_FUSED_PIPE=1 (the
+    /// two-tree pipe variant) vs =0 (the S1-11 kernel), both on the
+    /// layer-fused path: 16 + 128 greedy decode tokens, per-step logits
+    /// bit-identical and identical text; the pipe engine is
+    /// deterministic across two separate loads (bit-level).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / engine-ab"]
+    fn layer_fused_pipe_engine_ab_bitwise() {
+        let tok = tokenizer();
+        let ids = tok.encode("Hello", false).expect("encode");
+        assert!(!ids.is_empty());
+
+        // A: pipe — two separate loads must produce bit-identical steps.
+        let mut eng_a1 = load_pair_pipe("on", "on", "1");
+        let (l1, t1) = run(&mut eng_a1, &ids, 16);
+        drop(eng_a1);
+        let mut eng_a2 = load_pair_pipe("on", "on", "1");
+        let (l2, t2) = run(&mut eng_a2, &ids, 16);
+        assert_eq!(t1, t2, "pipe determinism: identical 16-token text");
+        assert_bitwise(&l1, &l2, "pipe determinism");
+        drop(eng_a2);
+
+        // B: the S1-11 reference arm (REINFER_FUSED_PIPE=0).
+        let mut eng_off = load_pair("on", "on");
+        let (l_off, t_off) = run(&mut eng_off, &ids, 128);
+        drop(eng_off);
+        let mut eng_on = load_pair_pipe("on", "on", "1");
+        let (l_on, t_on) = run(&mut eng_on, &ids, 128);
+        drop(eng_on);
+
+        assert_eq!(t_on, t_off, "pipe on/off must produce identical text");
+        assert_bitwise(&l_on, &l_off, "pipe on/off");
+        println!(
+            "layer-fused pipe A/B: {} decode steps bit-identical; text {:?}",
             t_on.len(),
             tok.decode_all(&t_on)
         );

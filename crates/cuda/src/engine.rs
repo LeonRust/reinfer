@@ -2926,7 +2926,10 @@ impl GraphStepDecl {
                   name: &str|
          -> Result<*mut c_void, LaunchError> { cu_kernel_of(lib, name) };
         let flib = lf.raw_lib();
-        let h_layer = cu(flib, "decode_step_layer_fused")?;
+        // S1-11: the kernel entry follows the selected block width
+        // (decode_step_layer_fused for W=1, decode_step_layer_fused_bw2
+        // for W=2 — same cubin, same 11-arg signature).
+        let h_layer = cu(flib, lf.kernel_name())?;
         // lm_head phase pair reuses the fused path's multi p1 + the
         // loaded Jgemm's reduce kernel.
         let h_p1 = cu(fused.raw_lib(), "gemv_m1_f16f32_multi")?;

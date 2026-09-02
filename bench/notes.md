@@ -1053,6 +1053,300 @@ tpot 24.1 -> 18.7 ms/tok (41.4 -> 53.6 tok/s; 50.2 tok/s with profiler on);
 - 未提交。限制：① 95W 电源墙（VBIOS，未抬升）；② 机况日间 4× 摆动使
   跨时段比较失效；③ p1_o/gu/gd 宽化被 D7 尺挡住（f16 输出 1 ULP ≈ 1e-3）。
 
+## 2026-09-02 — S1-11（specs/017 T1 + T2a + T2b，草案）：块宽化落地（W=2 缺省）
+
+> 状态：**草案**（段表 A/B 为本机单日交错 A/B/A，见下；T3 门禁与功耗抬升
+> 相关记录留待后续）。specs/017-decode-block-width（T1 审计 + 机械段块宽化
+> gather/p2_qkv/p1_gu + T2b p2_o/add_rms 审计负结果）。未提交。
+
+### T1 审计表（解码层融合 kernel 各段覆盖；Qwen3-0.6B @4096 window）
+
+实测列 = W=1 臂（REINFER_FUSED_BW=1）window 21-40 均值 @2.2GHz（原始
+ticks/1000/2200 = µs/层；×28 = ms/step）。grid 82（W=1）/164（W=2），512 线程。
+
+| 段 | 线程模型（W=1, grid 82） | 理论 floor | 实测 µs/层 | 宽化判定 |
+|---|---|---|---|---|
+| gather/rms0 (0) | 全 grid 冗余：每块整行复制 embed 8MB（L2 服务）+ 每块算全 rms 行 | 唯一 DRAM 8MB ≈ 9µs | 25.2 | 本已全 grid，W 只经 grid 放大生效；无循环改动 |
+| p1_qkv (1) | 144×512-col tile / 82 块 → 块 0-61 串行 2 tile（4-ILP phase-1） | 唯一 DRAM 8.4MB ≈ 9µs（L2 常驻后更低） | 7.3 | **已宽化**（288×256-col 对；与 p1_gu 共享 p1_tiles\<W\>） |
+| p2_qkv (2) | 16×512-col tile / 16 块并行；每块 4 头 hn 树（128-slot，7 轮 sync）+ rope | 读 partials ~0.3MB ≈ 0.4µs | 16.6 | **已宽化**（16×256-col 对 / 8 块，uniform-sync 骨架）；同步树延迟主导 |
+| flash (3) | 16 块（q_heads），每块 1 head，kv 写 + flash | 机器最优（S1-10c 定） | 16.2 | 不动（任务规则） |
+| p1_o (4) | 48×512-col tile / 48 块并行 | ~2µs | 11.2 | 不动（本波） |
+| p2_o+add_rms(o) (5) | add 全 grid（S1-10c 已拆）+ rms 单 block 原序 | 元素级 ~1µs | 33.0 | 不动（017-b 下一波） |
+| p1_gu (6) | 96×512-col tile / 82 块 → 块 0-13 串行 2 tile | 唯一 DRAM 12.6MB ≈ 14µs（L2 常驻后更低） | 30.4 | **已宽化**（192×256-col 对）✓ 本波最大收益 |
+| p2_gu_d (7) | 96 tile（512-col 条纹 + 冗余写），块 0-95 | ~5µs | 10.9 | 不动（本波） |
+| **layer** | | | **150.7** | W=2: 131.9（-12.5%） |
+
+**floor 如实记录**：① p1_qkv 实测 7.3µs 已**低于**其 8.4MB 唯一 DRAM floor
+（9µs）——权重 L2 常驻，段处于 L2 带宽/延迟边界，纯并行度收益有限；
+② p2_qkv 实测 16.6µs 是其 IO floor（~0.4µs）的 40×——**hn 树同步延迟主导**，
+块宽化不改变树结构，收益设计预测 ≈0，实测亦然；③ gather 非绝对 floor
+（25.2 vs 唯一 9µs），冗余复制是主成本，但首层只有一层，全层聚合后占比小。
+
+### T2a：W 参数化落地内容
+
+- 内核 `decode_layer_fused_kernels.cu`：主流程 → `template<int W>
+  layer_fused_body`；两个入口——`decode_step_layer_fused`（W=1 原码
+  逐字保留，`__launch_bounds__(512)`）与 `decode_step_layer_fused_bw2`
+  （W=2，`__launch_bounds__(512,2)` → 64 regs/线程，双块/SM 共驻）。
+- 只改"每块覆盖的列区间"：宽化段（p1_qkv/p2_qkv/p1_gu）512-col tile →
+  256-col tile 对（线程 0-255 处理 tile 2p、256-511 处理 tile 2p+1，两半
+  并行同 k-walk）；p1_o/p2_gu_d 保持 512-col（`p1_tiles_plain`）。
+  列序/归约树/聚合前缀序**零改动**（017 D2 论证）。
+- p2_qkv W=2 用 uniform-sync 骨架：v 段线程写 0 进 hn 树、跳过 hn 乘与
+  rope 写回——两半命中同一组 `__syncthreads()`（cq/ck 为奇时跨段配对
+  不死锁）；rope 缩放分支逐字镜像 W=1 的 q（×scale_q）/k（×1 无乘）路径。
+- barrier 参与者集合自动扩展：P 公式读 const 的 tile 计数（host 按 W 上
+  传）：W=2 时 tiles_qkv=288/tiles_gu=192/tiles_p2=16，P1=16、P2=48、
+  P4/P5=164=G（全 grid）。bar0/bar3/bar6/bar7/bar8 本就全 grid。
+- host `layer_fused.rs`：`REINFER_FUSED_BW`（缺省 **2**；off/1 → W=1 行为
+  逐字节一致）；W=2 的 tile 计数 + `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+  用 bw2 入口查询（occ<2 → 回退 W=1，打印 note）；grid = min(occ×sms,
+  max_tiles) = 164；`kernel_name()` 供 graph 声明（engine.rs 一行）。
+- 三段的"应用"语义：p1_gu/p1_qkv 共享 `p1_tiles<W>` 配对循环（同一函数，
+  一处改动同时覆盖两段）；p2_qkv 独立 w2 路径；gather/rms0 无循环结构
+  改动（本就全 grid 冗余），W 仅经 grid 82→164 放大生效。
+
+### 段表 A/B（同日交错 A/B/A：W=2 → W=1 → W=2；window 21-40 @4096，@2.2GHz，µs/层）
+
+| 段 | W=1（单次） | W=2（两次均值） | Δ raw | Δ 漂移归一化* |
+|---|---|---|---|---|
+| gather/rms0 | 25.18 | 22.45 | −10.8% | −5% |
+| p1_qkv | 7.29 | 6.34 | −13.0% | −7% |
+| p2_qkv | 16.60 | 14.94 | −10.0% | −4% |
+| flash（不动） | 16.19 | 15.74 | −2.8% | — |
+| p1_o（不动） | 11.18 | 10.47 | −6.4% | — |
+| p2_o（不动） | 32.95 | 30.74 | −6.7% | — |
+| p1_gu | 30.39 | 21.08 | **−30.6%** | −26% |
+| p2_gu_d（不动） | 10.92 | 10.11 | −7.4% | — |
+| **layer** | **150.7** | **131.9** | **−12.5%** | −7% |
+| gpu busy | 4.524 ms | 4.104 ms | −9.3% | — |
+| lm_head（不动） | 0.578 ms | 0.574 ms | ≈0 | — |
+
+\* 漂移归一化：W=1 臂的**未动段**整体高出 2026-09-01 旧基线 +3..+9%
+（中位 +6.3%，机况节流态），raw Δ 中混有该漂移；归一化 = W=1 各段
+÷1.063 后重算。两次 W=2 测量互差 <0.1%（layer 3.690/3.695 ms）——
+**真实收益区间取 raw 与归一化之间**：p1_gu −26~−31%（≥25% 目标 ✓）；
+p1_qkv −7~−13%；p2_qkv −4~−10%（设计预测 ≈0，如实）；gather −5~−11%。
+未动段 raw −3..−7% ≈ 漂移/噪声（flash/p1_o/p2_o/p2_gu_d 的 W=1 旧基线
+对照 +3..+9% 同量级）。**无段达到"绝对 DRAM floor 不可再动"**——已 floor
+的两段是 p1_qkv（低于唯一 floor，L2 常驻）与 p2_qkv（同步树延迟主导）。
+
+### 位级/D7 终态（真机，W=2 缺省全绿）
+
+- `layer_fused_li1_bit_exact_vs_split` ✓（W=2 vs split，三段 q/k/v、attn、
+  x、xn_attn、down、7 partials 段、page-1 KV 写，0-ulp）
+- `layer_fused_bit_exact_vs_split` ✓、`layer_fused_determinism_double_run` ✓
+- **`layer_fused_bw_ab_bitwise`（新门）** ✓：W=2（grid 164）vs W=1 全部输出
+  面 + 7 partials 段 + KV 写逐字节一致——D2 论证硬件证实
+- `layer_fused_engine_ab_bitwise` ✓（真机 128 步，W=2 引擎 vs S1-9 fused
+  位级一致 + 双载确定性）——D7 聚合序断言保持
+- 回退面：`REINFER_FUSED_BW=off` → W=1 内核为 S1-10 原码逐字（git diff
+  核对）；W=1 vs W=2 字节一致由 bw_ab 门断言。graph 节点数不变（n_layers+2）。
+
+### T2b（017 T2b 草案）：p2_o 与 add_rms 段块宽化 —— 审计负结果
+
+> 目标：p2_o 与 add_rms(o)/add_rms(down) 块宽化（W=2 grid=164）；判据：段表
+> A/B 中 p2_o 与 add_rms 段 ≥25% 下降（≥0.23ms/step），gpu busy vs 4.104ms。
+
+#### 审计（T1 行 5 补全；W=2 probe 对 block 0 逐 slot 分解，µs/层 @2.2GHz）
+
+| 打印段 | mark 区间 | 实际内容（probe 分解） | 判定 |
+|---|---|---|---|
+| p1_o (4) | 4→5 | bar3 汇合 2.7 + add(o) 3.2 + bar7 汇合 + rms(o) 4.5 ≈ 10.4 | add 已全 grid（S1-10c）；rms 单 block |
+| p2_o (5) | 5→6 | bar4 汇合等待 ~29.6 + p1_gu 块 0 自身 tile ~1.0 ≈ 30.6 | **不是 add_rms 工作** |
+| p1_gu (6) | 6→7 | bar5 汇合 + p2_gu_d 工作 ≈ 20.5 | 017-a 已宽化 |
+| p2_gu_d (7) | 7→8 | bar6 汇合 1.7 + add(down) 3.6 + bar8 汇合 + rms(down) 4.3 ≈ 9.6 | add 已全 grid；rms 单 block |
+
+- add(o)/add(down) 自 S1-10c 已是全 grid 连续列条带——T2b 无可做。
+- 唯一单 block 串行工作 = rms(o) 4.5 + rms(down) 4.3 µs/层（≈0.25ms/step）。
+- **bar4 汇合等待** ~29.6µs（慢机况）/ ~21-23µs（快机况），**与宽度无关**
+  （W=1 隐含同值：32.4 − p1_gu 块 0 自身 ~3 ≈ 29.4）且 T2b 之前已存在（017-a
+  基线同 30.3µs）。管道模型预测 ≈0（block 0 做 rms(o) 应最后到达、自旋 ≈0），
+  实测 29.6µs 解释不了；机况敏感（快/慢态差 ~8µs）→ 164 块自旋对 bgen/
+  bcnt 行与后续权重读的 L2 争用 + 释放传播延迟为最可能机制。与 add_rms
+  工作无关（rms 分块不改变它）。留 017-c（自旋退避/单 warp 自旋）候选。
+
+#### 实现（位级精确分块，已实现+回退）
+
+- 设计：rms 两段由 block 0（primary）+ block 1（helper）按 256-col 组后缀
+  拆半（D2 规则——列序/归约树/聚合前缀序零改动）：helper 算最后 J/2 组
+  平方部分和 → global scratch；primary 前缀链后按升序加 helper 部分和
+  （同 f32 加法同序同位 → 每线程 s 位级一致），256-slot 树整棵留在 block 0
+  （字节级不动）；rstd 经 scratch[Jh*256] 广播；输出按同组区间拆。两对
+  P=2 部分 barrier（bar9/bar10、bar11/bar12），参与者 {0,1} 固定 → host P
+  公式无需改动；const 加 rms_scratch 字段（520 f32）。
+- 位级验证（分块版全绿）：`layer_fused_li1_bit_exact_vs_split` /
+  `layer_fused_bit_exact_vs_split` / `layer_fused_determinism_double_run` /
+  `layer_fused_bw_ab_bitwise`（W=2 vs W=1 字节一致）/ `layer_fused_engine_ab_bitwise`
+  （真机 128 步位级 + 双载）。
+- **实测无收益 → 回退**：p1_o slot（含 rms(o)）10.4→10.5µs 持平；p2_gu_d
+  slot（含 rms(down)）10.0→10.9µs **+0.8µs**。原因（审计结论）：rms 在
+  block 0 上**延迟受限**——4 个 512B 列序加载本就并行发射、256-slot 树是
+  串行地板、全 grid 自旋 barrier 的 L2 争用再放大加载延迟；把后一半列搬
+  到 block 1 不缩短 block 0 的延迟链，反而加两对 barrier 握手 + scratch
+  往返（实测 +0.8µs 即其成本）。**017-a 的块宽化手法对 add_rms 段不适用**
+  （其收益来自 p1_qkv/p1_gu 的吞吐受限段；rms 不是吞吐受限）。
+
+#### 段表 A/B（回退后终态内核；同日交错 W2/W1/W2/W1；window 21-40 @4096，µs/层）
+
+| 段 | W=1（2 次均值） | W=2（2 次均值） | Δ |
+|---|---|---|---|
+| gather/rms0 | 19.35 | 17.63 | −8.9% |
+| p1_o（含 add_rms(o)） | 9.51 | 9.83 | +3.4%（噪声） |
+| p2_o | 24.18 | 24.16 | **0%** |
+| p1_gu | 24.37 | 17.39 | **−28.6%**（017-a 收益复现） |
+| p2_gu_d（含 add_rms(d)） | 9.43 | 9.67 | +2.5%（噪声） |
+| **layer** | **121.03** | **113.13** | **−6.5%** |
+| gpu busy | 3.739 ms | 3.596 ms | −3.8% |
+| lm_head（不动） | 0.425 ms | 0.455 ms | — |
+
+window 1-20 括号对照（同 4 次运行）：gpu busy 4.355 vs 4.095 ms（−6.0%；
+W=2 的 4.095 ≈ 017-a 基线 4.104），layer 143.6 vs 130.9µs，p2_o 32.46 vs
+30.64µs（−5.6% ≈ p1_gu 块 0 自身 tile 差 ~1.8µs，非 add_rms）。w1-20 含模型
+载入后首 20 步降级态（bar4 等待 30.6-32.6µs 与 017-a 基线同值）；w21-40
+机况转快，bar4 等待塌缩至 ~21-23µs——与 T2b 改动无关。
+
+**判据核验（如实）**：p2_o 段 ≥25% **不可达**——内容为 bar4 汇合等待 +
+p1_gu 块 0 自身 tile，非 add_rms 工作；add_rms 段 ≥25% 亦不可达——add 已全
+grid，rms 延迟受限、分块实测持平/微负（已回退）。gpu busy 终值 3.596 ms
+（W=2 均值，同日交错 W=1 臂 3.739 ms；今日处快机况——017-a 基线 4.104 ms
+为慢机况，同态比较取交错对 Δ −3.8%）。结论：**T2b"add_rms 段可块宽化"
+前提被测量证伪**；本波唯一 ≥25% 收益为 017-a 的 p1_gu −29%（复现）。bar4
+等待为下一步（017-c 自旋退避）候选。
+
+#### 回退面（终态）
+
+- `REINFER_FUSED_BW=off/1` → W=1 逐字节一致（017-a 断言保持）；终态源码
+  重跑位级全绿：5 项 bit 门 + 4 项常规测试全过（JIT 重编终态源码）。
+- 终态与 017-a 差异仅注释/布局（bar 缓冲 20 u32 = 10 slots、stage_ts
+  9 slots、const 无 rms_scratch 字段）——无功能差异。
+
+### 017-c（草案子节）：bar4 汇合等待审计 — 前提被探针证伪，双廉价实验零收益
+
+> 任务（specs/017-c wave）：以降 bar4 汇合等待为目标（017-b 归因 p2_o 行
+> ≈30.6µs/层 中 ~29.6µs 为"164 块自旋 + 释放传播"），先跑两个廉价实测
+> （P4 集合收窄 / 等待者 __nanosleep 退避），零收益→记录并停止。未提交。
+
+**探针（V1，临时）**：stage_ts 槽 9→12/层，块 0 在 bar4 出口（mark 9）、
+bar5 出口（mark 10）补两个时钟标记，把 p2_o / p1_gu 行按块 0 时间序拆成
+bar4-in / stage6-own / bar5-in / stage7-own 四段（block 0 只在
+blockIdx.x==0 && threadIdx.x==0 写——读侧行定义不变，无算序变化）。
+
+**V1 锚（W=2 现行码，同日 2 窗口 × 20 步均值，@2.2GHz，µs/层）**：
+
+| 段（块 0 槽分解） | w1-20 | w21-40 |
+|---|---|---|
+| p2_o 行 = bar4-in + stage6-own | 30.67 = **1.011** + 29.66 | 30.35 = **1.009** + 29.34 |
+| p1_gu 行 = bar5-in + stage7-own | 20.84 = 3.95 + 16.89 | 20.76 = 3.89 + 16.88 |
+| layer | 130.98 | 130.55 |
+| gpu busy | 4.122 ms | 4.122 ms |
+
+**结论：017-b 的"bar4 汇合等待 ≈29.6µs"归因被证伪**。块 0 在 bar4 内的
+实耗 ≈1.0µs（代码结构即如此：块 0 是最后到达者——它在 bar7 释放后还要
+跑 rms(o) ~4.5µs 才到 bar4，其余 163 块早已到达并自旋等它；到达即释放，
+自旋 ≈0）。p2_o 行的真实内容 = **块 0 自身 stage-6（p1_gu pair）内存 span
+≈29.4µs**——96 块并发流式 gu 权重（12.6MB/层唯一读）的 DRAM 受限段工作
+（实测有效 ~430GB/s ≈ ~50% DRAM 峰值——2B 元素 × k-跨步 6KB 的扇区效率
+上限），不是 barrier 等待。同理 p1_gu 行 = bar5-in 3.9 + stage-7 自身
+16.9µs（down 6.3MB 唯一读）。barrier 侧改动在 p2_o/p1_gu 行上至多能动
+~1-4µs/层。
+
+**E1：P4/P5 收窄到真实工作集（164→96）**——stage-6 生产者集 = pair 数
+ceil(tiles_gu/2) = 96（非 tiles_gu=192），stage-7 = tiles_gu_d = 96；
+P4=P5=96（W=1 与 tile 数超 grid 的形状回退全 grid，公式与旧式逐值相等）：
+
+| 度量（µs/层 或 ms/step） | V1 锚 | E1 | Δ |
+|---|---|---|---|
+| bar4-in / bar5-in | 1.009-1.011 / 3.89-3.95 | 1.007 / 3.81-3.86 | 0 / ≈0 |
+| stage6-own | 29.34-29.66 | 28.74-29.91 | ±0.6（噪声） |
+| p2_o 行 | 30.35-30.67 | 29.75-30.91 | ≈0 |
+| p1_gu 行 | 20.76-20.84 | 20.39-20.73 | ≈0 |
+| layer | 130.55-130.98 | 130.68-131.38 | ≈0 |
+| gpu busy | 4.122 / 4.122 | 4.099 / 4.041 | 漂移（layer 行平 → 非 E1 效应；同日同码两窗口间可见 ±0.05ms 漂移） |
+
+**E2：bar4/bar5 等待者 __nanosleep(100) 退避**（grid_barrier_ns 变体，
+释放者不睡不受影响；P 公式回原值）：
+
+| 度量 | V1 锚 | E2 | Δ |
+|---|---|---|---|
+| bar4-in | 1.009-1.011 | 1.010 | 0 |
+| bar5-in | 3.89-3.95 | 4.07-4.10 | **+0.15**（退避粒度延迟释放探测，预期方向） |
+| stage6-own | 29.34-29.66 | 29.53-29.55 | 0 |
+| p2_o 行 | 30.35-30.67 | 30.54-30.56 | 0 |
+| stage7-own | 16.88-16.89 | 16.92-16.99 | 0 |
+| gpu busy | 4.122 / 4.122 | 4.109 / 4.116 | ≈0 |
+
+**记录（零收益→停止，不凑数）**：E1/E2 均为零收益（bar5-in 微负）。与
+S1-10b 的 flash 段 nanosleep 零收益一致；机制也一致——等待者自旋的 L2
+轮询 ~1-2% 级，对 DRAM 受限的段工作无扰动；且等待本身仅 ~1-4µs/层。
+**段表判据（p2_o ≥25% / gpu busy 4.00→3.335ms）经本波判不可达**：p2_o 行
+不是 barrier 等待（017-b 误归因），是 stage-6 的 gu 权重 DRAM span——
+barrier 侧任何改动都动不了它。所有探针/实验码已回退，终态与 017-b 终态
+字节一致；5 项 bit 门重跑全绿（JIT 重编终态源码）。今日机况慢侧
+（busy ≈4.1ms 双窗口恒定），交错 A/B 同日内有效。
+
+**下一步候选（不在 barrier 侧，按收益排序）**：
+1. ~~phase-1 b 行加载加宽~~ — **017-d 已实测证伪，见下**。
+2. **层间权重 L2 预取**：flash/p1_o 窗口预取本层 down + 下一层 gu（纯内存
+   面操作，零算术变化）。
+3. **多 stage 跨层流水**：28 层顺序 launch 的层间重叠（layer L stage-6 ∥
+   layer L+1 gather/flash）——需拆 launch/事件依赖，大改。
+4. 权重瓦片化布局（离线 transpose）——超本波范围。
+
+### 017-d（草案子节）：phase-1 b 行加载加宽（每线程 2-4 连续列）— 前提证伪，负收益
+
+> 任务（specs/017-decode-block-width wave）：phase-1 GEMM（p1_qkv/p1_gu）
+> 及 DRAM 段（stage-7 down phase-1）的 b 行加载从"每线程 1 列"加宽为
+> "每线程 WC=2/4 连续列 + 矢量装载（LDG.32/64）"；D7 零偏差保持（只改
+> 列→线程归属，列序/归约前缀树/聚合序不动，同 017-a 手法）。预期
+> ~430→~700GB/s；判据：各段 ≥20% 降、gpu busy ≤3.335ms。探针纪律同
+> 017-c；未提交。
+
+**实现**（REINFER_FUSED_WC env 后，缺省 1 = 017-c 终态字节一致；2/4 入口
+bw2_wc2/bw2_wc4，__launch_bounds__(512,2)，REG:64 LOCAL:0 无溢出）：
+- `gemv_phase1_wc<WC>`：每列独立 4-ILP 链与 (acc0+acc1)+(acc2+acc3) 树
+  逐字节不变；WC=2 → 每 (thread, k) 一个 4B 装载、WC=4 → 8B（行步长
+  偶/4-整除门；n 边缘 wc<WC 与 k 尾回退逐列守卫标量路径，if(j<wc) 编译
+  期展开保寄存器）。装载宽度不进算术 → 位级不变。
+- `stage_p1_wc` / `stage_p2_gu_d_wc` + p1_tiles/layer_fused_body 模板化
+  <W,WC>；p1 瓦片宽 256·WC、stage-7 瓦片宽 512·WC（宿主 tiles 同步）；
+  p2_qkv 保持 256 瓦片（partials 逐列求和，与 p1 宽无关）。
+- **踩坑记录（真 bug，已修）**：CUDA 13.2 的 `__half(unsigned short)` 构造是
+  **数值转换**（`__ushort2half_rn`），不是位重释——矢量装载提取 half 若写
+  成 `__half2float((unsigned short)(w & 0xffff))`，0x3C00 会被当整数 15360
+  转 f16 而非按位读。首跑即 NaNLogits；li1 门定位 down 行 0x7c00(+inf)。
+  必须用仓库位重释 hbits_to_f32。已在注释登记（防再犯）。
+
+**测量**（2026-09-02 真机 Qwen3-0.6B，window 21-40 @4096；机况漂移先验：
+同码 A 两轮 busy 4.172/4.170、两轮 wall 271.2→286.5ms，交错对比有效）：
+
+| 配置 | gpu busy w21-40 (ms) | 层均值 µs | p1_gu 行 µs | p2_gu_d 行 µs | 交错 wall / tok/s |
+|---|---|---|---|---|---|
+| A: WC=1（缺省 = 017-c 终态） | 4.172 / 4.170 | 123.7 | 19.28 | 10.36 | 271.2ms/221.3；286.5ms/209.4 |
+| B: WC=2 | 4.244（w1-20 4.455） | 135.5 | 19.37 | 9.28 | 348.6ms/172.1；328.8ms/182.5 |
+| C: WC=4 | 5.257（w41-60 4.952） | — | — | — | 354.8ms/169.1 |
+
+**结论：017-c 候选 1 前提证伪 + 实现负收益，零收益记录在案（不凑数）**：
+1. p1_gu 行 A/B 持平（19.28→19.37µs）——12.6MB/19.3µs ≈ **650GB/s**。
+   块半 256 线程每 k 行取 512B 连续（4×32B 扇区全用），W=2 每 warp 64B
+   指令本就扇区饱和；017-c 的"~430GB/s≈50% 峰值"出自当日慢侧窗口（同码
+   同日 busy 漂 ±1.5-5%），未复现——快态下 p1_gu 已接近 DRAM 峰值。
+2. 加宽反而变慢：WC=2 瓦片数减半（tiles_qkv 288→144、tiles_gu 192→96）
+   → max_tiles 帽把 grid 收缩 164→144；WC=4 再减到 72 且 stage-7
+   （h=1024 < 2048 瓦片宽）半块闲置。活跃块减少 → 每块串行 span 拉长；
+   矢量宽不省扇区数（每 k 行已是全扇区）→ 纯负收益。
+3. 判据不可达（busy 需 −17%，实测 +2-26%）。**终态 = 缺省 WC=1**（与
+   017-c 终态字节一致）；WC=2/4 入口保留在 env 后（正确性已钉：li1 与
+   engine A/B 16+128 步在 WC=2/4 下均 0-ulp）。
+4. **门禁复验（终态源码 JIT 重编后）**：5 项 bit 门 + determinism 双跑全绿；
+   REINFER_FUSED_BW=off/1 回退面与 REINFER_FUSED_WC=2/4 面 engine A/B
+   亦全绿（9 项测试全过）。
+
+**下一步候选（017-c 清单更新，均不在加载宽度侧）**：① 层间权重 L2 预取
+（flash/p1_o 窗口预取本层 down + 次层 gu）；② 多 stage 跨层流水（28 层
+launch 重叠）；③ 权重瓦片化布局；④（新）层时大头再分解——层均 123.7µs
+中 p1_gu 行仅 ~20µs，flash/p2_qkv/p1_o 行的 DRAM/L2 构成未单独计量。
+
 ## 2026-09-01 — S1-8: 基准回归门禁建档（006 T7；纯文档/脚本/测试域）
 
 - **门禁定案（decode 唯一门禁）**：0.85× llama.cpp CUDA = **299.8 tok/s**（参照

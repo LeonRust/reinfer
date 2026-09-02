@@ -40,10 +40,34 @@
 // any co-resident grid is correct. If even that cannot be satisfied the
 // loader fails (Fatal) and the engine falls back to the S1-9 fused path.
 //
-// The barrier counters live in a device buffer (2 * N_BARRIERS u32)
-// zeroed once at build; every barrier resets its counter when the last
-// block arrives, so the state is clean across launches (and across graph
-// replays — the kernel is a plain cuLaunchKernel node).
+// S1-11 (specs/017) block-width wave: the "single-block serial" stages
+// (p1_qkv, p2_qkv, p1_gu) are widened by splitting their 512-col tiles
+// into 256-col tiles, one PAIR of adjacent tiles per block (threads
+// 0..255 on tile 2p, threads 256..511 on tile 2p+1 — both halves run the
+// same k-walk concurrently). Only the (column -> block, thread)
+// assignment changes; every (col, slab) value is still computed by
+// exactly one thread with the identical scan order, so the outputs and
+// the partials bytes are unchanged. The widened kernel is the second
+// entry point `decode_step_layer_fused_bw2` (W=2, __launch_bounds__(512,
+// 2) — 64 registers/thread so two blocks per SM fit); the W=1 entry is
+// the S1-10 kernel verbatim (REINFER_FUSED_BW=off keeps it). The host
+// (layer_fused.rs) picks the entry and the grid; the barrier participant
+// sets below are recomputed from the widened tile counts automatically
+// (the P formulas read the const's tile counts, which the host uploads
+// per width).
+//
+// 017-d per-thread column width (specs/017-decode-block-width): the
+// DRAM-bound phase-1 stages (p1_qkv, p1_gu, and the down phase-1 in
+// stage 7) widen the b-row loads of the W=2 kernel further — each thread
+// owns WC = 2 or 4 CONSECUTIVE columns and fetches them as one vector
+// load (LDG.32 / LDG.64; scalar stride-2 loads would waste half of every
+// 32B sector). A block-half's tile is then 256*WC columns wide and the
+// stage-7 tile 512*WC wide. Per-column arithmetic is untouched (each
+// column still gets the identical 4-ILP chain, and the reduction trees /
+// aggregation orders never see WC) — see gemv_phase1_wc. WC=1 keeps
+// this file's S1-11 code verbatim; entries `decode_step_layer_fused_
+// bw2_wc2` / `..._wc4` (both __launch_bounds__(512, 2)) carry WC=2/4,
+// selected by REINFER_FUSED_WC.
 //
 // Host side: crates/cuda/src/layer_fused.rs; engine wiring:
 // crates/cuda/src/engine.rs (REINFER_LAYER_FUSED gate, S1-10 step launch
@@ -212,19 +236,187 @@ __device__ __forceinline__ void gemv_phase1(const PlanRow& row, int col,
 }
 
 // ---------------------------------------------------------------------------
+// S1-11d (specs/017-d): the phase-1 b-row walk widened — one thread
+// accumulates WC CONSECUTIVE output columns with independent per-column
+// 4-ILP chains. Per (col, slab) the k sequence, the (acc0+acc1)+(acc2+acc3)
+// tree and the partials write are byte-identical to gemv_phase1 (every
+// column is still computed by exactly one thread in the identical order —
+// only the column -> thread assignment changed). The consecutive columns
+// make the per-(thread, k) b loads contiguous, so WC columns per row are
+// fetched as one vector LDG.32 (WC=2) / LDG.64 (WC=4) instead of WC scalar
+// 2B loads (scalar per-column loads at stride-2 would fetch each 32B
+// sector half-used). Load width never enters the arithmetic — the widen
+// path changes only memory instruction shapes.
+//
+// `wc` = the number of valid columns at col0 (== WC on the vector fast
+// path; a tile that straddles the plan's n edge falls back to the guarded
+// per-column scalar path for its remainder).
+// ---------------------------------------------------------------------------
+template <int WC>
+__device__ __forceinline__ void gemv_phase1_wc(const PlanRow& row, int col0,
+                                               int ks, int ke, int slab,
+                                               int wc) {
+    float a[WC][4];
+    for (int j = 0; j < WC; ++j) {
+        a[j][0] = 0.0f;
+        a[j][1] = 0.0f;
+        a[j][2] = 0.0f;
+        a[j][3] = 0.0f;
+    }
+    if ((ke - ks) % 4 == 0 && wc == WC) {
+        // Fast path (no per-k guards — the slab k-range is a multiple of
+        // 4, exactly like gemv_phase1's fast path). Vector loads require
+        // 4B (WC=2) / 8B (WC=4) alignment: col0 is a multiple of WC and
+        // the row stride is even (checked below); plans with an odd n
+        // fall back to the scalar loop (identical arithmetic).
+        if constexpr (WC == 2) {
+            if ((row.n & 1) == 0) {
+                #pragma unroll 8
+                for (int k0 = ks; k0 < ke; k0 += 4) {
+                    const unsigned int* b = (const unsigned int*)(row.b + (size_t)k0 * row.n + col0);
+                    float av0 = __half2float(__ldg(&row.a[k0]));
+                    float av1 = __half2float(__ldg(&row.a[k0 + 1]));
+                    float av2 = __half2float(__ldg(&row.a[k0 + 2]));
+                    float av3 = __half2float(__ldg(&row.a[k0 + 3]));
+                    unsigned int w0 = __ldg(b);
+                    unsigned int w1 = __ldg(b + row.n / 2);
+                    unsigned int w2 = __ldg(b + 2 * (row.n / 2));
+                    unsigned int w3 = __ldg(b + 3 * (row.n / 2));
+                    a[0][0] += av0 * hbits_to_f32((unsigned short)(w0 & 0xffffu));
+                    a[0][1] += av1 * hbits_to_f32((unsigned short)(w1 & 0xffffu));
+                    a[0][2] += av2 * hbits_to_f32((unsigned short)(w2 & 0xffffu));
+                    a[0][3] += av3 * hbits_to_f32((unsigned short)(w3 & 0xffffu));
+                    a[1][0] += av0 * hbits_to_f32((unsigned short)(w0 >> 16));
+                    a[1][1] += av1 * hbits_to_f32((unsigned short)(w1 >> 16));
+                    a[1][2] += av2 * hbits_to_f32((unsigned short)(w2 >> 16));
+                    a[1][3] += av3 * hbits_to_f32((unsigned short)(w3 >> 16));
+                }
+            } else {
+                // Scalar fast path (n odd — vector loads misaligned).
+                for (int k0 = ks; k0 < ke; k0 += 4) {
+                    for (int i = 0; i < 4; ++i) {
+                        float av = __half2float(__ldg(&row.a[k0 + i]));
+                        a[0][i] += av * __half2float(__ldg(&row.b[(size_t)(k0 + i) * row.n + col0]));
+                        a[1][i] += av * __half2float(__ldg(&row.b[(size_t)(k0 + i) * row.n + col0 + 1]));
+                    }
+                }
+            }
+        } else {  // WC == 4
+            if ((row.n & 3) == 0) {
+                #pragma unroll 8
+                for (int k0 = ks; k0 < ke; k0 += 4) {
+                    const unsigned long long* b =
+                        (const unsigned long long*)(row.b + (size_t)k0 * row.n + col0);
+                    float av0 = __half2float(__ldg(&row.a[k0]));
+                    float av1 = __half2float(__ldg(&row.a[k0 + 1]));
+                    float av2 = __half2float(__ldg(&row.a[k0 + 2]));
+                    float av3 = __half2float(__ldg(&row.a[k0 + 3]));
+                    unsigned long long w0 = __ldg(b);
+                    unsigned long long w1 = __ldg(b + row.n / 4);
+                    unsigned long long w2 = __ldg(b + 2 * (row.n / 4));
+                    unsigned long long w3 = __ldg(b + 3 * (row.n / 4));
+                    a[0][0] += av0 * hbits_to_f32((unsigned short)(w0 & 0xffffu));
+                    a[1][0] += av0 * hbits_to_f32((unsigned short)((w0 >> 16) & 0xffffu));
+                    a[2][0] += av0 * hbits_to_f32((unsigned short)((w0 >> 32) & 0xffffu));
+                    a[3][0] += av0 * hbits_to_f32((unsigned short)(w0 >> 48));
+                    a[0][1] += av1 * hbits_to_f32((unsigned short)(w1 & 0xffffu));
+                    a[1][1] += av1 * hbits_to_f32((unsigned short)((w1 >> 16) & 0xffffu));
+                    a[2][1] += av1 * hbits_to_f32((unsigned short)((w1 >> 32) & 0xffffu));
+                    a[3][1] += av1 * hbits_to_f32((unsigned short)(w1 >> 48));
+                    a[0][2] += av2 * hbits_to_f32((unsigned short)(w2 & 0xffffu));
+                    a[1][2] += av2 * hbits_to_f32((unsigned short)((w2 >> 16) & 0xffffu));
+                    a[2][2] += av2 * hbits_to_f32((unsigned short)((w2 >> 32) & 0xffffu));
+                    a[3][2] += av2 * hbits_to_f32((unsigned short)(w2 >> 48));
+                    a[0][3] += av3 * hbits_to_f32((unsigned short)(w3 & 0xffffu));
+                    a[1][3] += av3 * hbits_to_f32((unsigned short)((w3 >> 16) & 0xffffu));
+                    a[2][3] += av3 * hbits_to_f32((unsigned short)((w3 >> 32) & 0xffffu));
+                    a[3][3] += av3 * hbits_to_f32((unsigned short)(w3 >> 48));
+                }
+            } else {
+                for (int k0 = ks; k0 < ke; k0 += 4) {
+                    for (int i = 0; i < 4; ++i) {
+                        float av = __half2float(__ldg(&row.a[k0 + i]));
+                        for (int j = 0; j < 4; ++j) {
+                            a[j][i] += av *
+                                __half2float(__ldg(&row.b[(size_t)(k0 + i) * row.n + col0 + j]));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Guarded path (k tail or the tile's n-edge straddle — per-column
+        // guards mirror gemv_phase1's guarded loop for each column; the
+        // j<wc guards are per-column compile-time unrolled so the a[j][i]
+        // accumulators stay in registers).
+        for (int k0 = ks; k0 < ke; k0 += 4) {
+            float av0 = __half2float(__ldg(&row.a[k0]));
+            #pragma unroll
+            for (int j = 0; j < WC; ++j) {
+                if (j < wc) {
+                    a[j][0] += av0 * __half2float(__ldg(&row.b[(size_t)k0 * row.n + col0 + j]));
+                }
+            }
+            if (k0 + 1 < ke) {
+                float av1 = __half2float(__ldg(&row.a[k0 + 1]));
+                #pragma unroll
+                for (int j = 0; j < WC; ++j) {
+                    if (j < wc) {
+                        a[j][1] += av1 *
+                            __half2float(__ldg(&row.b[(size_t)(k0 + 1) * row.n + col0 + j]));
+                    }
+                }
+            }
+            if (k0 + 2 < ke) {
+                float av2 = __half2float(__ldg(&row.a[k0 + 2]));
+                #pragma unroll
+                for (int j = 0; j < WC; ++j) {
+                    if (j < wc) {
+                        a[j][2] += av2 *
+                            __half2float(__ldg(&row.b[(size_t)(k0 + 2) * row.n + col0 + j]));
+                    }
+                }
+            }
+            if (k0 + 3 < ke) {
+                float av3 = __half2float(__ldg(&row.a[k0 + 3]));
+                #pragma unroll
+                for (int j = 0; j < WC; ++j) {
+                    if (j < wc) {
+                        a[j][3] += av3 *
+                            __half2float(__ldg(&row.b[(size_t)(k0 + 3) * row.n + col0 + j]));
+                    }
+                }
+            }
+        }
+    }
+    float* dst = row.partials + (size_t)slab * row.n + col0;
+    dst[0] = (a[0][0] + a[0][1]) + (a[0][2] + a[0][3]);
+    if (wc > 1) {
+        dst[1] = (a[1][0] + a[1][1]) + (a[1][2] + a[1][3]);
+    }
+    if (wc > 2) {
+        dst[2] = (a[2][0] + a[2][1]) + (a[2][2] + a[2][3]);
+    }
+    if (wc > 3) {
+        dst[3] = (a[3][0] + a[3][1]) + (a[3][2] + a[3][3]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stage 1: phase-1 of the q/k/v plans (the layer input xn). Tiles =
-// sum over plans of (ceil(n/512) * nslabs); each tile is one 512-col
+// sum over plans of (ceil(n/tw) * nslabs); each tile is one tw-col
 // (col-block, slab) pair, one thread per column, the identical per-tile
-// arithmetic as gemv_m1_f16f32_multi.
+// arithmetic as gemv_m1_f16f32_multi. `tw` is the widened tile width
+// (512 for the plain stages, 256 for the S1-11 widened stages).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void stage_p1(const LayerFusedConst* c,
                                          const PlanRow* table,
                                          int row_base, int nrows,
-                                         int tile, int tid) {
+                                         int tile, int tw, int tl) {
     int row = row_base;
     for (int r = 0; r < nrows; ++r) {
         const PlanRow R = table[row_base + r];
-        int ncols = (R.n + 511) / 512;
+        int ncols = (R.n + tw - 1) / tw;
         int nt = ncols * R.nslabs;
         if (tile < nt) {
             row = row_base + r;
@@ -233,7 +425,7 @@ __device__ __forceinline__ void stage_p1(const LayerFusedConst* c,
         tile -= nt;
     }
     const PlanRow R = table[row];
-    int col = (tile / R.nslabs) * 512 + tid;
+    int col = (tile / R.nslabs) * tw + tl;
     if (col >= R.n) {
         return;
     }
@@ -247,20 +439,113 @@ __device__ __forceinline__ void stage_p1(const LayerFusedConst* c,
     gemv_phase1(R, col, ks, ke, slab);
 }
 
+// 017-d: stage_p1's WC-wide variant — the block-half's tile covers
+// tw = 256*WC columns and thread tl (0..255) owns WC CONSECUTIVE columns
+// starting at col0 = blk*tw + tl*WC (the same columns stage_p1 would
+// assign to threads tl*WC..tl*WC+WC-1 of a 512/1024-col tile, so every
+// (col, slab) is still computed exactly once, in the identical order).
+// The tile decode is stage_p1's with tw = 256*WC; the k-range and the
+// per-column chain arithmetic come from gemv_phase1_wc<WC>.
+template <int WC>
+__device__ __forceinline__ void stage_p1_wc(const LayerFusedConst* c,
+                                            const PlanRow* table,
+                                            int row_base, int nrows,
+                                            int tile, int tl) {
+    const int tw = 256 * WC;
+    int row = row_base;
+    for (int r = 0; r < nrows; ++r) {
+        const PlanRow R = table[row_base + r];
+        int ncols = (R.n + tw - 1) / tw;
+        int nt = ncols * R.nslabs;
+        if (tile < nt) {
+            row = row_base + r;
+            break;
+        }
+        tile -= nt;
+    }
+    const PlanRow R = table[row];
+    int col0 = (tile / R.nslabs) * tw + tl * WC;
+    if (col0 >= R.n) {
+        return;
+    }
+    int wc = R.n - col0;
+    if (wc > WC) {
+        wc = WC;
+    }
+    int slab = tile % R.nslabs;
+    int slab_k = (R.k + R.nslabs - 1) / R.nslabs;
+    int ks = slab * slab_k;
+    int ke = ks + slab_k;
+    if (ke > R.k) {
+        ke = R.k;
+    }
+    gemv_phase1_wc<WC>(R, col0, ks, ke, slab, wc);
+}
+
+// The plain (512-col) tile loop — grid-strided, all 512 threads per tile.
+// Used by the p1_o stage in both widths and by the widened stages when W=1.
+__device__ __forceinline__ void p1_tiles_plain(const LayerFusedConst* c,
+                                               const PlanRow* table,
+                                               int row_base, int nrows,
+                                               int tiles, int bx, int G,
+                                               int tid) {
+    for (int t = bx; t < tiles; t += G) {
+        stage_p1(c, table, row_base, nrows, t, 512, tid);
+    }
+}
+
+// The widened (S1-11) tile loop: tw-col tiles, one adjacent PAIR per
+// block — threads 0..255 process tile 2p, threads 256..511 process tile
+// 2p+1, both k-walks concurrently (per-thread arithmetic unchanged; only
+// the column -> (block, thread) assignment differs). W=1 keeps the plain
+// grid-stride loop verbatim.
+//
+// 017-d: with WC > 1 each half's tile is 256*WC columns wide and every
+// thread covers WC consecutive columns via stage_p1_wc (the tw argument
+// is then only the W=2/WC=1 tile width; stage_p1_wc derives its own).
+template <int W, int WC>
+__device__ __forceinline__ void p1_tiles(const LayerFusedConst* c,
+                                         const PlanRow* table,
+                                         int row_base, int nrows,
+                                         int tiles, int tw, int bx, int G,
+                                         int tid) {
+    if constexpr (W == 1) {
+        for (int t = bx; t < tiles; t += G) {
+            stage_p1(c, table, row_base, nrows, t, 512, tid);
+        }
+    } else if constexpr (WC == 1) {
+        const int half = tid >> 8;
+        const int tl = tid & 255;
+        for (int p = bx; 2 * p < tiles; p += G) {
+            if (2 * p + half < tiles) {
+                stage_p1(c, table, row_base, nrows, 2 * p + half, tw, tl);
+            }
+        }
+    } else {
+        const int half = tid >> 8;
+        const int tl = tid & 255;
+        for (int p = bx; 2 * p < tiles; p += G) {
+            if (2 * p + half < tiles) {
+                stage_p1_wc<WC>(c, table, row_base, nrows, 2 * p + half, tl);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2: q/k/v phase-2 reductions + f16 casts + q/k head-norm + RoPE —
-// the 512-thread form of gemv_p2_qkv_cast_hn_rope. Tiles: q (ceil(nq/512)),
+// the 512-thread form of gemv_p2_qkv_cast_hn_rope. Tiles: q (ceil(nq/tw)),
 // k, v. Per-column ascending-slab sums, per-head 128-slot tree (st =
 // 64..1) and the rope pair rounds are unchanged; only the block's head
 // count grows from 256/d to 512/d (the rstd broadcast guard becomes
-// tid < 512/d).
+// tid < 512/d). `tw` = 512 for W=1, 256 for the widened W=2 entry.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void stage_p2_qkv(const LayerFusedConst* c,
-                                             const PlanRow* table,
-                                             int tile, int tid,
-                                             unsigned int pos,
-                                             const unsigned short* wq,
-                                             const unsigned short* wk) {
+__device__ __forceinline__ void stage_p2_qkv_w1(const LayerFusedConst* c,
+                                                const PlanRow* table,
+                                                int tile, int tid,
+                                                unsigned int pos,
+                                                const unsigned short* wq,
+                                                const unsigned short* wk) {
     const int cq = (c->nqk + 511) / 512;
     const int ck = (c->kvk + 511) / 512;
     const int d = c->d;
@@ -383,6 +668,122 @@ __device__ __forceinline__ void stage_p2_qkv(const LayerFusedConst* c,
             acc += R.partials[(size_t)s * R.n + col];
         }
         c->v16[col] = f32_to_hbits(acc);
+    }
+}
+
+// The widened (S1-11) q/k/v phase-2: two 256-col tiles per block (threads
+// 0..255 on tile 2p, 256..511 on tile 2p+1). The per-column arithmetic is
+// the W=1 form's (ascending-slab sums, casts, head-norm tree, rope pair
+// rounds); the head-norm tree runs on a UNIFORM skeleton so both halves
+// hit the same __syncthreads() regardless of their segments (the v
+// segment contributes zero slots and skips the writes — the tree
+// arithmetic per head is unchanged).
+__device__ __forceinline__ void stage_p2_qkv_w2(const LayerFusedConst* c,
+                                                const PlanRow* table,
+                                                int tile, int tl, int tid,
+                                                unsigned int pos,
+                                                const unsigned short* wq,
+                                                const unsigned short* wk) {
+    const int cq = (c->nqk + 255) / 256;
+    const int ck = (c->kvk + 255) / 256;
+    const int d = c->d;
+    const int half = c->half;
+    __shared__ float s_sh[1024];  // (512/d) heads * 128 slots, d >= 32
+    int seg;
+    int col;
+    if (tile < cq) {
+        seg = 0;
+        col = tile * 256 + tl;
+    } else if (tile < cq + ck) {
+        seg = 1;
+        col = (tile - cq) * 256 + tl;
+    } else {
+        seg = 2;
+        col = (tile - cq - ck) * 256 + tl;
+    }
+    const PlanRow R = table[seg];
+    unsigned short* out = seg == 0 ? c->q16 : (seg == 1 ? c->k16 : c->v16);
+    if (col < R.n) {
+        float acc = 0.0f;
+        for (int s = 0; s < R.nslabs; ++s) {
+            acc += R.partials[(size_t)s * R.n + col];
+        }
+        out[col] = f32_to_hbits(acc);
+    }
+    if (c->hn) {
+        int head = tid / d;
+        int e = tid % d;
+        float v = 0.0f;
+        if (seg != 2 && col < R.n) {
+            v = hbits_to_f32(out[col]);
+        }
+        s_sh[head * 128 + e] = v * v;
+        __syncthreads();
+        for (int st = 64; st > 0; st >>= 1) {
+            if (e < st) {
+                s_sh[head * 128 + e] += s_sh[head * 128 + e + st];
+            }
+            __syncthreads();
+        }
+        if (tid < 512 / d) {
+            s_sh[tid * 128] = rsqrtf(s_sh[tid * 128] / (float)d + c->eps);
+        }
+        __syncthreads();
+        if (seg != 2 && col < R.n) {
+            float rstd = s_sh[(tid / d) * 128];
+            out[col] = f32_to_hbits(hbits_to_f32(out[col]) * rstd *
+                                    hbits_to_f32(seg == 0 ? wq[e] : wk[e]));
+        }
+        __syncthreads();
+    } else {
+        __syncthreads();
+    }
+    if (seg != 2 && col < R.n) {
+        int e = tid % d;
+        if (e < half) {
+            int base = col - e;
+            unsigned short* xr = out + base;
+            float theta = (float)pos * powf(c->eta, -2.f * (float)e / (2.f * (float)half));
+            float co = cosf(theta), si = sinf(theta);
+            float a = hbits_to_f32(xr[e]);
+            float b = hbits_to_f32(xr[e + half]);
+            float v1 = a * co - b * si;
+            float v2 = a * si + b * co;
+            if (seg == 0) {
+                // q: scale_q on the rounded pair (the W=1 q path verbatim).
+                xr[e] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v1)) * c->scale_q);
+                xr[e + half] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v2)) * c->scale_q);
+            } else {
+                // k: no scale (the W=1 k path verbatim).
+                xr[e] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v1)));
+                xr[e + half] = f32_to_hbits(hbits_to_f32(f32_to_hbits(v2)));
+            }
+        }
+    }
+}
+
+// The stage-2 tile loop: W=1 keeps the plain grid-stride form (one 512-col
+// tile per block per iteration); W=2 runs one adjacent 256-col tile pair
+// per block.
+template <int W>
+__device__ __forceinline__ void p2qkv_tiles(const LayerFusedConst* c,
+                                            const PlanRow* table,
+                                            int tiles, int bx, int G,
+                                            int tid, unsigned int pos,
+                                            const unsigned short* wq,
+                                            const unsigned short* wk) {
+    if (W == 1) {
+        for (int t = bx; t < tiles; t += G) {
+            stage_p2_qkv_w1(c, table, t, tid, pos, wq, wk);
+        }
+    } else {
+        const int half = tid >> 8;
+        const int tl = tid & 255;
+        for (int p = bx; 2 * p < tiles; p += G) {
+            if (2 * p + half < tiles) {
+                stage_p2_qkv_w2(c, table, 2 * p + half, tl, tid, pos, wq, wk);
+            }
+        }
     }
 }
 
@@ -775,7 +1176,6 @@ __device__ __forceinline__ void stage_rms_out(unsigned short* x,
     __syncthreads();
 }
 
-
 // ---------------------------------------------------------------------------
 // Stage 7: gate/up phase-2 + fused cast-SiLU-GLU + the down plan's phase-1
 // in one stage — gemv_p2_gu_p1d_swiglu with 512-col stripes. Tile =
@@ -822,6 +1222,53 @@ __device__ __forceinline__ void stage_p2_gu_d(const LayerFusedConst* c,
     }
     for (int cc = c2 * 512 + tid; cc < ccmax; cc += 512) {
         gemv_phase1(rd, cc, ks, ke, slab);
+    }
+}
+
+// 017-d: stage_p2_gu_d with WC-wide down phase-1 — the phase-2 part (silu
+// stripe writes) is byte-identical to stage_p2_gu_d; only the phase-1
+// column ownership widens: each down tile now covers 512*WC columns and
+// thread tid owns the WC consecutive columns [tid*WC, tid*WC+WC) (host
+// tile count tiles_gu_d = tiles_w(rd.n, rd.nslabs, 512*WC)). Each column
+// is still computed exactly once with the identical k-walk.
+template <int WC>
+__device__ __forceinline__ void stage_p2_gu_d_wc(const LayerFusedConst* c,
+                                                 const PlanRow* table,
+                                                 int tile, int tid) {
+    const PlanRow rg = table[4];
+    const PlanRow ru = table[5];
+    const PlanRow rd = table[6];
+
+    const int slab_k = (rd.k + rd.nslabs - 1) / rd.nslabs;
+    int c1 = (tile % rd.nslabs) / (512 / slab_k);
+    int col = c1 * 512 + tid;
+    if (col < rg.n) {
+        float gacc = 0.0f, uacc = 0.0f;
+        for (int s = 0; s < rg.nslabs; ++s) {
+            gacc += rg.partials[(size_t)s * rg.n + col];
+            uacc += ru.partials[(size_t)s * ru.n + col];
+        }
+        float gv = hbits_to_f32(f32_to_hbits(gacc));
+        float uv = hbits_to_f32(f32_to_hbits(uacc));
+        float silu = gv / (1.f + expf(-gv));
+        ((unsigned short*)rd.a)[col] = f32_to_hbits(silu * uv);
+    }
+    __syncthreads();
+
+    int slab = tile % rd.nslabs;
+    int ks = slab * slab_k;
+    int ke = ks + slab_k;
+    if (ke > rd.k) {
+        ke = rd.k;
+    }
+    int c2 = tile / rd.nslabs;
+    int col0 = c2 * (512 * WC) + tid * WC;
+    if (col0 < rd.n) {
+        int wc = rd.n - col0;
+        if (wc > WC) {
+            wc = WC;
+        }
+        gemv_phase1_wc<WC>(rd, col0, ks, ke, slab, wc);
     }
 }
 
@@ -913,25 +1360,47 @@ __device__ __forceinline__ void stage_ts_mark(const LayerFusedConst* c, int li,
 // required while the kernel runs, and blocks may retire at any time.
 // All P values are clamped to G (grid-stride stages: every block then
 // participates).
+//
+// S1-11 widening: the widened stages (p1_qkv, p2_qkv, p1_gu) run PAIRED
+// tw-col tiles (one adjacent pair per block), so their producer sets are
+// {bx < tiles/2} — a subset of the prefix the P formulas compute from the
+// widened tile counts, which the host uploads per width (the participant
+// sets therefore extend automatically; with W=2 and Qwen3-0.6B all the
+// qkv/gu tile counts exceed the grid, so bar4/bar5 become full-grid).
+//
+// 017-d: with WC > 1 the p1 stages' tiles are 256*WC columns wide (see
+// p1_tiles<W, WC>) and stage 7's tiles 512*WC wide — the producer sets
+// shrink accordingly, and since every producer set stays a prefix of the
+// grid and the P formulas are min(count, G) upper bounds, the barrier
+// participant sets extend automatically (p1 producers {bx < count/2}
+// are still a subset of the {bx < count} prefix; the excess prefix
+// blocks arrive without work). WC only changes which columns each
+// thread owns — never the per-column arithmetic.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
-    const LayerFusedConst* __restrict__ c,
-    const PlanRow* __restrict__ table,       // this layer's 7 rows
-    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
-    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
-    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
-    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
-    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+template <int W, int WC>
+__device__ __forceinline__ void layer_fused_body(
+    const LayerFusedConst* c,
+    const PlanRow* table,       // this layer's 7 rows
+    const unsigned short* wnext,  // next attn_norm / final_norm
+    const unsigned short* wffn,   // this layer's ffn_norm
+    const unsigned short* wq,     // this layer's q head-norm weights
+    const unsigned short* wk,     // this layer's k head-norm weights
+    volatile unsigned int* bar,   // [2 * N_BARRIERS] u32 (zeroed once)
     int li, int n_layers, unsigned int pos, unsigned int token) {
     const int tid = threadIdx.x;
     const int bx = blockIdx.x;
     const int G = gridDim.x;
     // 10 barrier slots (2 * N_BARRIERS u32): index k guards stage k -> k+1
-    // (bar0..bar6, bar7/bar8 are the add_rms split barriers; slot 9 spare).
+    // (bar0..bar6 full-grid/participant, bar7/bar8 the add_rms split
+    // barriers, bar9 spare).
     volatile unsigned int* bcnt = bar;
     volatile unsigned int* bgen = bar + 10;
-    const int cq = (c->nqk + 511) / 512;
-    const int ck = (c->kvk + 511) / 512;
+    const int tw = W == 1 ? 512 : 256 * WC;
+    // Stage-2 (p2_qkv) keeps its own 256-col (W=2) / 512-col (W=1) tiles
+    // regardless of WC — phase-2 only sums per-column partials, so its
+    // tile width is independent of phase-1's.
+    const int cq = W == 1 ? (c->nqk + 511) / 512 : (c->nqk + 255) / 256;
+    const int ck = W == 1 ? (c->kvk + 511) / 512 : (c->kvk + 255) / 256;
     const int P1m = (cq + 2 * ck) < c->q_heads ? c->q_heads : (cq + 2 * ck);
     const int P1 = P1m < G ? P1m : G;
     const int P2m = c->q_heads < c->tiles_o ? c->tiles_o : c->q_heads;
@@ -945,15 +1414,11 @@ extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
         stage_gather_rms0(c, token, tid);
     }
     // 1. phase-1 of the q/k/v plans (reads xn)
-    for (int t = bx; t < c->tiles_qkv; t += G) {
-        stage_p1(c, table, 0, 3, t, tid);
-    }
+    p1_tiles<W, WC>(c, table, 0, 3, c->tiles_qkv, tw, bx, G, tid);
     stage_ts_mark(c, li, 1);
     grid_barrier(&bcnt[0], &bgen[0], G);
     // 2. q/k/v phase-2 + casts + head-norm + rope (cq + 2*ck tiles)
-    for (int t = bx; t < cq + 2 * ck; t += G) {
-        stage_p2_qkv(c, table, t, tid, pos, wq, wk);
-    }
+    p2qkv_tiles<W>(c, table, cq + 2 * ck, bx, G, tid, pos, wq, wk);
     stage_ts_mark(c, li, 2);
     if (bx < P1) {
         grid_barrier(&bcnt[1], &bgen[1], P1);
@@ -967,9 +1432,7 @@ extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
         grid_barrier(&bcnt[2], &bgen[2], P2);
     }
     // 4. o phase-1 (reads the full attention row)
-    for (int t = bx; t < c->tiles_o; t += G) {
-        stage_p1(c, table, 3, 1, t, tid);
-    }
+    p1_tiles_plain(c, table, 3, 1, c->tiles_o, bx, G, tid);
     stage_ts_mark(c, li, 4);
     grid_barrier(&bcnt[3], &bgen[3], G);
     // 5. o phase-2 + residual add (all blocks) + ffn rms (block 0)
@@ -983,17 +1446,22 @@ extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
         grid_barrier(&bcnt[4], &bgen[4], P4);
     }
     // 6. gate/up phase-1 (reads xn = p2_o's ffn-normed x)
-    for (int t = bx; t < c->tiles_gu; t += G) {
-        stage_p1(c, table, 4, 2, t, tid);
-    }
+    p1_tiles<W, WC>(c, table, 4, 2, c->tiles_gu, tw, bx, G, tid);
     stage_ts_mark(c, li, 6);
     if (bx < P5) {
         grid_barrier(&bcnt[5], &bgen[5], P5);
     }
     // 7. gate/up phase-2 + swiglu + down phase-1 (one tile per down
-    //    (col-block, slab) — the split's full down phase-1 grid)
-    for (int t = bx; t < c->tiles_gu_d; t += G) {
-        stage_p2_gu_d(c, table, t, tid);
+    //    (col-block, slab) — the split's full down phase-1 grid; 017-d:
+    //    WC > 1 widens each tile to 512*WC columns)
+    if constexpr (WC > 1) {
+        for (int t = bx; t < c->tiles_gu_d; t += G) {
+            stage_p2_gu_d_wc<WC>(c, table, t, tid);
+        }
+    } else {
+        for (int t = bx; t < c->tiles_gu_d; t += G) {
+            stage_p2_gu_d(c, table, t, tid);
+        }
     }
     stage_ts_mark(c, li, 7);
     grid_barrier(&bcnt[6], &bgen[6], G);
@@ -1004,4 +1472,65 @@ extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
         stage_rms_out(c->x, c->xn, wnext, c->h, c->eps, tid);
     }
     stage_ts_mark(c, li, 8);
+}
+
+// W=1 entry: the S1-10 kernel verbatim (REINFER_FUSED_BW=off).
+extern "C" __global__ void __launch_bounds__(512) decode_step_layer_fused(
+    const LayerFusedConst* __restrict__ c,
+    const PlanRow* __restrict__ table,       // this layer's 7 rows
+    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
+    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
+    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
+    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
+    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+    int li, int n_layers, unsigned int pos, unsigned int token) {
+    layer_fused_body<1, 1>(c, table, wnext, wffn, wq, wk, bar, li, n_layers,
+                           pos, token);
+}
+
+// W=2 entry (S1-11 block-width): __launch_bounds__(512, 2) forces 64
+// registers/thread so two blocks are co-resident per SM (grid = 2x the
+// W=1 grid; the host gates it by the occupancy query).
+extern "C" __global__ void __launch_bounds__(512, 2) decode_step_layer_fused_bw2(
+    const LayerFusedConst* __restrict__ c,
+    const PlanRow* __restrict__ table,       // this layer's 7 rows
+    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
+    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
+    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
+    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
+    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+    int li, int n_layers, unsigned int pos, unsigned int token) {
+    layer_fused_body<2, 1>(c, table, wnext, wffn, wq, wk, bar, li, n_layers,
+                           pos, token);
+}
+
+// 017-d WC=2 entry: W=2 pairing plus 2 consecutive columns per thread
+// (LDG.32 b loads; tiles 512/1024 cols wide). Still __launch_bounds__
+// (512, 2) — 64 registers/thread, two blocks per SM.
+extern "C" __global__ void __launch_bounds__(512, 2) decode_step_layer_fused_bw2_wc2(
+    const LayerFusedConst* __restrict__ c,
+    const PlanRow* __restrict__ table,       // this layer's 7 rows
+    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
+    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
+    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
+    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
+    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+    int li, int n_layers, unsigned int pos, unsigned int token) {
+    layer_fused_body<2, 2>(c, table, wnext, wffn, wq, wk, bar, li, n_layers,
+                           pos, token);
+}
+
+// 017-d WC=4 entry: 4 consecutive columns per thread (LDG.64 b loads;
+// tiles 1024/2048 cols wide).
+extern "C" __global__ void __launch_bounds__(512, 2) decode_step_layer_fused_bw2_wc4(
+    const LayerFusedConst* __restrict__ c,
+    const PlanRow* __restrict__ table,       // this layer's 7 rows
+    const unsigned short* __restrict__ wnext,  // next attn_norm / final_norm
+    const unsigned short* __restrict__ wffn,   // this layer's ffn_norm
+    const unsigned short* __restrict__ wq,     // this layer's q head-norm weights
+    const unsigned short* __restrict__ wk,     // this layer's k head-norm weights
+    volatile unsigned int* __restrict__ bar,   // [2 * N_BARRIERS] u32 (zeroed once)
+    int li, int n_layers, unsigned int pos, unsigned int token) {
+    layer_fused_body<2, 4>(c, table, wnext, wffn, wq, wk, bar, li, n_layers,
+                           pos, token);
 }

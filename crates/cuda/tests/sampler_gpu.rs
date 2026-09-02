@@ -392,3 +392,84 @@ mod smoke {
         assert_eq!(t3, 1, "token 2 penalized by presence 0.5");
     }
 }
+
+mod cost_probe {
+    use reinfer_core::DeviceId;
+    use reinfer_cuda::buffer::{DeviceBuffer, HostBuffer, MemRef, copy};
+    use reinfer_cuda::sampler::GpuSamplerChain;
+    use reinfer_cuda::{CudaContext, CudaStream};
+    use reinfer_kernels::{LogitsView, RngState, SamplerChain, SamplerParams};
+    use std::time::Instant;
+
+    fn new_chain(dev: DeviceId) -> GpuSamplerChain {
+        GpuSamplerChain::new(
+            dev,
+            &reinfer_cuda::arch::resolve_arch().expect("arch"),
+            Some(std::env::temp_dir().join("reinfer-jit-sampler")),
+        )
+        .expect("sampler chain")
+    }
+
+    fn make_view(dev: DeviceId, logits: &[f32]) -> LogitsView {
+        let n = logits.len();
+        let db = DeviceBuffer::alloc(dev, n * 4).expect("dev logits");
+        let hb = HostBuffer::alloc(n * 4).expect("host logits");
+        // SAFETY: pinned host buffer holds exactly n f32s.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                logits.as_ptr() as *const u8,
+                hb.as_ptr() as *mut u8,
+                n * 4,
+            );
+        }
+        copy(&mut MemRef::Device(&db), &MemRef::Host(&hb), n * 4, None).expect("h2d");
+        let ptr = db.as_ptr() as usize;
+        let bytes = db.size();
+        let dev0 = dev;
+        LogitsView::new(dev, reinfer_kernels::DeviceBuffer::new(ptr, bytes), n, move || {
+            let hb = HostBuffer::alloc(bytes).expect("host");
+            // SAFETY: hb holds bytes bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr as *const u8, hb.as_ptr() as *mut u8, bytes);
+            }
+            let _ = dev0;
+            unsafe { std::slice::from_raw_parts(hb.as_ptr() as *const f32, n).to_vec() }
+        })
+    }
+
+    /// Cost of `GpuSamplerChain::new` (warm JIT cache) — the per-request
+    /// chain construction question for the scheduler integration.
+    #[test]
+    #[ignore = "gpu.yml: cost-probe"]
+    fn chain_new_and_sample_cost() {
+        let ctx = CudaContext::init(DeviceId::new(0)).expect("ctx");
+        let dev = ctx.device_id();
+        let stream = CudaStream::new(dev).expect("stream");
+        let _ = stream.synchronize().expect("sync");
+        let _ = new_chain(dev); // warm the cache
+        let t0 = Instant::now();
+        let chains: Vec<_> = (0..5).map(|_| new_chain(dev)).collect();
+        eprintln!(
+            "chain new x5 (warm) = {:?} (per {:.2} ms)",
+            t0.elapsed(),
+            t0.elapsed().as_micros() as f64 / 5e3
+        );
+        let mut chain = chains.into_iter().next().unwrap();
+        let logits: Vec<f32> = (0..151936u32).map(|i| (i % 100) as f32).collect();
+        let view = make_view(dev, &logits);
+        let params = SamplerParams { temperature: 1.0, top_k: Some(64), ..Default::default() };
+        let mut rng = RngState::new(0);
+        let mut last = 0;
+        let t1 = Instant::now();
+        for _ in 0..5 {
+            last = chain.sample(&view, &params, &mut rng).expect("sample").token;
+        }
+        let t2 = Instant::now();
+        eprintln!(
+            "sample x5 steady (vocab 151936, temp=1, topk=64) = {:?} per {:.2} us",
+            t2 - t1,
+            (t2 - t1).as_micros() as f64 / 5.0
+        );
+        eprintln!("last token={} launch_count={}", last, chain.launch_count());
+    }
+}

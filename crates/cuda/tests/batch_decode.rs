@@ -361,10 +361,8 @@ mod gpu {
         assert_eq!(segs.len(), 20);
 
         // Independent references (single-request path, its own pool).
-        let refs: Vec<Vec<f32>> = toks
-            .iter()
-            .map(|&t| engine.step(t, 14, 15).expect("reference step"))
-            .collect();
+        let refs: Vec<Vec<f32>> =
+            toks.iter().map(|&t| engine.step(t, 14, 15).expect("reference step")).collect();
 
         let reqs_at = |s: usize, segs: &[DeviceBuffer]| -> Vec<BatchReq> {
             segs.iter()

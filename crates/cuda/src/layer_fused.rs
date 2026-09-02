@@ -46,9 +46,56 @@ use reinfer_kernels::LaunchError;
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-/// The kernel's 512-col tile mapping, derived from the plan shapes.
+/// S1-11 (specs/017): the block-width switch (default **2** — the widened
+/// stages' 512-col tiles are split into 256-col tile PAIRS, one per block;
+/// `REINFER_FUSED_BW=1`/off words keep the S1-10 single-width kernel
+/// byte-for-byte). Widths above 2 (the plan's W=4) are not implemented
+/// yet — they clamp to the shipped width 2.
+const BW_ENV: &str = "REINFER_FUSED_BW";
+
+/// 017-d: the per-thread column width of the W=2 kernel's phase-1 stages
+/// (`REINFER_FUSED_WC=2`/`4`; default 1 keeps the S1-11 kernel verbatim —
+/// each thread then owns WC consecutive columns fetched as one vector
+/// load, see decode_layer_fused_kernels.cu). Only meaningful with block
+/// width 2; W=1 forces WC=1.
+const WC_ENV: &str = "REINFER_FUSED_WC";
+
+/// REINFER_FUSED_BW parsing: unset -> **2** (default on); off words mirror
+/// the opt-out convention (like REINFER_FUSED) and select width 1.
+#[must_use]
+fn block_width_from_env(value: Option<&str>) -> u32 {
+    match value {
+        None => 2,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "0" | "off" | "false" | "no" => 1,
+            _ => 2,
+        },
+    }
+}
+
+/// REINFER_FUSED_WC parsing: unset -> 1; only 2 and 4 are implemented.
+#[must_use]
+fn col_width_from_env(value: Option<&str>) -> u32 {
+    match value {
+        None => 1,
+        Some(v) => match v.trim() {
+            "2" => 2,
+            "4" => 4,
+            _ => 1,
+        },
+    }
+}
+
+/// The kernel's tw-col tile mapping, derived from the plan shapes
+/// (tw = 512 for the plain stages, 256 for the S1-11 widened stages).
+fn tiles_w(n: usize, nslabs: u32, tw: u32) -> u32 {
+    n.div_ceil(tw as usize) as u32 * nslabs
+}
+
+/// The kernel's 512-col tile mapping (the plain stages — o, down, and all
+/// of W=1), derived from the plan shapes.
 fn tiles512(n: usize, nslabs: u32) -> u32 {
-    n.div_ceil(512) as u32 * nslabs
+    tiles_w(n, nslabs, 512)
 }
 
 /// Host mirror of the kernel-side `LayerFusedConst` (repr(C) — the bytes
@@ -198,10 +245,32 @@ pub struct LayerFusedSpec {
 /// The S1-10 layer-fused unit: the persistent kernel + its stable
 /// argument buffers (the const blob, the barrier slots, the per-stage
 /// clock64 timestamps) + the co-residency grid.
+///
+/// S1-11 (specs/017): two kernel entries are loaded — the W=1 S1-10
+/// kernel (512-col stage tiles) and the W=2 `decode_step_layer_fused_bw2`
+/// (256-col widened-stage tiles, __launch_bounds__(512, 2) so two blocks
+/// fit per SM). `build` picks the width from REINFER_FUSED_BW and the
+/// occupancy gate; `launch`/`kernel_name`/`grid` follow the selection.
+///
+/// 017-d: the W=2 phase-1 stages additionally widen per-thread columns
+/// (`REINFER_FUSED_WC`): WC=2/4 entries `decode_step_layer_fused_bw2_wc2`
+/// /`..._wc4` load each thread's WC consecutive columns as one vector
+/// load. WC=1 is the S1-11 entry verbatim.
 #[derive(Debug)]
 pub struct LayerFusedKernels {
     lib: JLib,
+    /// The selected kernel entry (per the width + column-width gates).
     kernel: KernelFn,
+    /// The W=2 entry (`decode_step_layer_fused_bw2`).
+    kernel_w2: KernelFn,
+    /// 017-d: the W=2 WC=2/4 entries.
+    kernel_w2_wc2: KernelFn,
+    kernel_w2_wc4: KernelFn,
+    /// Selected block width (1 = S1-10 behavior, 2 = S1-11 widened).
+    block_width: u32,
+    /// Selected per-thread column width of the phase-1 stages (1/2/4;
+    /// 1 when block width 1).
+    col_width: u32,
     dev: u32,
     /// The uploaded `LayerFusedConst` blob (stable).
     cbuf: DeviceBuffer,
@@ -238,9 +307,17 @@ impl LayerFusedKernels {
         let bytes = std::fs::read(&cubin_path).map_err(|_| LaunchError::Fatal)?;
         let lib = JLib::from_bytes(bytes)?;
         let kernel = lib.kernel("decode_step_layer_fused")?;
+        let kernel_w2 = lib.kernel("decode_step_layer_fused_bw2")?;
+        let kernel_w2_wc2 = lib.kernel("decode_step_layer_fused_bw2_wc2")?;
+        let kernel_w2_wc4 = lib.kernel("decode_step_layer_fused_bw2_wc4")?;
         Ok(Self {
             lib,
             kernel,
+            kernel_w2,
+            kernel_w2_wc2,
+            kernel_w2_wc4,
+            block_width: 1,
+            col_width: 1,
             dev,
             cbuf: DeviceBuffer::alloc(DeviceId::new(dev), 4)?, // placeholder
             bar: DeviceBuffer::alloc(DeviceId::new(dev), 4)?,  // placeholder
@@ -306,22 +383,21 @@ impl LayerFusedKernels {
             return Err(LaunchError::Fatal);
         }
 
-        // Stage tile counts (512-col tiles, grid-stride over the grid).
-        let tiles_qkv = tiles512(spec.nqk, g.nslabs_q as u32)
-            + tiles512(spec.kvk, g.nslabs_k as u32)
-            + tiles512(spec.kvk, g.nslabs_v as u32);
-        let tiles_o = tiles512(spec.h, g.nslabs_o as u32);
-        let tiles_gu = tiles512(spec.ffn, g.nslabs_g as u32) * 2;
-        let tiles_gu_d = tiles512(spec.h, g.nslabs_d as u32);
-        let tiles_p2 = (spec.nqk.div_ceil(512) + 2 * spec.kvk.div_ceil(512)) as u32;
-        let max_tiles = tiles_qkv
-            .max(tiles_p2)
-            .max(spec.q_heads as u32)
-            .max(tiles_o)
-            .max(1)
-            .max(tiles_gu)
-            .max(tiles_gu_d);
-
+        // S1-11 (specs/017): block width from REINFER_FUSED_BW (default
+        // 2). The widened stages (p1_qkv, p2_qkv, p1_gu) split their
+        // 512-col tiles into 512/W-col tiles (W=2 -> 256), one adjacent
+        // PAIR per block; the plain stages (o, down) and all of W=1 keep
+        // the 512-col tiles. The const's tile counts feed the kernel's
+        // stage loops AND the barrier participant sets (P1/P4/P5), so they
+        // must match the entry's tiles — the counts are computed only
+        // after the width is settled (the fallback below).
+        let mut w = block_width_from_env(std::env::var(BW_ENV).ok().as_deref());
+        // 017-d: per-thread column width from REINFER_FUSED_WC (default
+        // 1 = the S1-11 kernel verbatim; 2/4 widen the W=2 phase-1 b
+        // loads). Only the W=2 kernel has widened entries — W=1 forces
+        // WC=1.
+        let mut wc =
+            if w == 2 { col_width_from_env(std::env::var(WC_ENV).ok().as_deref()) } else { 1 };
         // Co-residency gate: the exact resident block count for the real
         // launch geometry (512 threads, the launch's dynamic smem), times
         // the SM count. The grid is capped at max_tiles (the largest
@@ -348,21 +424,61 @@ impl LayerFusedKernels {
             return Err(LaunchError::Fatal); // ctx too long for the layer kernel
         }
         // >48KB opt-in: the launch smem exceeds the default per-block
-        // limit (49152) — declare the cap on the kernel handle once.
+        // limit (49152) — declare the cap on all kernel handles once
+        // (they share the launch's dynamic smem).
         if shared > 49152 {
             super::jit::set_max_dynamic_smem(self.kernel, shared)?;
+            super::jit::set_max_dynamic_smem(self.kernel_w2, shared)?;
+            super::jit::set_max_dynamic_smem(self.kernel_w2_wc2, shared)?;
+            super::jit::set_max_dynamic_smem(self.kernel_w2_wc4, shared)?;
         }
-        let mut occ: i32 = 0;
-        let r = unsafe {
-            dsys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                &mut occ,
-                self.kernel.raw(),
-                512,
-                shared as usize,
-            )
+        // W=2 needs TWO co-resident blocks per SM (its
+        // __launch_bounds__(512, 2) caps the registers at 64/thread);
+        // when the occupancy query cannot fit that (smem/register
+        // pressure), the width falls back to W=1 — the S1-10 behavior
+        // verbatim (REINFER_FUSED_BW=off keeps it). The 017-d column
+        // width falls back WC -> 1 first (same gate), then width.
+        let entry = |w: u32, wc: u32| -> KernelFn {
+            match (w, wc) {
+                (1, _) => self.kernel,
+                (2, 1) => self.kernel_w2,
+                (2, 2) => self.kernel_w2_wc2,
+                (2, 4) => self.kernel_w2_wc4,
+                _ => self.kernel, // unreachable (env parsing clamps)
+            }
         };
-        if r != dsys::CUresult::CUDA_SUCCESS || occ <= 0 {
-            return Err(LaunchError::Fatal);
+        let occ_of = |kern: KernelFn| -> Result<i32, LaunchError> {
+            let mut occ: i32 = 0;
+            let r = unsafe {
+                dsys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &mut occ,
+                    kern.raw(),
+                    512,
+                    shared as usize,
+                )
+            };
+            if r != dsys::CUresult::CUDA_SUCCESS || occ <= 0 {
+                return Err(LaunchError::Fatal);
+            }
+            Ok(occ)
+        };
+        let mut occ = occ_of(entry(w, wc))?;
+        if w == 2 && wc > 1 && occ < 2 {
+            eprintln!(
+                "reinfer-cuda: layer-fused column width {wc} not co-resident (occ {occ}) — \
+                 falling back to column width 1"
+            );
+            wc = 1;
+            occ = occ_of(self.kernel_w2)?;
+        }
+        if w == 2 && occ < 2 {
+            eprintln!(
+                "reinfer-cuda: layer-fused block width 2 not co-resident (occ {occ}) — \
+                 falling back to width 1"
+            );
+            w = 1;
+            wc = 1;
+            occ = occ_of(self.kernel)?;
         }
         let mut sms: i32 = 0;
         let r = unsafe {
@@ -375,6 +491,33 @@ impl LayerFusedKernels {
         if r != dsys::CUresult::CUDA_SUCCESS || sms <= 0 {
             return Err(LaunchError::Fatal);
         }
+        // Stage tile counts for the settled width: tw-col for the widened
+        // stages (p1_qkv/p2_qkv/p1_gu), 512-col for the plain stages
+        // (p1_o, p2_gu_d) — grid-strided over the grid. `tiles_p2` mirrors
+        // the kernel's cq + 2*ck (the stage-2 loop bound).
+        //
+        // 017-d: with WC > 1 the W=2 phase-1 tiles are 256*WC columns wide
+        // (tw below) and stage 7's down tiles 512*WC (tw7); phase-2 keeps
+        // its own 256-col (W=2) tiling regardless of WC, so `tiles_p2`
+        // stays 256-based.
+        let tw = if w == 2 { 256 * wc } else { 512 };
+        let tw7 = if w == 2 && wc > 1 { 512 * wc } else { 512 };
+        let tw_p2 = if w == 2 { 256 } else { 512 };
+        let tiles_qkv = tiles_w(spec.nqk, g.nslabs_q as u32, tw)
+            + tiles_w(spec.kvk, g.nslabs_k as u32, tw)
+            + tiles_w(spec.kvk, g.nslabs_v as u32, tw);
+        let tiles_o = tiles512(spec.h, g.nslabs_o as u32);
+        let tiles_gu = tiles_w(spec.ffn, g.nslabs_g as u32, tw) * 2;
+        let tiles_gu_d = tiles_w(spec.h, g.nslabs_d as u32, tw7);
+        let tiles_p2 =
+            (spec.nqk.div_ceil(tw_p2 as usize) + 2 * spec.kvk.div_ceil(tw_p2 as usize)) as u32;
+        let max_tiles = tiles_qkv
+            .max(tiles_p2)
+            .max(spec.q_heads as u32)
+            .max(tiles_o)
+            .max(1)
+            .max(tiles_gu)
+            .max(tiles_gu_d);
         let grid = (occ * sms).min(max_tiles as i32).max(1) as u32;
 
         // Buffers: stage-clock slots (allocated FIRST — the const's
@@ -444,11 +587,35 @@ impl LayerFusedKernels {
         }
         copy(&mut MemRef::Device(&self.bar), &MemRef::Host(&zeros), 20 * 4, None)?;
 
+        // Persist the width, the column width and the selected entry.
+        self.block_width = w;
+        self.col_width = wc;
+        self.kernel = entry(w, wc);
         self.grid = grid;
         self.shared = shared;
         self.ts_acc = [0.0; 9];
         self.ts_steps = 0;
         Ok(())
+    }
+
+    /// The selected block width (1 = S1-10 behavior, 2 = S1-11 widened).
+    #[must_use]
+    pub fn block_width(&self) -> u32 {
+        self.block_width
+    }
+
+    /// The selected kernel entry's cubin symbol name (graph declaration
+    /// takes the `CUkernel` handle by name — it must match the width the
+    /// launch uses).
+    #[must_use]
+    pub fn kernel_name(&self) -> &'static str {
+        match (self.block_width, self.col_width) {
+            (1, _) => "decode_step_layer_fused",
+            (2, 1) => "decode_step_layer_fused_bw2",
+            (2, 2) => "decode_step_layer_fused_bw2_wc2",
+            (2, 4) => "decode_step_layer_fused_bw2_wc4",
+            _ => "decode_step_layer_fused_bw2",
+        }
     }
 
     /// The co-resident grid size (graph declaration geometry).

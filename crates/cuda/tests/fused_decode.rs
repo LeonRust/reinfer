@@ -36,6 +36,11 @@
 //!      tokens: per-step logits bit-identical, identical greedy text;
 //!      the fused / layer-fused engine is deterministic across two
 //!      separate loads (bit-level).
+//!   5. layer_fused_bw_ab_bitwise — S1-11 (specs/017) block-width A/B:
+//!      the W=2 widened kernel (REINFER_FUSED_BW default) vs the W=1
+//!      S1-10 kernel on the same li=1 layer inputs: every output and
+//!      partials segment byte-identical (the 017 D2 argument). The
+//!      W=2 default also runs gates 1..4 above (the strongest surface).
 //!
 //! Run (real machine; nvcc 13.2 — the sm_120a JIT rule):
 //! ```text
@@ -1347,6 +1352,224 @@ mod gpu {
         );
         println!(
             "layer-fused li=1 kernel: bit-exact vs split on q/k/v, attn, x, xn_attn, down, all 7 phase-1 partials segments and the page-1 kv write"
+        );
+    }
+
+    /// S1-11 (specs/017) block-width env (the host reads it at build).
+    const BW_ENV: &str = "REINFER_FUSED_BW";
+
+    /// The output surface one layer-kernel arm produces, for the W=1 vs
+    /// W=2 comparison.
+    struct ArmOut {
+        q16: Vec<u16>,
+        k16: Vec<u16>,
+        v16: Vec<u16>,
+        attn: Vec<u16>,
+        x: Vec<u16>,
+        xn: Vec<u16>,
+        down: Vec<u16>,
+        p_q: Vec<f32>,
+        p_k: Vec<f32>,
+        p_v: Vec<f32>,
+        p_o: Vec<f32>,
+        p_g: Vec<f32>,
+        p_u: Vec<f32>,
+        p_d: Vec<f32>,
+        kv: Vec<u16>,
+    }
+
+    /// Run the li=1 layer kernel at the given block width (`width` = the
+    /// REINFER_FUSED_BW env value; the host picks the entry at build) over
+    /// `b`/`kv` (the arm's own fresh buffers) and read every output
+    /// surface back for comparison. Asserts the build actually selected
+    /// the requested width (a silent occupancy fallback must fail loudly).
+    fn run_layer_fused_arm(
+        lf: &mut LayerFusedKernels,
+        ctx: &CudaContext,
+        stream: &CudaStream,
+        dev: u32,
+        b: &LayerBufs,
+        g: &FusedGeom,
+        kv: &DeviceBuffer,
+        width: &str,
+    ) -> ArmOut {
+        // SAFETY (test-only): --test-threads=1 keeps the env mutation
+        // single-threaded; the value is read once at build.
+        unsafe {
+            std::env::set_var(BW_ENV, width);
+        }
+        let spec = LayerFusedSpec {
+            h: H,
+            nqk: NQK,
+            kvk: KVK,
+            ffn: FFN,
+            d: D,
+            q_heads: 16,
+            kv_heads: 8,
+            block_len: BLOCK_LEN,
+            max_kv: BLOCK_LEN,
+            total_pages: 2,
+            pp: 1,
+            eta: ETA,
+            eps: EPS,
+            head_norm: true,
+            embed: std::ptr::null(), // li > 0: no gather
+            x: b.x_f.as_ptr() as *mut u16,
+            xn: b.xn_attn_f.as_ptr() as *mut u16,
+            q16: b.q16_f.as_ptr() as *mut u16,
+            k16: b.k16_f.as_ptr() as *mut u16,
+            v16: b.v16_f.as_ptr() as *mut u16,
+            attn: b.attn_f.as_ptr() as *mut u16,
+            kv: kv.as_ptr() as *mut u16,
+            lens: b.lens.as_ptr() as *const u32,
+            pages: b.pages2.as_ptr() as *const u32,
+            wnorm0: b.attn_norm.as_ptr() as *const u16,
+        };
+        lf.build(ctx.device_id(), g, &spec).unwrap();
+        let want = if width == "1" { 1 } else { 2 };
+        assert_eq!(
+            lf.block_width(),
+            want,
+            "width {width}: the build did not select the requested width \
+             (occupancy fell back?)"
+        );
+        lf.launch(
+            stream,
+            unsafe { g.tables.add(7) },         // layer-1 rows (li * 7)
+            b.attn_norm.as_ptr() as *const u16, // wnext (stage 8)
+            b.ffn_norm.as_ptr() as *const u16,  // wffn (stage 5)
+            b.q_norm.as_ptr() as *const u16,    // wq (stage 2 head norm)
+            b.k_norm.as_ptr() as *const u16,    // wk (stage 2 head norm)
+            1,                                  // li (layer 1 — no gather)
+            2,                                  // n_layers (stage_ts slots)
+            POS,                                // rope pos
+            0,                                  // token (unused at li > 0)
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        ArmOut {
+            q16: read_u16(&b.q16_f, NQK),
+            k16: read_u16(&b.k16_f, KVK),
+            v16: read_u16(&b.v16_f, KVK),
+            attn: read_u16(&b.attn_f, NQK),
+            x: read_u16(&b.x_f, H),
+            xn: read_u16(&b.xn_attn_f, H),
+            down: read_u16(&b.down_f, FFN),
+            p_q: read_f32_ptr(dev, g.pq, NQK * g.nslabs_q as usize),
+            p_k: read_f32_ptr(dev, g.pk, KVK * g.nslabs_k as usize),
+            p_v: read_f32_ptr(dev, g.pv, KVK * g.nslabs_v as usize),
+            p_o: read_f32_ptr(dev, g.po, H * g.nslabs_o as usize),
+            p_g: read_f32_ptr(dev, g.pg, FFN * g.nslabs_g as usize),
+            p_u: read_f32_ptr(dev, g.pu, FFN * g.nslabs_g as usize),
+            p_d: read_f32_ptr(dev, g.pd, H * g.nslabs_d as usize),
+            kv: read_u16(kv, 2 * BLOCK_LEN * KVK * 2),
+        }
+    }
+
+    /// Gate 5 (S1-11, specs/017): block-width A/B — the W=1 kernel
+    /// (REINFER_FUSED_BW=1, the S1-10 behavior) and the W=2 widened
+    /// kernel (default) run the same li=1 layer on identical inputs;
+    /// every output surface (q/k/v after head norm + rope, attn, x,
+    /// xn_attn, down, the 7 partials segments, the page-1 kv write) must
+    /// be byte-identical. Only the (column -> block, thread) assignment
+    /// differs between the widths — the per-column arithmetic and the
+    /// aggregation orders are unchanged (017 D2).
+    #[test]
+    #[ignore = "gpu.yml: l3-fused-decode / bw-ab"]
+    fn layer_fused_bw_ab_bitwise() {
+        let (ctx, stream, arch, cache) = setup();
+        let dev = ctx.device_id().index();
+        let dense = DenseKernels::new(&arch, Some(cache.clone())).unwrap();
+        let diff = DiffKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let decode = DecodeKernels::new(&arch, Some(cache.clone()), stream.clone()).unwrap();
+        let jgemm = Jgemm::new(dev, &arch, Some(cache.clone())).unwrap();
+        let gemm_lib = load_gemm_m1(&arch, Some(cache.clone()));
+        let mut fused = FusedDecodeKernels::new(
+            dev,
+            &arch,
+            Some(cache.clone()),
+            gemm_lib.kernel("gemv_m1_f16f32_reduce").unwrap(),
+        )
+        .unwrap();
+        let mut lf_w1 = LayerFusedKernels::new(dev, &arch, Some(cache.clone())).unwrap();
+        let mut lf_w2 = LayerFusedKernels::new(dev, &arch, Some(cache.clone())).unwrap();
+
+        // Two identical two-layer geometries: layer-0 rows from b1
+        // (filler — the li=1 launch reads rows 7..13), layer-1 rows from
+        // the arm's own fresh buffers (same seed). Each arm gets its own
+        // fused plans build (the layer kernel reads the SAME plan table
+        // the fused path uploads; the geometry pointers are per-build).
+        let b1 = layer_bufs(dev, 0xB1A7u64);
+        let b2 = layer_bufs(dev, 0xB1A7u64);
+        let b3 = layer_bufs(dev, 0xB1A7u64);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &b2);
+        run_split(&gemm_lib, &dense, &diff, &decode, &jgemm, &stream, dev, &b3);
+        let kv2 = {
+            let per_tok_kv = KVK;
+            let kv_s = read_u16(&b2.kv_s, BLOCK_LEN * per_tok_kv * 2);
+            let mut seed = 0xB1A7u64 ^ 0x0BAD_5EEDu64;
+            let page_a = (0..(BLOCK_LEN * per_tok_kv * 2))
+                .map(|_| rand_f16_bits(&mut seed))
+                .collect::<Vec<u16>>();
+            let kv2: Vec<u16> = [
+                &page_a[0..BLOCK_LEN * per_tok_kv],
+                &kv_s[0..BLOCK_LEN * per_tok_kv],
+                &page_a[BLOCK_LEN * per_tok_kv..],
+                &kv_s[BLOCK_LEN * per_tok_kv..],
+            ]
+            .concat();
+            upl(dev, &bytes_u16(&kv2))
+        };
+        let kv3 = {
+            let per_tok_kv = KVK;
+            let kv_s = read_u16(&b3.kv_s, BLOCK_LEN * per_tok_kv * 2);
+            let mut seed = 0xB1A7u64 ^ 0x0BAD_5EEDu64;
+            let page_a = (0..(BLOCK_LEN * per_tok_kv * 2))
+                .map(|_| rand_f16_bits(&mut seed))
+                .collect::<Vec<u16>>();
+            let kv3: Vec<u16> = [
+                &page_a[0..BLOCK_LEN * per_tok_kv],
+                &kv_s[0..BLOCK_LEN * per_tok_kv],
+                &page_a[BLOCK_LEN * per_tok_kv..],
+                &kv_s[BLOCK_LEN * per_tok_kv..],
+            ]
+            .concat();
+            upl(dev, &bytes_u16(&kv3))
+        };
+
+        // Arm A (W=1) first — its partials live in the fused unit's
+        // buffers, so the arm-B build_plans must not reallocate them yet.
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b2)).unwrap();
+        let g2 = fused.geom();
+        let a1 = run_layer_fused_arm(&mut lf_w1, &ctx, &stream, dev, &b2, &g2, &kv2, "1");
+
+        fused.build_plans(ctx.device_id(), &jgemm, &fabricate_plans2(&b1, &b3)).unwrap();
+        let g3 = fused.geom();
+        let a2 = run_layer_fused_arm(&mut lf_w2, &ctx, &stream, dev, &b3, &g3, &kv3, "2");
+        // SAFETY (test-only): single-threaded env (see load_pair).
+        unsafe {
+            std::env::remove_var(BW_ENV);
+        }
+
+        assert_u16_eq(&a1.q16, &a2.q16, "bw q16");
+        assert_u16_eq(&a1.k16, &a2.k16, "bw k16");
+        assert_u16_eq(&a1.v16, &a2.v16, "bw v16");
+        assert_u16_eq(&a1.attn, &a2.attn, "bw attn");
+        assert_u16_eq(&a1.x, &a2.x, "bw x");
+        assert_u16_eq(&a1.xn, &a2.xn, "bw xn_attn");
+        assert_u16_eq(&a1.down, &a2.down, "bw down");
+        assert_f32_eq(&a1.p_q, &a2.p_q, "bw partials q");
+        assert_f32_eq(&a1.p_k, &a2.p_k, "bw partials k");
+        assert_f32_eq(&a1.p_v, &a2.p_v, "bw partials v");
+        assert_f32_eq(&a1.p_o, &a2.p_o, "bw partials o");
+        assert_f32_eq(&a1.p_g, &a2.p_g, "bw partials gate");
+        assert_f32_eq(&a1.p_u, &a2.p_u, "bw partials up");
+        assert_f32_eq(&a1.p_d, &a2.p_d, "bw partials down");
+        assert_u16_eq(&a1.kv, &a2.kv, "bw kv");
+        println!(
+            "layer-fused block width A/B: W=2 (grid {}) byte-identical to W=1 on q/k/v, attn, x, \
+             xn_attn, down, all 7 partials segments and the page-1 kv write",
+            lf_w2.grid()
         );
     }
 
